@@ -2,16 +2,33 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
+#include <ArduinoJson.h>
 
-// Wi-Fi
 const char* ssid = "Pepito";
 const char* password = "215646pepito";
 
-// IP компьютера с Python Gateway
 const char* gateway_ip = "192.168.0.103";
 const uint16_t gateway_port = 8765;
 
+const int LED_PIN = 48;
+
 WebSocketsClient webSocket;
+
+void sendState(bool ledOn) {
+    JsonDocument doc;
+
+    doc["type"] = "state";
+    doc["id"] = "state-001";
+    doc["device"] = "esp32-01";
+    doc["data"]["parameters"]["led"] = ledOn;
+
+    String message;
+    serializeJson(doc, message);
+    webSocket.sendTXT(message);
+
+    Serial.print("State sent: ");
+    Serial.println(message);
+}
 
 void onWebSocketEvent(
     WStype_t type,
@@ -31,12 +48,41 @@ void onWebSocketEvent(
             );
             break;
 
-        case WStype_TEXT:
-            Serial.printf(
-                "Gateway says: %s\n",
-                (char*)payload
-            );
+        case WStype_TEXT: {
+            Serial.printf("Received: %s\n", (char*)payload);
+
+            JsonDocument doc;
+            DeserializationError error =
+                deserializeJson(doc, payload, length);
+
+            if (error) {
+                Serial.println("Invalid JSON");
+                break;
+            }
+
+            const char* typeName = doc["type"] | "";
+
+            if (strcmp(typeName, "command") == 0) {
+                const char* parameter =
+                    doc["data"]["parameter"] | "";
+                bool value = doc["data"]["value"] | false;
+
+                if (strcmp(parameter, "led") == 0) {
+                    digitalWrite(
+                        LED_PIN,
+                        value ? HIGH : LOW
+                    );
+
+                    Serial.println(
+                        value ? "LED ON" : "LED OFF"
+                    );
+
+                    sendState(value);
+                }
+            }
+
             break;
+        }
 
         case WStype_DISCONNECTED:
             Serial.println("WebSocket disconnected");
@@ -53,11 +99,13 @@ void onWebSocketEvent(
 
 void setup() {
     Serial.begin(9600);
-    delay(1000);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
 
-    Serial.println("Connecting to Wi-Fi...");
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, password);
+
+    Serial.print("Connecting to Wi-Fi");
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
@@ -65,7 +113,7 @@ void setup() {
     }
 
     Serial.println();
-    Serial.println("Wi-Fi connected!");
+    Serial.print("Wi-Fi connected: ");
     Serial.println(WiFi.localIP());
 
     webSocket.begin(
