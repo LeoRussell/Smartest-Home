@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IoT Gateway</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div>
+            <h1>IoT Gateway</h1>
+            <p>Панель управления устройствами</p>
+        </div>
+        <div class="server-status">
+            <span class="status-dot"></span>
+            <span>Веб-интерфейс запущен</span>
+        </div>
+    </header>
+
+    <main>
+        <section class="section-heading">
+            <div>
+                <h2>Устройства</h2>
+                <p>Подключённые устройства IoT Gateway</p>
+            </div>
+            <button id="refresh-button">Обновить</button>
+        </section>
+
+        <section class="device-card">
+            <div class="device-heading">
+                <div class="device-icon">ESP</div>
+                <div>
+                    <h3>ESP32-S3</h3>
+                    <p class="device-id">esp32-01</p>
+                </div>
+                <span class="badge" id="device-status">Ожидание</span>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="parameter">
+                <span>Светодиод (LED)</span>
+                <strong id="led-status">Неизвестно</strong>
+            </div>
+
+            <p class="hint">
+                На следующем этапе здесь появятся рабочие кнопки управления.
+            </p>
+        </section>
+
+        <section class="activity-card">
+            <h2>События</h2>
+            <p id="activity-message">
+                Веб-страница готова. Подключение к Gateway добавим следующим шагом.
+            </p>
+        </section>
+    </main>
+
+    <footer>
+        IoT Gateway · Локальная сеть
+    </footer>
+	<script src="app.js"></script>
+</body>
+</html>

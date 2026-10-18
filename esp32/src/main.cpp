@@ -7,7 +7,7 @@
 const char* ssid = "Pepito";
 const char* password = "215646pepito";
 
-const char* gateway_ip = "192.168.0.103";
+const char* gateway_ip = "192.168.0.110";
 const uint16_t gateway_port = 8765;
 
 const int LED_PIN = 48;
