@@ -1,163 +1,315 @@
 import asyncio
 import json
 import sqlite3
-from pathlib import Path
-from itertools import count
 from datetime import datetime, timezone
+from pathlib import Path
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 
+# =========================
+# НАСТРОЙКИ
+# =========================
+
+HOST = "0.0.0.0"
+PORT = 8765
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "gateway.db"
 
-# Активные ESP32 и браузерные подключения
+# Активные ESP32: device_id -> WebSocket
 devices = {}
+
+# Подключённые браузеры
 browser_clients = set()
 
-# Последние известные состояния в памяти
+# Последние известные состояния устройств
 device_states = {}
 
-command_ids = count(1)
+command_counter = 0
 
 
-def now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+# =========================
+# ВРЕМЯ
+# =========================
 
+def current_time():
+    return datetime.now(timezone.utc).astimezone().isoformat(
+        timespec="seconds"
+    )
+
+
+# =========================
+# SQLITE
+# =========================
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS devices (
                 device_id TEXT PRIMARY KEY,
                 last_seen TEXT,
                 led INTEGER,
-                connected INTEGER NOT NULL DEFAULT 0
+                connected INTEGER DEFAULT 0
             )
         """)
 
-        connection.execute("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS device_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 device_id TEXT NOT NULL,
                 event_type TEXT NOT NULL,
-                event_value TEXT NOT NULL,
+                event_value TEXT,
                 timestamp TEXT NOT NULL
             )
         """)
 
+        conn.commit()
 
-def save_device_seen(device_id):
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("""
-            INSERT INTO devices (device_id, last_seen, connected)
-            VALUES (?, ?, 1)
-            ON CONFLICT(device_id) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                connected = 1
-        """, (device_id, now()))
+    print(f"База данных: {DB_PATH}")
 
 
-def save_device_state(device_id, parameters):
-    led_value = parameters.get("led")
-    led_db_value = int(led_value) if isinstance(led_value, bool) else None
-
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("""
-            INSERT INTO devices (device_id, last_seen, led, connected)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(device_id) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                led = COALESCE(excluded.led, devices.led),
-                connected = 1
-        """, (device_id, now(), led_db_value))
+def save_event_in_connection(
+    conn, device_id, event_type, event_value, timestamp
+):
+    conn.execute("""
+        INSERT INTO device_events (
+            device_id,
+            event_type,
+            event_value,
+            timestamp
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        device_id,
+        event_type,
+        str(event_value),
+        timestamp
+    ))
 
 
 def save_device_event(device_id, event_type, event_value):
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("""
-            INSERT INTO device_events (
-                device_id, event_type, event_value, timestamp
+    timestamp = current_time()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        save_event_in_connection(
+            conn,
+            device_id,
+            event_type,
+            event_value,
+            timestamp
+        )
+        conn.commit()
+
+    return timestamp
+
+
+def save_device_seen(device_id, connected):
+    timestamp = current_time()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO devices (
+                device_id,
+                last_seen,
+                connected
             )
-            VALUES (?, ?, ?, ?)
-        """, (device_id, event_type, str(event_value), now()))
+            VALUES (?, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                connected = excluded.connected
+        """, (
+            device_id,
+            timestamp,
+            int(connected)
+        ))
+
+        conn.commit()
+
+    return timestamp
 
 
-def mark_disconnected(device_id):
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.execute("""
-            UPDATE devices SET connected = 0
+def save_device_state(device_id, parameters):
+    """
+    Сохраняет состояние устройства.
+
+    Событие LED создаётся только если:
+    1. Предыдущее значение LED уже известно.
+    2. Новое значение отличается от предыдущего.
+    """
+
+    timestamp = current_time()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("""
+            SELECT led
+            FROM devices
             WHERE device_id = ?
-        """, (device_id,))
-
-
-def get_device_from_db(device_id):
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.row_factory = sqlite3.Row
-        row = connection.execute("""
-            SELECT device_id, last_seen, led, connected
-            FROM devices WHERE device_id = ?
         """, (device_id,)).fetchone()
-        return dict(row) if row else None
+
+        if row is None:
+            conn.execute("""
+                INSERT INTO devices (
+                    device_id,
+                    last_seen,
+                    connected
+                )
+                VALUES (?, ?, 1)
+            """, (
+                device_id,
+                timestamp
+            ))
+
+            previous_led = None
+        else:
+            previous_led = row[0]
+
+        new_led = None
+
+        if "led" in parameters:
+            raw_led = parameters["led"]
+
+            if isinstance(raw_led, bool):
+                new_led = int(raw_led)
+            elif isinstance(raw_led, int) and raw_led in (0, 1):
+                new_led = raw_led
+
+        if new_led is not None:
+            # Сохраняем новое состояние LED.
+            conn.execute("""
+                UPDATE devices
+                SET led = ?,
+                    last_seen = ?,
+                    connected = 1
+                WHERE device_id = ?
+            """, (
+                new_led,
+                timestamp,
+                device_id
+            ))
+
+            # Записываем событие только при реальном изменении.
+            if (
+                previous_led is not None
+                and int(previous_led) != new_led
+            ):
+                save_event_in_connection(
+                    conn,
+                    device_id,
+                    "led",
+                    str(bool(new_led)).lower(),
+                    timestamp
+                )
+
+                print(
+                    f"[СОБЫТИЕ] {device_id}: "
+                    f"LED {'включён' if new_led else 'выключен'}"
+                )
+
+        else:
+            conn.execute("""
+                UPDATE devices
+                SET last_seen = ?,
+                    connected = 1
+                WHERE device_id = ?
+            """, (
+                timestamp,
+                device_id
+            ))
+
+        conn.commit()
+
+    return timestamp
 
 
-def get_all_devices_from_db():
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute("""
-            SELECT device_id, last_seen, led, connected
-            FROM devices ORDER BY device_id
-        """).fetchall()
-        return [dict(row) for row in rows]
+def get_recent_events(limit=30):
+    """
+    Возвращает последние значимые события.
 
+    Старые повторяющиеся подряд значения LED скрываются
+    в выдаче, даже если они уже сохранены в SQLite.
 
-def get_device_events(device_id, limit=10):
-    with sqlite3.connect(DB_PATH) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute("""
-            SELECT event_type, event_value, timestamp
+    Записи в самой базе при этом не удаляются.
+    """
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+
+        rows = conn.execute("""
+            SELECT
+                id,
+                device_id,
+                event_type,
+                event_value,
+                timestamp
             FROM device_events
-            WHERE device_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (device_id, limit)).fetchall()
-        return [dict(row) for row in rows]
+            ORDER BY id ASC
+        """).fetchall()
+
+    filtered_events = []
+
+    # Последнее встреченное значение LED для каждого устройства.
+    last_led_values = {}
+
+    for row in rows:
+        event = dict(row)
+
+        if event["event_type"] == "led":
+            device_id = event["device_id"]
+            value = str(event["event_value"]).lower()
+
+            previous_value = last_led_values.get(device_id)
+
+            # Пропускаем повтор одного и того же состояния.
+            if previous_value == value:
+                continue
+
+            last_led_values[device_id] = value
+
+        filtered_events.append({
+            "device_id": event["device_id"],
+            "event_type": event["event_type"],
+            "event_value": event["event_value"],
+            "timestamp": event["timestamp"]
+        })
+
+    # Сначала оставляем последние значимые события,
+    # затем отображаем их от новых к старым.
+    return list(reversed(filtered_events[-limit:]))
 
 
-async def send_json(websocket, message):
-    await websocket.send(json.dumps(message))
+def get_all_devices():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
 
+        rows = conn.execute("""
+            SELECT device_id, last_seen, led, connected
+            FROM devices
+            ORDER BY device_id
+        """).fetchall()
 
-async def broadcast(message):
-    """Отправляет сообщение всем подключённым браузерам."""
-    if not browser_clients:
-        return
-
-    results = await asyncio.gather(
-        *(send_json(client, message) for client in list(browser_clients)),
-        return_exceptions=True,
-    )
-
-    for client, result in zip(list(browser_clients), results):
-        if isinstance(result, Exception):
-            browser_clients.discard(client)
-
-
-def make_device_list():
-    """Формирует снимок устройств для браузера."""
     result = []
 
-    for saved in get_all_devices_from_db():
-        device_id = saved["device_id"]
+    for row in rows:
+        device_id = row["device_id"]
+
+        parameters = {}
+
+        if row["led"] is not None:
+            parameters["led"] = bool(row["led"])
+
+        parameters.update(device_states.get(device_id, {}))
+
         result.append({
             "device": device_id,
             "connected": device_id in devices,
-            "parameters": device_states.get(device_id, {}),
-            "last_seen": saved["last_seen"],
+            "last_seen": row["last_seen"],
+            "parameters": parameters
         })
 
-    # Учитываем устройства, которые подключены, но ещё не сохранены.
     known_ids = {item["device"] for item in result}
 
     for device_id in devices:
@@ -165,58 +317,99 @@ def make_device_list():
             result.append({
                 "device": device_id,
                 "connected": True,
-                "parameters": device_states.get(device_id, {}),
                 "last_seen": None,
+                "parameters": device_states.get(device_id, {})
             })
 
     return result
 
 
-async def send_device_list(websocket):
-    await send_json(websocket, {
+# =========================
+# WEBSOCKET
+# =========================
+
+async def send_json(websocket, data):
+    await websocket.send(
+        json.dumps(data, ensure_ascii=False)
+    )
+
+
+async def broadcast(data):
+    disconnected_clients = set()
+
+    for websocket in list(browser_clients):
+        try:
+            await send_json(websocket, data)
+        except Exception:
+            disconnected_clients.add(websocket)
+
+    browser_clients.difference_update(disconnected_clients)
+
+
+async def send_device_list(websocket=None):
+    message = {
         "type": "device_list",
-        "devices": make_device_list(),
-    })
+        "devices": get_all_devices()
+    }
+
+    if websocket is not None:
+        await send_json(websocket, message)
+    else:
+        await broadcast(message)
 
 
-async def handle_browser_message(websocket, data):
-    action = data.get("action")
+async def send_event_history(websocket=None):
+    message = {
+        "type": "event_history",
+        "events": get_recent_events()
+    }
+
+    if websocket is not None:
+        await send_json(websocket, message)
+    else:
+        await broadcast(message)
+
+
+# =========================
+# КОМАНДЫ ИЗ БРАУЗЕРА
+# =========================
+
+async def handle_browser_message(websocket, message):
+    global command_counter
+
+    action = message.get("action")
 
     if action == "get_devices":
         await send_device_list(websocket)
         return
 
-    if action == "command":
-        device_id = data.get("device")
-        parameter = data.get("parameter")
-        value = data.get("value")
+    if action == "get_events":
+        await send_event_history(websocket)
+        return
 
-        if not isinstance(device_id, str):
+    if action == "command":
+        device_id = message.get("device")
+        parameter = message.get("parameter")
+        value = message.get("value")
+
+        if not device_id or device_id not in devices:
             await send_json(websocket, {
                 "type": "error",
-                "message": "Некорректный ID устройства",
+                "message": f"Устройство {device_id} не подключено."
             })
             return
 
         if parameter != "led" or not isinstance(value, bool):
             await send_json(websocket, {
                 "type": "error",
-                "message": "Поддерживается только команда управления LED",
+                "message": "Некорректная команда."
             })
             return
 
-        device_ws = devices.get(device_id)
+        command_counter += 1
+        command_id = f"cmd-{command_counter:06d}"
 
-        if device_ws is None:
-            await send_json(websocket, {
-                "type": "error",
-                "message": f"Устройство {device_id} не подключено",
-            })
-            return
-
-        command_id = f"cmd-{next(command_ids):03d}"
-
-        command = {
+        command_payload = {
             "type": "command",
             "id": command_id,
             "device": device_id,
@@ -224,273 +417,301 @@ async def handle_browser_message(websocket, data):
                 "command": "set",
                 "command_id": command_id,
                 "parameter": parameter,
-                "value": value,
-            },
+                "value": value
+            }
         }
 
         try:
-            await send_json(device_ws, command)
+            await send_json(devices[device_id], command_payload)
+
             await send_json(websocket, {
                 "type": "command_sent",
                 "device": device_id,
-                "parameter": parameter,
-                "value": value,
-                "command_id": command_id,
-            })
-        except ConnectionClosed:
-            await send_json(websocket, {
-                "type": "error",
-                "message": f"Соединение с {device_id} закрыто",
+                "command_id": command_id
             })
 
+            print(
+                f"[КОМАНДА] {device_id}: "
+                f"{parameter} = {value}"
+            )
+
+        except Exception as error:
+            await send_json(websocket, {
+                "type": "error",
+                "message": f"Не удалось отправить команду: {error}"
+            })
+
+        return
+
+    await send_json(websocket, {
+        "type": "error",
+        "message": f"Неизвестное действие: {action}"
+    })
+
+
+# =========================
+# ОБРАБОТКА ПОДКЛЮЧЕНИЙ
+# =========================
 
 async def handle_client(websocket):
     client_type = None
     device_id = None
 
-    print(f"Новое подключение: {websocket.remote_address}")
+    remote = getattr(websocket, "remote_address", None)
+    print(f"[ПОДКЛЮЧЕНИЕ] Новое соединение: {remote}")
 
     try:
-        async for message in websocket:
+        async for raw_message in websocket:
             try:
-                data = json.loads(message)
+                message = json.loads(raw_message)
             except json.JSONDecodeError:
                 await send_json(websocket, {
                     "type": "error",
-                    "message": "Некорректный JSON",
+                    "message": "Получен некорректный JSON."
                 })
                 continue
 
-            if not isinstance(data, dict):
-                continue
+            message_type = message.get("type")
 
-            message_type = data.get("type")
+            # -------------------------
+            # Регистрация браузера
+            # -------------------------
 
-            # Браузер регистрируется отдельным сообщением.
             if message_type == "browser_hello":
                 client_type = "browser"
                 browser_clients.add(websocket)
-                print("Подключён веб-браузер")
+
+                print("[БРАУЗЕР] Подключён")
+
                 await send_device_list(websocket)
+                await send_event_history(websocket)
                 continue
 
-            # Остальные сообщения браузера.
             if client_type == "browser":
-                await handle_browser_message(websocket, data)
+                if message_type == "browser_message":
+                    await handle_browser_message(websocket, message)
+                else:
+                    await send_json(websocket, {
+                        "type": "error",
+                        "message": "Неизвестное сообщение браузера."
+                    })
+
                 continue
 
-            # Регистрация ESP32.
-            if message_type == "hello":
-                new_device_id = data.get("device")
+            # -------------------------
+            # Регистрация ESP32
+            # -------------------------
 
-                if (
-                    not isinstance(new_device_id, str)
-                    or not new_device_id.strip()
-                ):
-                    print("Ошибка: некорректный ID устройства")
+            if message_type == "hello":
+                incoming_id = message.get("device")
+
+                if not incoming_id:
+                    await send_json(websocket, {
+                        "type": "error",
+                        "message": "В сообщении hello отсутствует device."
+                    })
                     continue
 
+                device_id = str(incoming_id)
                 client_type = "device"
-                device_id = new_device_id
+
+                old_connection = devices.get(device_id)
 
                 devices[device_id] = websocket
-                device_states.setdefault(device_id, {})
-                save_device_seen(device_id)
+                save_device_seen(device_id, True)
 
-                await send_json(websocket, {
-                    "type": "welcome",
-                    "id": "welcome-001",
-                    "device": device_id,
-                    "data": {"message": "Gateway is ready"},
-                })
+                # Логируем подключение в историю.
+                save_device_event(
+                    device_id,
+                    "connection",
+                    "Подключено"
+                )
 
-                print(f"Устройство зарегистрировано: {device_id}")
-                await broadcast({
-                    "type": "device_list",
-                    "devices": make_device_list(),
-                })
+                print(f"[ESP32] Подключено устройство: {device_id}")
+
+                # Закрываем предыдущее соединение с тем же ID.
+                if (
+                    old_connection is not None
+                    and old_connection is not websocket
+                ):
+                    try:
+                        await old_connection.close()
+                    except Exception:
+                        pass
+
+                await send_device_list()
+                await send_event_history()
                 continue
 
-            if client_type != "device" or device_id is None:
-                print("Получено сообщение от незарегистрированного клиента")
-                continue
+            # -------------------------
+            # Состояние от ESP32
+            # -------------------------
 
-            if message_type == "state":
-                payload = data.get("data", {})
-                if not isinstance(payload, dict):
+            if client_type == "device" and message_type == "state":
+                if message.get("device") != device_id:
                     continue
 
-                parameters = payload.get("parameters", {})
+                data = message.get("data", {})
+                parameters = data.get("parameters", {})
+
                 if not isinstance(parameters, dict):
                     continue
 
-                device_states.setdefault(device_id, {}).update(parameters)
-                save_device_state(device_id, parameters)
+                device_states[device_id] = {
+                    **device_states.get(device_id, {}),
+                    **parameters
+                }
 
-                for parameter, value in parameters.items():
-                    save_device_event(device_id, parameter, value)
+                last_seen = save_device_state(
+                    device_id,
+                    parameters
+                )
 
-                print(f"Состояние {device_id}: {device_states[device_id]}")
+                print(
+                    f"[СОСТОЯНИЕ] {device_id}: {parameters}"
+                )
 
                 await broadcast({
                     "type": "device_state",
                     "device": device_id,
                     "parameters": device_states[device_id],
-                    "last_seen": now(),
+                    "last_seen": last_seen
                 })
 
-            elif message_type == "error":
-                print(f"Ошибка устройства {device_id}: {data}")
+                # История обновляется в браузере, но новые
+                # LED-события добавляются только при изменении.
+                await send_event_history()
+                continue
 
-            else:
-                print(f"Неизвестный тип сообщения: {message_type}")
+            print(f"[ПРЕДУПРЕЖДЕНИЕ] Неизвестное сообщение: {message}")
 
     except ConnectionClosed:
         pass
 
-    finally:
-        if client_type == "browser":
-            browser_clients.discard(websocket)
-            print("Веб-браузер отключён")
+    except Exception as error:
+        print(f"[ОШИБКА] Обработка соединения: {error}")
 
-        elif (
-            client_type == "device"
-            and device_id
+    finally:
+        browser_clients.discard(websocket)
+
+        # Обрабатываем отключение только текущего соединения.
+        # Это не даст старому соединению ошибочно отметить
+        # новое соединение того же устройства отключённым.
+        if (
+            device_id
             and devices.get(device_id) is websocket
         ):
             del devices[device_id]
-            mark_disconnected(device_id)
-            print(f"Устройство отключено: {device_id}")
 
-            await broadcast({
-                "type": "device_list",
-                "devices": make_device_list(),
-            })
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("""
+                    UPDATE devices
+                    SET connected = 0
+                    WHERE device_id = ?
+                """, (device_id,))
+                conn.commit()
+
+            save_device_event(
+                device_id,
+                "connection",
+                "Отключено"
+            )
+
+            print(f"[ESP32] Отключено устройство: {device_id}")
+
+            await send_device_list()
+            await send_event_history()
+
+        elif client_type == "browser":
+            print("[БРАУЗЕР] Отключён")
 
 
-async def console():
+# =========================
+# КОНСОЛЬНЫЕ КОМАНДЫ
+# =========================
+
+async def console_loop():
+    print()
+    print("Команды консоли:")
+    print("  devices          — список устройств")
+    print("  status           — статус Gateway")
+    print("  on               — включить LED выбранного устройства")
+    print("  off              — выключить LED выбранного устройства")
+    print("  use <device_id>  — выбрать устройство")
+    print("  events           — последние события")
+    print("  history          — устройства в базе данных")
+    print("  exit             — остановить Gateway")
+    print()
+
     selected_device = None
 
     while True:
-        raw_command = await asyncio.to_thread(
-            input,
-            "Команда (on/off/info/events/status/devices/history/use/exit): ",
-        )
-        parts = raw_command.strip().split()
+        try:
+            command_line = await asyncio.to_thread(
+                input,
+                "Gateway> "
+            )
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        parts = command_line.strip().split()
 
         if not parts:
             continue
 
-        action = parts[0].lower()
+        command = parts[0].lower()
 
-        if action == "exit":
-            print("Завершение работы Gateway...")
+        if command == "exit":
+            print("Останавливаем Gateway...")
             return
 
-        elif action == "status":
-            print(f"Подключено устройств: {len(devices)}")
+        elif command == "status":
+            print(f"WebSocket: ws://0.0.0.0:{PORT}")
+            print(f"Подключено ESP32: {len(devices)}")
+            print(f"Подключено браузеров: {len(browser_clients)}")
 
-        elif action == "devices":
-            if devices:
-                print("Подключённые устройства:")
-                for device_id in devices:
-                    marker = " (выбрано)" if device_id == selected_device else ""
-                    print(f"- {device_id}{marker}")
-            else:
-                print("Подключённые устройства отсутствуют.")
-            print(f"Всего подключено: {len(devices)}")
+        elif command == "devices":
+            all_devices = get_all_devices()
 
-        elif action == "use":
-            if len(parts) != 2:
+            for item in all_devices:
+                status = (
+                    "онлайн"
+                    if item["connected"]
+                    else "офлайн"
+                )
+
+                print(
+                    f'{item["device"]}: {status}, '
+                    f'{item["parameters"]}'
+                )
+
+            if not all_devices:
+                print("Устройств пока нет.")
+
+        elif command == "use":
+            if len(parts) < 2:
                 print("Использование: use <device_id>")
-                continue
-
-            if parts[1] not in devices:
-                print(f"Устройство {parts[1]} не подключено")
-                continue
-
-            selected_device = parts[1]
-            print(f"Выбрано устройство: {selected_device}")
-
-        elif action == "info":
-            if selected_device is None:
-                print("Сначала выбери устройство: use <device_id>")
-                continue
-
-            state = get_device_from_db(selected_device)
-            if state is None:
-                print("Информация об устройстве не найдена")
-                continue
-
-            print(f"Устройство: {selected_device}")
-            print("Подключение:", "активно" if selected_device in devices else "отсутствует")
-            print(f"Последнее сообщение: {state['last_seen']}")
-
-            if state["led"] is None:
-                print("LED: состояние неизвестно")
             else:
-                print("LED:", "включён" if state["led"] else "выключен")
+                selected_device = parts[1]
+                print(f"Выбрано устройство: {selected_device}")
 
-        elif action == "events":
-            if selected_device is None:
-                print("Сначала выбери устройство: use <device_id>")
+        elif command in ("on", "off"):
+            if not selected_device:
+                print("Сначала выбери устройство: use esp32-01")
                 continue
 
-            events = get_device_events(selected_device)
-            if not events:
-                print("История событий пока пуста.")
-                continue
-
-            print(f"Последние события: {selected_device}")
-            for event in reversed(events):
-                value = event["event_value"]
-
-                if event["event_type"] == "led":
-                    if value.lower() == "true":
-                        value = "включён"
-                    elif value.lower() == "false":
-                        value = "выключен"
-
+            if selected_device not in devices:
                 print(
-                    f"{event['timestamp']} | "
-                    f"{event['event_type']}: {value}"
+                    f"Устройство {selected_device} "
+                    "не подключено."
                 )
-
-        elif action == "history":
-            saved_devices = get_all_devices_from_db()
-            if not saved_devices:
-                print("В базе пока нет устройств.")
                 continue
 
-            for state in saved_devices:
-                led = (
-                    "неизвестно" if state["led"] is None
-                    else "включён" if state["led"]
-                    else "выключен"
-                )
-                connection = (
-                    "подключено"
-                    if state["device_id"] in devices
-                    else "не подключено"
-                )
-                print(
-                    f"{state['device_id']} | LED: {led} | {connection} | "
-                    f"последнее сообщение: {state['last_seen']}"
-                )
+            value = command == "on"
+            command_counter += 1
+            command_id = f"console-{command_counter:06d}"
 
-        elif action in ("on", "off"):
-            if selected_device is None:
-                print("Сначала выбери устройство: use <device_id>")
-                continue
-
-            device_ws = devices.get(selected_device)
-            if device_ws is None:
-                print(f"Устройство {selected_device} отключено")
-                selected_device = None
-                continue
-
-            command_id = f"cmd-{next(command_ids):03d}"
-            command = {
+            payload = {
                 "type": "command",
                 "id": command_id,
                 "device": selected_device,
@@ -498,35 +719,77 @@ async def console():
                     "command": "set",
                     "command_id": command_id,
                     "parameter": "led",
-                    "value": action == "on",
-                },
+                    "value": value
+                }
             }
 
             try:
-                await send_json(device_ws, command)
-                print(f"Команда {action} отправлена → {selected_device}")
-            except ConnectionClosed:
-                print(f"Соединение с {selected_device} закрыто")
+                await send_json(
+                    devices[selected_device],
+                    payload
+                )
+
+                print(f"Команда отправлена: LED = {value}")
+
+            except Exception as error:
+                print(f"Не удалось отправить команду: {error}")
+
+        elif command == "events":
+            for event in get_recent_events(10):
+                print(
+                    f'{event["timestamp"]} | '
+                    f'{event["device_id"]} | '
+                    f'{event["event_type"]}: '
+                    f'{event["event_value"]}'
+                )
+
+        elif command == "history":
+            with sqlite3.connect(DB_PATH) as conn:
+                rows = conn.execute("""
+                    SELECT device_id, last_seen, led, connected
+                    FROM devices
+                    ORDER BY device_id
+                """).fetchall()
+
+            for row in rows:
+                print(
+                    f"ID: {row[0]}, "
+                    f"последнее сообщение: {row[1]}, "
+                    f"LED: {row[2]}, "
+                    f"подключено: {bool(row[3])}"
+                )
+
+            if not rows:
+                print("История устройств пока пуста.")
 
         else:
             print(
-                "Доступно: on, off, info, events, status, devices, "
-                "history, use <device_id>, exit"
+                "Неизвестная команда. "
+                "Доступно: devices, status, on, off, "
+                "use, events, history, exit."
             )
 
+
+# =========================
+# ЗАПУСК GATEWAY
+# =========================
 
 async def main():
     init_db()
 
-    async with websockets.serve(handle_client, "0.0.0.0", 8765):
-        print(f"База данных: {DB_PATH}")
-        print("Gateway запущен на порту 8765")
-        print("Ожидаем подключения ESP32 и браузера...")
-        await console()
+    print("=" * 48)
+    print("        IoT Gateway запускается")
+    print("=" * 48)
+
+    async with websockets.serve(handle_client, HOST, PORT):
+        print(f"WebSocket-сервер запущен на порту {PORT}")
+        print("Ожидание подключений ESP32 и браузера...")
+
+        await console_loop()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nGateway остановлен")
+        print("\nGateway остановлен.")
