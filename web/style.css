@@ -170,3 +170,132 @@ footer {
         padding: 17px;
     }
 }
+
+/* История событий */
+
+.event-history {
+    margin-top: 18px;
+}
+
+.event-device-filter-group {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 14px 0;
+    color: #cbd5e1;
+    font-size: 13px;
+}
+
+.event-device-filter {
+    min-width: 180px;
+    padding: 8px 11px;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    background: #1e293b;
+    color: #f8fafc;
+    font-size: 13px;
+}
+
+.event-filter-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 16px 0 10px;
+}
+
+.event-filter {
+    padding: 8px 13px;
+    border: 1px solid #475569;
+    border-radius: 999px;
+    background: #1e293b;
+    color: #cbd5e1;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.2s, border-color 0.2s;
+}
+
+.event-filter:hover {
+    background: #334155;
+}
+
+.event-filter.active {
+    background: #334155;
+    border-color: #60a5fa;
+    color: #ffffff;
+}
+
+.event-summary {
+    margin: 8px 0 14px;
+    color: #94a3b8;
+    font-size: 13px;
+}
+
+.event-list {
+    display: grid;
+    gap: 10px;
+}
+
+.event-entry {
+    padding: 13px 14px;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.45);
+}
+
+.event-entry-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.event-device {
+    color: #f1f5f9;
+    font-size: 14px;
+}
+
+.event-type {
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: #263a56;
+    color: #bfdbfe;
+    font-size: 11px;
+}
+
+.event-description {
+    margin: 10px 0 6px;
+    color: #e2e8f0;
+    font-size: 14px;
+}
+
+.event-time {
+    color: #94a3b8;
+    font-size: 12px;
+}
+
+.event-empty {
+    padding: 12px 0;
+    color: #94a3b8;
+}
+
+.event-load-more {
+    display: block;
+    margin: 16px auto 0;
+}
+
+.event-load-more:disabled {
+    cursor: wait;
+    opacity: 0.7;
+}
+
+@media (max-width: 600px) {
+    .event-entry {
+        padding: 11px;
+    }
+
+    .event-filter {
+        padding: 7px 10px;
+    }
+}

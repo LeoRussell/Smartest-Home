@@ -30,6 +30,35 @@ void sendState(bool ledOn) {
     Serial.println(message);
 }
 
+void sendCommandResult(
+    const char* commandId,
+    const char* parameter,
+    bool success,
+    bool value,
+    const char* errorMessage = nullptr
+) {
+    JsonDocument doc;
+
+    doc["type"] = "command_result";
+    doc["id"] = commandId;
+    doc["command_id"] = commandId;
+    doc["device"] = "esp32-01";
+    doc["success"] = success;
+    doc["data"]["parameter"] = parameter;
+    doc["data"]["value"] = value;
+
+    if (errorMessage) {
+        doc["data"]["error"] = errorMessage;
+    }
+
+    String message;
+    serializeJson(doc, message);
+    webSocket.sendTXT(message);
+
+    Serial.print("Command result sent: ");
+    Serial.println(message);
+}
+
 void onWebSocketEvent(
     WStype_t type,
     uint8_t* payload,
@@ -63,9 +92,16 @@ void onWebSocketEvent(
             const char* typeName = doc["type"] | "";
 
             if (strcmp(typeName, "command") == 0) {
+                const char* commandId =
+                    doc["data"]["command_id"] | "";
                 const char* parameter =
                     doc["data"]["parameter"] | "";
                 bool value = doc["data"]["value"] | false;
+
+                if (commandId[0] == '\0') {
+                    Serial.println("Command has no command_id");
+                    break;
+                }
 
                 if (strcmp(parameter, "led") == 0) {
                     digitalWrite(
@@ -73,11 +109,30 @@ void onWebSocketEvent(
                         value ? HIGH : LOW
                     );
 
+                    bool actualValue = digitalRead(LED_PIN) == HIGH;
+
                     Serial.println(
-                        value ? "LED ON" : "LED OFF"
+                        actualValue ? "LED ON" : "LED OFF"
                     );
 
-                    sendState(value);
+                    sendState(actualValue);
+                    sendCommandResult(
+                        commandId,
+                        parameter,
+                        actualValue == value,
+                        actualValue,
+                        actualValue == value
+                            ? nullptr
+                            : "LED output did not reach requested value"
+                    );
+                } else {
+                    sendCommandResult(
+                        commandId,
+                        parameter,
+                        false,
+                        false,
+                        "Unsupported parameter"
+                    );
                 }
             }
 

@@ -27,6 +27,11 @@ browser_clients = set()
 # Последние известные состояния устройств
 device_states = {}
 
+# Команды, ожидающие результата: command_id -> контекст команды.
+pending_commands = {}
+COMMAND_TIMEOUT_SECONDS = 5
+EVENTS_PAGE_SIZE = 30
+
 command_counter = 0
 
 
@@ -281,6 +286,42 @@ def get_recent_events(limit=30):
     return list(reversed(filtered_events[-limit:]))
 
 
+def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None):
+    conditions = []
+    parameters = []
+
+    if device_id is not None:
+        conditions.append("device_id = ?")
+        parameters.append(device_id)
+
+    if before_id is not None:
+        conditions.append("id < ?")
+        parameters.append(before_id)
+
+    where_clause = (
+        f"WHERE {' AND '.join(conditions)}"
+        if conditions
+        else ""
+    )
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(f"""
+            SELECT id, device_id, event_type, event_value, timestamp
+            FROM device_events
+            {where_clause}
+            ORDER BY id DESC
+            LIMIT ?
+        """, (*parameters, limit + 1)).fetchall()
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    events = [dict(row) for row in page]
+    next_before_id = page[-1]["id"] if has_more and page else None
+
+    return events, has_more, next_before_id
+
+
 def get_all_devices():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -358,16 +399,117 @@ async def send_device_list(websocket=None):
         await broadcast(message)
 
 
-async def send_event_history(websocket=None):
+async def send_event_history(
+    websocket=None,
+    device_id=None,
+    before_id=None,
+    request_id=None
+):
+    events, has_more, next_before_id = get_event_page(
+        device_id=device_id,
+        before_id=before_id
+    )
+
     message = {
         "type": "event_history",
-        "events": get_recent_events()
+        "events": events,
+        "has_more": has_more,
+        "next_before_id": next_before_id,
+        "device_filter": device_id or "all"
     }
+
+    if request_id is not None:
+        message["request_id"] = request_id
 
     if websocket is not None:
         await send_json(websocket, message)
     else:
         await broadcast(message)
+
+
+def remove_pending_command(command_id):
+    pending = pending_commands.pop(command_id, None)
+
+    if pending is not None:
+        timeout_task = pending.get("timeout_task")
+
+        if (
+            timeout_task is not None
+            and timeout_task is not asyncio.current_task()
+        ):
+            timeout_task.cancel()
+
+    return pending
+
+
+async def send_pending_command_result(pending, status, value, error):
+    if pending["browser"] is None:
+        print(
+            f"[КОМАНДА] {pending['command_id']} ({pending['device']}): "
+            f"{status}; {error or value}"
+        )
+        return
+
+    message = {
+        "type": "command_result",
+        "command_id": pending["command_id"],
+        "device": pending["device"],
+        "success": status == "succeeded",
+        "status": status,
+        "parameter": pending["parameter"],
+        "value": value
+    }
+
+    if error:
+        message["error"] = error
+
+    try:
+        await send_json(pending["browser"], message)
+    except Exception:
+        pass
+
+
+async def expire_pending_command(command_id):
+    await asyncio.sleep(COMMAND_TIMEOUT_SECONDS)
+    pending = remove_pending_command(command_id)
+
+    if pending is not None:
+        await send_pending_command_result(
+            pending,
+            "timeout",
+            pending["value"],
+            "Устройство не подтвердило выполнение за отведённое время."
+        )
+
+
+async def finish_pending_commands_for_device(device_id, status, error):
+    command_ids = [
+        command_id
+        for command_id, pending in pending_commands.items()
+        if pending["device"] == device_id
+    ]
+
+    for command_id in command_ids:
+        pending = remove_pending_command(command_id)
+
+        if pending is not None:
+            await send_pending_command_result(
+                pending,
+                status,
+                pending["value"],
+                error
+            )
+
+
+def remove_pending_commands_for_browser(websocket):
+    command_ids = [
+        command_id
+        for command_id, pending in pending_commands.items()
+        if pending["browser"] is websocket
+    ]
+
+    for command_id in command_ids:
+        remove_pending_command(command_id)
 
 
 # =========================
@@ -384,17 +526,56 @@ async def handle_browser_message(websocket, message):
         return
 
     if action == "get_events":
-        await send_event_history(websocket)
+        device_id = message.get("device", "all")
+        before_id = message.get("before_id")
+        request_id = message.get("request_id")
+
+        if device_id == "all":
+            device_id = None
+        elif not isinstance(device_id, str) or not 1 <= len(device_id) <= 64:
+            await send_json(websocket, {
+                "type": "error",
+                "request_id": request_id,
+                "message": "Некорректный фильтр устройства истории."
+            })
+            return
+
+        if before_id is not None and (type(before_id) is not int or before_id < 1):
+            await send_json(websocket, {
+                "type": "error",
+                "request_id": request_id,
+                "message": "Некорректный курсор истории."
+            })
+            return
+
+        if request_id is not None and (
+            not isinstance(request_id, str)
+            or not 1 <= len(request_id) <= 80
+        ):
+            await send_json(websocket, {
+                "type": "error",
+                "message": "Некорректный ID запроса истории."
+            })
+            return
+
+        await send_event_history(
+            websocket,
+            device_id=device_id,
+            before_id=before_id,
+            request_id=request_id
+        )
         return
 
     if action == "command":
         device_id = message.get("device")
+        requested_command_id = message.get("command_id")
         parameter = message.get("parameter")
         value = message.get("value")
 
         if not device_id or device_id not in devices:
             await send_json(websocket, {
                 "type": "error",
+                "command_id": requested_command_id,
                 "message": f"Устройство {device_id} не подключено."
             })
             return
@@ -402,12 +583,34 @@ async def handle_browser_message(websocket, message):
         if parameter != "led" or not isinstance(value, bool):
             await send_json(websocket, {
                 "type": "error",
+                "command_id": requested_command_id,
                 "message": "Некорректная команда."
             })
             return
 
-        command_counter += 1
-        command_id = f"cmd-{command_counter:06d}"
+        if requested_command_id is None:
+            command_counter += 1
+            command_id = f"cmd-{command_counter:06d}"
+        elif (
+            isinstance(requested_command_id, str)
+            and 1 <= len(requested_command_id) <= 80
+        ):
+            command_id = requested_command_id
+        else:
+            await send_json(websocket, {
+                "type": "error",
+                "command_id": requested_command_id,
+                "message": "Некорректный command_id."
+            })
+            return
+
+        if command_id in pending_commands:
+            await send_json(websocket, {
+                "type": "error",
+                "command_id": command_id,
+                "message": "Команда с таким command_id уже ожидает результат."
+            })
+            return
 
         command_payload = {
             "type": "command",
@@ -421,25 +624,45 @@ async def handle_browser_message(websocket, message):
             }
         }
 
+        pending = {
+            "command_id": command_id,
+            "device": device_id,
+            "browser": websocket,
+            "parameter": parameter,
+            "value": value,
+            "timeout_task": None
+        }
+        pending_commands[command_id] = pending
+
         try:
             await send_json(devices[device_id], command_payload)
+        except Exception as error:
+            remove_pending_command(command_id)
+            await send_json(websocket, {
+                "type": "error",
+                "command_id": command_id,
+                "message": f"Не удалось отправить команду: {error}"
+            })
+            return
 
+        pending["timeout_task"] = asyncio.create_task(
+            expire_pending_command(command_id)
+        )
+
+        try:
             await send_json(websocket, {
                 "type": "command_sent",
                 "device": device_id,
-                "command_id": command_id
+                "command_id": command_id,
+                "status": "sent"
             })
+        except Exception:
+            return
 
-            print(
-                f"[КОМАНДА] {device_id}: "
-                f"{parameter} = {value}"
-            )
-
-        except Exception as error:
-            await send_json(websocket, {
-                "type": "error",
-                "message": f"Не удалось отправить команду: {error}"
-            })
+        print(
+            f"[КОМАНДА] {device_id}: "
+            f"{parameter} = {value} ({command_id})"
+        )
 
         return
 
@@ -484,7 +707,6 @@ async def handle_client(websocket):
                 print("[БРАУЗЕР] Подключён")
 
                 await send_device_list(websocket)
-                await send_event_history(websocket)
                 continue
 
             if client_type == "browser":
@@ -534,6 +756,12 @@ async def handle_client(websocket):
                     old_connection is not None
                     and old_connection is not websocket
                 ):
+                    await finish_pending_commands_for_device(
+                        device_id,
+                        "unavailable",
+                        "Соединение устройства было заменено до получения результата."
+                    )
+
                     try:
                         await old_connection.close()
                     except Exception:
@@ -546,6 +774,69 @@ async def handle_client(websocket):
             # -------------------------
             # Состояние от ESP32
             # -------------------------
+
+            if client_type == "device" and message_type == "command_result":
+                if message.get("device") != device_id:
+                    continue
+
+                command_id = message.get("command_id")
+                success = message.get("success")
+                data = message.get("data", {})
+
+                if (
+                    not isinstance(command_id, str)
+                    or not 1 <= len(command_id) <= 80
+                    or type(success) is not bool
+                    or not isinstance(data, dict)
+                ):
+                    continue
+
+                parameter = data.get("parameter")
+                value = data.get("value")
+                error_message = data.get("error")
+
+                if (
+                    not isinstance(parameter, str)
+                    or not parameter
+                    or not isinstance(value, bool)
+                    or (
+                        error_message is not None
+                        and not isinstance(error_message, str)
+                    )
+                ):
+                    continue
+
+                pending = pending_commands.get(command_id)
+
+                if pending is None or pending["device"] != device_id:
+                    print(
+                        f"[ПРЕДУПРЕЖДЕНИЕ] Игнорируется неизвестный "
+                        f"результат команды {command_id} от {device_id}."
+                    )
+                    continue
+
+                if (
+                    success
+                    and parameter == pending["parameter"]
+                    and value == pending["value"]
+                ):
+                    status = "succeeded"
+                    result_error = None
+                else:
+                    status = "failed"
+                    result_error = error_message or (
+                        "Устройство вернуло результат, не совпадающий "
+                        "с отправленной командой."
+                    )
+
+                pending = remove_pending_command(command_id)
+                await send_pending_command_result(
+                    pending,
+                    status,
+                    value,
+                    result_error
+                )
+                continue
 
             if client_type == "device" and message_type == "state":
                 if message.get("device") != device_id:
@@ -571,12 +862,14 @@ async def handle_client(websocket):
                     f"[СОСТОЯНИЕ] {device_id}: {parameters}"
                 )
 
-                await broadcast({
+                state_message = {
                     "type": "device_state",
                     "device": device_id,
                     "parameters": device_states[device_id],
                     "last_seen": last_seen
-                })
+                }
+
+                await broadcast(state_message)
 
                 # История обновляется в браузере, но новые
                 # LED-события добавляются только при изменении.
@@ -603,6 +896,12 @@ async def handle_client(websocket):
         ):
             del devices[device_id]
 
+            await finish_pending_commands_for_device(
+                device_id,
+                "unavailable",
+                "Устройство отключилось до получения результата команды."
+            )
+
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("""
                     UPDATE devices
@@ -623,6 +922,7 @@ async def handle_client(websocket):
             await send_event_history()
 
         elif client_type == "browser":
+            remove_pending_commands_for_browser(websocket)
             print("[БРАУЗЕР] Отключён")
 
 
@@ -723,15 +1023,30 @@ async def console_loop():
                 }
             }
 
+            pending = {
+                "command_id": command_id,
+                "device": selected_device,
+                "browser": None,
+                "parameter": "led",
+                "value": value,
+                "timeout_task": None
+            }
+            pending_commands[command_id] = pending
+
             try:
                 await send_json(
                     devices[selected_device],
                     payload
                 )
 
+                pending["timeout_task"] = asyncio.create_task(
+                    expire_pending_command(command_id)
+                )
+
                 print(f"Команда отправлена: LED = {value}")
 
             except Exception as error:
+                remove_pending_command(command_id)
                 print(f"Не удалось отправить команду: {error}")
 
         elif command == "events":
