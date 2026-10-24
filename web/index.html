@@ -8,13 +8,17 @@
 </head>
 <body>
     <header class="topbar">
-        <div>
-            <h1>IoT Gateway</h1>
-            <p>Панель управления устройствами</p>
+        <div class="brand">
+            <div class="brand-mark" aria-hidden="true">SH</div>
+            <div>
+                <p class="eyebrow">SMART HOME · LOCAL GATEWAY</p>
+                <h1>IoT Gateway</h1>
+                <p>Управление устройствами и состоянием системы</p>
+            </div>
         </div>
-        <div class="server-status">
-            <span class="status-dot"></span>
-            <span>Веб-интерфейс запущен</span>
+        <div class="server-status" role="status" aria-live="polite">
+            <span class="status-dot" id="gateway-status-dot"></span>
+            <span id="gateway-status">Нет соединения с Gateway</span>
         </div>
     </header>
 
@@ -22,37 +26,19 @@
         <section class="section-heading">
             <div>
                 <h2>Устройства</h2>
-                <p>Подключённые устройства IoT Gateway</p>
+                <p>Состояние и доступные действия</p>
             </div>
             <button id="refresh-button">Обновить</button>
         </section>
 
-        <section class="device-card">
-            <div class="device-heading">
-                <div class="device-icon">ESP</div>
-                <div>
-                    <h3>ESP32-S3</h3>
-                    <p class="device-id">esp32-01</p>
-                </div>
-                <span class="badge" id="device-status">Ожидание</span>
-            </div>
+        <section id="dashboard-overview" class="dashboard-overview" aria-label="Сводка устройств"></section>
 
-            <div class="divider"></div>
-
-            <div class="parameter">
-                <span>Светодиод (LED)</span>
-                <strong id="led-status">Неизвестно</strong>
-            </div>
-
-            <p class="hint">
-                На следующем этапе здесь появятся рабочие кнопки управления.
-            </p>
-        </section>
+        <section class="device-card" aria-live="polite"></section>
 
         <section class="activity-card">
             <h2>События</h2>
             <p id="activity-message">
-                Веб-страница готова. Подключение к Gateway добавим следующим шагом.
+                Подключаемся к Gateway...
             </p>
         </section>
     </main>
@@ -60,6 +46,6 @@
     <footer>
         IoT Gateway · Локальная сеть
     </footer>
-	<script src="app.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>

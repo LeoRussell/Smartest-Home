@@ -1,0 +1,25 @@
+[Unit]
+Description=Smartest Home IoT Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smartest-home
+Group=smartest-home
+WorkingDirectory=/opt/smartest-home
+Environment=PYTHONUNBUFFERED=1
+Environment=GATEWAY_HOST=0.0.0.0
+Environment=GATEWAY_PORT=8765
+Environment=GATEWAY_DB_PATH=/var/lib/smartest-home/gateway.db
+ExecStart=/opt/smartest-home/.venv/bin/python /opt/smartest-home/gateway/main.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/smartest-home
+
+[Install]
+WantedBy=multi-user.target

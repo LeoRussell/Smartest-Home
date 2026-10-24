@@ -2,6 +2,9 @@ const deviceCard = document.querySelector(".device-card");
 const activityMessage = document.getElementById("activity-message");
 const refreshButton = document.getElementById("refresh-button");
 const activityCard = document.querySelector(".activity-card");
+const overview = document.getElementById("dashboard-overview");
+const gatewayStatus = document.getElementById("gateway-status");
+const gatewayStatusDot = document.getElementById("gateway-status-dot");
 
 // =========================
 // СОСТОЯНИЕ ПРИЛОЖЕНИЯ
@@ -21,6 +24,7 @@ let eventRequestSequence = 0;
 let activeEventRequest = null;
 
 const pendingCommands = new Map();
+const pendingSchemaDecisions = new Set();
 const COMMAND_TIMEOUT_MS = 7000;
 let commandSequence = 0;
 
@@ -57,12 +61,22 @@ function setActivity(message) {
     }
 }
 
+function setGatewayConnectionStatus(message, connected) {
+    if (gatewayStatus) gatewayStatus.textContent = message;
+    if (gatewayStatusDot) {
+        gatewayStatusDot.classList.toggle("connected", connected);
+        gatewayStatusDot.classList.toggle("disconnected", !connected);
+    }
+}
+
 function clearPendingCommand(commandId) {
     const pending = pendingCommands.get(commandId);
 
     if (pending) {
         clearTimeout(pending.timer);
         pendingCommands.delete(commandId);
+        const device = devices.find(item => item.device === pending.deviceId);
+        if (device) updateDevicePanel(device);
     }
 }
 
@@ -72,6 +86,23 @@ function clearAllPendingCommands() {
     }
 
     pendingCommands.clear();
+    for (const device of devices) updateDevicePanel(device);
+}
+
+function hasPendingParameterCommand(deviceId, parameter) {
+    return [...pendingCommands.values()].some(pending =>
+        pending.deviceId === deviceId && pending.parameter === parameter
+    );
+}
+
+function hasPendingAction(deviceId, actionId) {
+    return [...pendingCommands.values()].some(pending =>
+        pending.deviceId === deviceId && pending.actionId === actionId
+    );
+}
+
+function isGatewayConnected() {
+    return socket?.readyState === WebSocket.OPEN;
 }
 
 // =========================
@@ -90,13 +121,16 @@ function connectGateway() {
     }
 
     clearTimeout(reconnectTimer);
+    setGatewayConnectionStatus("Подключение к Gateway...", false);
 
     const host = window.location.hostname || "localhost";
 
     socket = new WebSocket(`ws://${host}:8765`);
 
     socket.addEventListener("open", () => {
+        setGatewayConnectionStatus("Gateway подключён", true);
         setActivity("Подключено к Gateway.");
+        for (const device of devices) updateDevicePanel(device);
 
         socket.send(JSON.stringify({
             type: "browser_hello"
@@ -121,6 +155,8 @@ function connectGateway() {
     });
 
     socket.addEventListener("close", () => {
+        setGatewayConnectionStatus("Нет соединения с Gateway", false);
+        pendingSchemaDecisions.clear();
         clearAllPendingCommands();
 
         setActivity(
@@ -135,6 +171,7 @@ function connectGateway() {
     });
 
     socket.addEventListener("error", (error) => {
+        setGatewayConnectionStatus("Ошибка соединения с Gateway", false);
         console.error("Ошибка WebSocket:", error);
         setActivity("Ошибка соединения с Gateway.");
     });
@@ -182,6 +219,7 @@ function handleGatewayMessage(message) {
             let device = devices.find(
                 item => item.device === message.device
             );
+            const isNewDevice = !device;
 
             if (device) {
                 device.parameters = {
@@ -202,11 +240,11 @@ function handleGatewayMessage(message) {
                 devices.push(device);
             }
 
-            renderDevices();
-
-            setActivity(
-                `Получено состояние от ${message.device}.`
-            );
+            if (isNewDevice) {
+                renderDevices();
+            } else {
+                updateDevicePanel(device);
+            }
 
             break;
         }
@@ -214,22 +252,41 @@ function handleGatewayMessage(message) {
         case "command_result": {
             const pending = pendingCommands.get(message.command_id);
 
-            if (!pending || message.device !== pending.deviceId) {
+            if (
+                !pending ||
+                message.device !== pending.deviceId ||
+                (pending.actionId
+                    ? message.action !== pending.actionId
+                    : message.parameter !== pending.parameter)
+            ) {
                 break;
+            }
+
+            if (pending.parameter) {
+                const panel = [...(deviceCard?.querySelectorAll(".device-panel") || [])]
+                    .find(item => item.dataset.deviceId === pending.deviceId);
+                const input = [...(panel?.querySelectorAll('[data-role="parameter-input"]') || [])]
+                    .find(item => item.dataset.parameterId === pending.parameter);
+                if (input) input.dataset.dirty = "false";
             }
 
             clearPendingCommand(message.command_id);
 
             if (
                 message.success === true &&
-                message.parameter === "led" &&
-                message.value === pending.value
+                (pending.actionId || message.value === pending.value)
             ) {
-                const stateText = message.value ? "включён" : "выключен";
-
-                setActivity(
-                    `Подтверждено: LED на ${message.device} ${stateText}.`
+                const device = devices.find(
+                    item => item.device === message.device
                 );
+                if (pending.actionId) {
+                    const label = device?.schema?.actions?.[pending.actionId]?.label || pending.actionId;
+                    setActivity(`Действие «${label}» на ${message.device} выполнено.`);
+                } else {
+                    const definition = device?.schema?.parameters?.[pending.parameter];
+                    const label = definition?.label || pending.parameter;
+                    setActivity(`Подтверждено: ${label} на ${message.device} обновлено.`);
+                }
             } else if (message.status === "timeout") {
                 setActivity(
                     `Gateway не получил подтверждение от ${message.device} ` +
@@ -248,7 +305,7 @@ function handleGatewayMessage(message) {
             } else {
                 setActivity(
                     `Результат команды ${pending.commandId} не совпал ` +
-                    `с ожидаемым состоянием LED.`
+                    `с ожидаемым значением параметра.`
                 );
             }
 
@@ -318,6 +375,15 @@ function handleGatewayMessage(message) {
             break;
         }
 
+        case "schema_decision_result": {
+            pendingSchemaDecisions.delete(
+                `${message.device}\u0000${message.proposal_id}`
+            );
+            setActivity(message.message || "Решение по Schema обработано.");
+            if (message.success !== true) requestDevices();
+            break;
+        }
+
         case "error": {
             if (
                 message.request_id &&
@@ -330,7 +396,10 @@ function handleGatewayMessage(message) {
             }
 
             if (message.command_id) {
+                const pending = pendingCommands.get(message.command_id);
                 clearPendingCommand(message.command_id);
+                const device = devices.find(item => item.device === pending?.deviceId);
+                if (device) updateDevicePanel(device);
             }
 
             const errorText = message.message || "Неизвестная ошибка";
@@ -350,103 +419,317 @@ function handleGatewayMessage(message) {
 // ОТОБРАЖЕНИЕ УСТРОЙСТВ
 // =========================
 
+function canonicalJson(value) {
+    if (Array.isArray(value)) {
+        return `[${value.map(canonicalJson).join(",")}]`;
+    }
+    if (value && typeof value === "object") {
+        return `{${Object.keys(value).sort().map(key =>
+            `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+        ).join(",")}}`;
+    }
+    return JSON.stringify(value);
+}
+
+function describeSchemaChanges(previousSchema, nextSchema) {
+    const changes = [];
+    const groups = [
+        ["parameters", "Параметр"],
+        ["actions", "Действие"]
+    ];
+
+    for (const [group, label] of groups) {
+        const previous = previousSchema?.[group] || {};
+        const next = nextSchema?.[group] || {};
+        const ids = new Set([...Object.keys(previous), ...Object.keys(next)]);
+
+        for (const id of ids) {
+            if (!(id in previous)) {
+                changes.push(`${label} «${next[id].label || id}» добавлен`);
+            } else if (!(id in next)) {
+                changes.push(`${label} «${previous[id].label || id}» удалён`);
+            } else if (canonicalJson(previous[id]) !== canonicalJson(next[id])) {
+                const oldLabel = previous[id].label || id;
+                const newLabel = next[id].label || id;
+                changes.push(oldLabel === newLabel
+                    ? `${label} «${newLabel}» изменён`
+                    : `${label} «${oldLabel}» переименован в «${newLabel}»`);
+            }
+        }
+    }
+
+    if (changes.length === 0 && canonicalJson(previousSchema) !== canonicalJson(nextSchema)) {
+        changes.push("Изменились другие поля Schema");
+    }
+    return changes;
+}
+
+function createSchemaReview(device) {
+    const proposal = device.pending_schema;
+    const review = document.createElement("section");
+    review.className = "schema-review";
+
+    const heading = document.createElement("h4");
+    heading.textContent = "Обнаружено изменение Schema";
+
+    const version = document.createElement("p");
+    const oldVersion = device.schema_version ?? "не указана";
+    const newVersion = proposal.schema_version ?? "не указана";
+    version.textContent = `Сохранённая версия: ${oldVersion} · новая версия: ${newVersion}`;
+
+    const list = document.createElement("ul");
+    for (const change of describeSchemaChanges(device.schema, proposal.schema)) {
+        const item = document.createElement("li");
+        item.textContent = change;
+        list.appendChild(item);
+    }
+
+    const note = document.createElement("p");
+    note.className = "schema-review-note";
+    note.textContent = "Пока вы выбираете, действует прежняя Schema и команды заблокированы. Если оставить её, Gateway повторит предложение при следующем подключении устройства.";
+
+    const buttons = document.createElement("div");
+    buttons.className = "schema-review-buttons";
+
+    const accept = document.createElement("button");
+    accept.type = "button";
+    accept.textContent = "Принять Schema";
+    const decisionKey = `${device.device}\u0000${proposal.proposal_id}`;
+    accept.disabled = !isGatewayConnected() || pendingSchemaDecisions.has(decisionKey);
+    accept.addEventListener("click", () => {
+        sendSchemaDecision(device.device, proposal.proposal_id, "accept");
+    });
+
+    const reject = document.createElement("button");
+    reject.type = "button";
+    reject.className = "secondary-button";
+    reject.textContent = "Оставить текущую Schema";
+    reject.disabled = !isGatewayConnected() || pendingSchemaDecisions.has(decisionKey);
+    reject.addEventListener("click", () => {
+        sendSchemaDecision(device.device, proposal.proposal_id, "reject");
+    });
+
+    buttons.append(accept, reject);
+    review.append(heading, version, list, note, buttons);
+    return review;
+}
+
 function renderDevices() {
     if (!deviceCard) {
         console.error("Не найден элемент .device-card");
         return;
     }
 
+    const drafts = new Map();
+    for (const input of deviceCard.querySelectorAll('[data-role="parameter-input"][data-dirty="true"]')) {
+        drafts.set(`${input.dataset.deviceId}\u0000${input.dataset.parameterId}`, input.value);
+    }
+
     deviceCard.replaceChildren();
 
     if (devices.length === 0) {
         const empty = document.createElement("p");
+        empty.className = "device-empty";
         empty.textContent = "Устройства пока не найдены.";
 
         deviceCard.appendChild(empty);
+        renderOverview();
         return;
     }
 
     for (const device of devices) {
+        const panel = document.createElement("article");
+        panel.className = "device-panel";
+        panel.dataset.deviceId = device.device;
+
         const heading = document.createElement("div");
         heading.className = "device-heading";
 
         const icon = document.createElement("div");
         icon.className = "device-icon";
-        icon.textContent = "ESP";
+        icon.textContent = "IoT";
 
         const titleBlock = document.createElement("div");
 
         const title = document.createElement("h3");
-        title.textContent = device.device;
+        title.textContent = device.name || device.device;
 
         const subtitle = document.createElement("p");
         subtitle.className = "device-id";
-        subtitle.textContent = "IoT-устройство";
+        const schemaNote = device.schema_source === "inferred"
+            ? "Автоматическая Schema · только чтение"
+            : device.schema_source === "missing"
+                ? "Schema ещё не получена"
+                : null;
+        subtitle.textContent = [
+            device.device,
+            device.firmware_version
+                ? `Прошивка ${device.firmware_version}`
+                : null,
+            schemaNote
+        ].filter(Boolean).join(" · ");
 
         titleBlock.append(title, subtitle);
 
         const badge = document.createElement("span");
-        badge.className = "badge";
+        badge.className = "badge device-status";
         badge.textContent = device.connected
             ? "Подключено"
             : "Отключено";
 
         heading.append(icon, titleBlock, badge);
-        deviceCard.appendChild(heading);
+        panel.appendChild(heading);
 
         const divider = document.createElement("div");
         divider.className = "divider";
-        deviceCard.appendChild(divider);
+        panel.appendChild(divider);
 
-        // Состояние LED.
-
-        const parameter = document.createElement("div");
-        parameter.className = "parameter";
-
-        const label = document.createElement("span");
-        label.textContent = "Светодиод (LED)";
-
-        const ledStatus = document.createElement("strong");
-        const ledValue = device.parameters?.led;
-
-        if (typeof ledValue === "boolean") {
-            ledStatus.textContent = ledValue
-                ? "Включён"
-                : "Выключен";
-        } else {
-            ledStatus.textContent = "Неизвестно";
+        if (device.pending_schema) {
+            panel.appendChild(createSchemaReview(device));
         }
 
-        parameter.append(label, ledStatus);
-        deviceCard.appendChild(parameter);
+        const parameters = device.schema?.parameters || {};
 
-        // Кнопки управления.
+        for (const [parameterId, definition] of Object.entries(parameters)) {
+            const parameter = document.createElement("div");
+            parameter.className = "device-parameter";
+            parameter.dataset.parameterId = parameterId;
 
-        const controls = document.createElement("div");
+            const label = document.createElement("strong");
+            label.className = "device-parameter-label";
+            label.textContent = definition.label || parameterId;
 
-        controls.style.display = "flex";
-        controls.style.flexWrap = "wrap";
-        controls.style.gap = "10px";
-        controls.style.marginTop = "20px";
+            const value = device.parameters?.[parameterId];
+            const currentValue = document.createElement("span");
+            currentValue.className = "device-parameter-value";
+            currentValue.dataset.role = "parameter-value";
+            currentValue.dataset.parameterId = parameterId;
+            currentValue.textContent = formatParameterValue(value, definition);
 
-        const onButton = document.createElement("button");
-        onButton.textContent = "Включить LED";
-        onButton.disabled = !device.connected;
+            parameter.append(label, currentValue);
 
-        onButton.addEventListener("click", () => {
-            sendLedCommand(device.device, true);
-        });
+            if (definition.access === "read_write" && device.connected) {
+                const control = document.createElement("div");
+                control.className = "device-parameter-control";
 
-        const offButton = document.createElement("button");
-        offButton.textContent = "Выключить LED";
-        offButton.disabled = !device.connected;
+                if (definition.type === "boolean") {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.dataset.role = "parameter-command";
+                    button.dataset.parameterId = parameterId;
+                    button.addEventListener("click", () => {
+                        const currentDevice = devices.find(
+                            item => item.device === device.device
+                        );
+                        const currentValue = currentDevice?.parameters?.[parameterId];
+                        if (typeof currentValue === "boolean") {
+                            sendParameterCommand(
+                                device.device,
+                                parameterId,
+                                !currentValue
+                            );
+                        }
+                    });
+                    control.appendChild(button);
+                } else {
+                    const input = document.createElement(
+                        definition.type === "enum" ? "select" : "input"
+                    );
+                    input.className = "device-parameter-input";
+                    input.dataset.role = "parameter-input";
+                    input.dataset.deviceId = device.device;
+                    input.dataset.parameterId = parameterId;
+                    input.addEventListener(
+                        definition.type === "enum" ? "change" : "input",
+                        () => { input.dataset.dirty = "true"; }
+                    );
 
-        offButton.addEventListener("click", () => {
-            sendLedCommand(device.device, false);
-        });
+                    if (definition.type === "enum") {
+                        for (const option of definition.options || []) {
+                            const item = document.createElement("option");
+                            item.value = JSON.stringify(option.value);
+                            item.textContent = option.label;
+                            item.selected = option.value === value;
+                            input.appendChild(item);
+                        }
+                    } else {
+                        input.type = definition.type === "string" ? "text" : "number";
+                        input.value = value ?? "";
+                        if (definition.type === "integer" || definition.type === "number") {
+                            input.required = true;
+                        }
+                        if (definition.type === "integer") {
+                            input.step = String(definition.step || 1);
+                        } else if (definition.type === "number") {
+                            input.step = String(definition.step || "any");
+                        }
+                        if (definition.min !== undefined) input.min = definition.min;
+                        if (definition.max !== undefined) input.max = definition.max;
+                    }
 
-        controls.append(onButton, offButton);
-        deviceCard.appendChild(controls);
+                    const savedDraft = drafts.get(`${device.device}\u0000${parameterId}`);
+                    if (savedDraft !== undefined) {
+                        input.value = savedDraft;
+                        input.dataset.dirty = "true";
+                    }
+
+                    const apply = document.createElement("button");
+                    apply.type = "button";
+                    apply.dataset.role = "parameter-apply";
+                    apply.dataset.parameterId = parameterId;
+                    apply.textContent = "Применить";
+                    apply.addEventListener("click", () => {
+                        if (!input.checkValidity()) {
+                            input.reportValidity();
+                            return;
+                        }
+
+                        let nextValue = input.value;
+                        if (definition.type === "enum") {
+                            nextValue = JSON.parse(input.value);
+                        } else if (definition.type === "integer") {
+                            nextValue = Number.parseInt(input.value, 10);
+                        } else if (definition.type === "number") {
+                            nextValue = Number(input.value);
+                        }
+                        sendParameterCommand(device.device, parameterId, nextValue);
+                    });
+                    control.append(input, apply);
+                }
+
+                parameter.appendChild(control);
+            }
+
+            panel.appendChild(parameter);
+        }
+
+        const actions = device.schema?.actions || {};
+        const availableActions = Object.entries(actions);
+        if (availableActions.length > 0) {
+            const actionList = document.createElement("div");
+            actionList.className = "device-actions";
+            const actionHeading = document.createElement("strong");
+            actionHeading.textContent = "Действия устройства";
+            actionList.appendChild(actionHeading);
+
+            for (const [actionId, definition] of availableActions) {
+                const actionButton = document.createElement("button");
+                actionButton.type = "button";
+                actionButton.dataset.role = "device-action";
+                actionButton.dataset.actionId = actionId;
+                actionButton.textContent = definition.label || actionId;
+                actionButton.title = definition.description || "";
+                actionButton.addEventListener("click", () => {
+                    if (Object.keys(definition.arguments || {}).length > 0) {
+                        openActionDialog(device.device, actionId, definition);
+                    } else {
+                        sendDeviceAction(device.device, actionId);
+                    }
+                });
+                actionList.appendChild(actionButton);
+            }
+            panel.appendChild(actionList);
+        }
 
         // Время последнего сообщения.
 
@@ -457,8 +740,132 @@ function renderDevices() {
             ? `Последнее сообщение: ${device.last_seen || "неизвестно"}`
             : "Устройство сейчас не подключено.";
 
-        deviceCard.appendChild(hint);
+        hint.dataset.role = "device-hint";
+        panel.appendChild(hint);
+
+        deviceCard.appendChild(panel);
+        updateDevicePanel(device);
     }
+
+    renderOverview();
+}
+
+function updateDevicePanel(device) {
+    const panel = [...(deviceCard?.querySelectorAll(".device-panel") || [])]
+        .find(item => item.dataset.deviceId === device.device);
+    if (!panel) return;
+
+    const badge = panel.querySelector(".device-status");
+    if (badge) {
+        badge.textContent = device.connected ? "Подключено" : "Отключено";
+        badge.classList.toggle("is-online", device.connected);
+        badge.classList.toggle("is-offline", !device.connected);
+    }
+
+    for (const valueNode of panel.querySelectorAll('[data-role="parameter-value"]')) {
+        const parameterId = valueNode.dataset.parameterId;
+        const definition = device.schema?.parameters?.[parameterId];
+        valueNode.textContent = formatParameterValue(
+            device.parameters?.[parameterId],
+            definition || { type: typeof device.parameters?.[parameterId] }
+        );
+    }
+
+    for (const input of panel.querySelectorAll('[data-role="parameter-input"]')) {
+        input.disabled = !device.connected || Boolean(device.pending_schema);
+        if (input.dataset.dirty === "true" || document.activeElement === input) {
+            continue;
+        }
+        const parameterId = input.dataset.parameterId;
+        const value = device.parameters?.[parameterId];
+        input.value = input.tagName === "SELECT"
+            ? (value === undefined ? "" : JSON.stringify(value))
+            : (value ?? "");
+    }
+
+    for (const button of panel.querySelectorAll('[data-role="parameter-command"]')) {
+        const parameterId = button.dataset.parameterId;
+        const definition = device.schema?.parameters?.[parameterId];
+        const value = device.parameters?.[parameterId];
+        const pending = hasPendingParameterCommand(device.device, parameterId);
+        const label = definition?.label || parameterId;
+        button.textContent = pending
+            ? `Ожидаем: ${label}…`
+            : value === true
+                ? `Выключить: ${label}`
+                : `Включить: ${label}`;
+        button.disabled = !device.connected || !isGatewayConnected() ||
+            Boolean(device.pending_schema) || typeof value !== "boolean" || pending;
+    }
+
+    for (const button of panel.querySelectorAll('[data-role="parameter-apply"]')) {
+        button.disabled = !device.connected || !isGatewayConnected() ||
+            Boolean(device.pending_schema) ||
+            hasPendingParameterCommand(device.device, button.dataset.parameterId);
+    }
+
+    for (const button of panel.querySelectorAll('[data-role="device-action"]')) {
+        button.disabled = !device.connected || !isGatewayConnected() ||
+            Boolean(device.pending_schema) ||
+            hasPendingAction(device.device, button.dataset.actionId);
+    }
+
+    const schemaDecisionPending = device.pending_schema && pendingSchemaDecisions.has(
+        `${device.device}\u0000${device.pending_schema.proposal_id}`
+    );
+    for (const button of panel.querySelectorAll(".schema-review-buttons button")) {
+        button.disabled = !isGatewayConnected() || Boolean(schemaDecisionPending);
+    }
+
+    const hint = panel.querySelector('[data-role="device-hint"]');
+    if (hint) {
+        hint.textContent = device.connected
+            ? `Последнее сообщение: ${device.last_seen || "неизвестно"}`
+            : "Устройство сейчас не подключено.";
+    }
+    renderOverview();
+}
+
+function renderOverview() {
+    if (!overview) return;
+    const online = devices.filter(device => device.connected).length;
+    const metrics = [
+        { value: String(devices.length), label: "Устройства" },
+        { value: String(online), label: "На связи" },
+        { value: String(Math.max(0, devices.length - online)), label: "Не в сети" }
+    ];
+    overview.replaceChildren();
+    for (const metric of metrics) {
+        const item = document.createElement("div");
+        item.className = "overview-metric";
+        const value = document.createElement("strong");
+        value.textContent = metric.value;
+        const label = document.createElement("span");
+        label.textContent = metric.label;
+        item.append(value, label);
+        overview.appendChild(item);
+    }
+}
+
+function formatParameterValue(value, definition) {
+    if (value === undefined || value === null) {
+        return "Неизвестно";
+    }
+
+    let formatted = value;
+    if (definition.type === "json") {
+        formatted = JSON.stringify(value);
+    } else if (definition.type === "boolean") {
+        formatted = value ? "Включено" : "Выключено";
+    } else if (definition.type === "enum") {
+        formatted = definition.options?.find(option => option.value === value)?.label || value;
+    } else if (typeof value === "number" && Number.isInteger(definition.precision)) {
+        formatted = value.toFixed(definition.precision);
+    }
+
+    return definition.unit
+        ? `${formatted} ${definition.unit}`
+        : String(formatted);
 }
 
 // =========================
@@ -490,6 +897,72 @@ function getEventDescription(event) {
     const value = String(event.event_value ?? "");
     const normalized = value.toLowerCase();
 
+    if (event.event_type === "command") {
+        let command;
+
+        try {
+            command = JSON.parse(value);
+        } catch (error) {
+            return `Результат команды: ${value}`;
+        }
+
+        const device = devices.find(item => item.device === event.device_id);
+        const isAction = typeof command.action === "string";
+        const definition = isAction
+            ? device?.schema?.actions?.[command.action]
+            : device?.schema?.parameters?.[command.parameter];
+        const operationLabel = definition?.label || command.action || command.parameter || "Команда";
+        const requestedValue = isAction
+            ? "вызвать"
+            : typeof command.requested_value === "boolean"
+                ? (command.requested_value ? "включить" : "выключить")
+                : formatParameterValue(
+                    command.requested_value,
+                    definition || { type: typeof command.requested_value }
+                );
+        const statusLabels = {
+            succeeded: "выполнена",
+            failed: "завершилась ошибкой",
+            timeout: "не получила подтверждение",
+            unavailable: "прервана: устройство отключилось"
+        };
+        const status = statusLabels[command.status] || command.status;
+        const actualValue = command.result_value;
+        const actualText = (
+            !isAction &&
+            ["succeeded", "failed"].includes(command.status) &&
+            actualValue !== undefined &&
+            actualValue !== null &&
+            actualValue !== command.requested_value
+        )
+            ? `, фактически: ${formatParameterValue(
+                actualValue,
+                definition || { type: typeof actualValue }
+            )}`
+            : "";
+        const errorText = command.error ? ` — ${command.error}` : "";
+
+        return `${operationLabel}: ${requestedValue}, ${status}${actualText}${errorText}`;
+    }
+
+    if (event.event_type === "parameter") {
+        try {
+            const change = JSON.parse(value);
+            const device = devices.find(item => item.device === event.device_id);
+            const definition = device?.schema?.parameters?.[change.parameter] || {
+                type: typeof change.value
+            };
+            const label = definition.label || change.parameter;
+            return `${label}: ${formatParameterValue(change.value, definition)}`;
+        } catch (error) {
+            return `Изменение параметра: ${value}`;
+        }
+    }
+
+    if (event.event_type === "schema") {
+        return `Обновление Schema: ${value}`;
+    }
+
     if (event.event_type === "led") {
         if (normalized === "true" || normalized === "1") {
             return "Светодиод включён";
@@ -515,6 +988,56 @@ function getEventDescription(event) {
     }
 
     return `${event.event_type}: ${value}`;
+}
+
+function isCommandEchoEvent(event, eventList) {
+    let parameter;
+    let value;
+    try {
+        if (event.event_type === "led") {
+            parameter = "led";
+            const normalized = String(event.event_value).toLowerCase();
+            if (normalized !== "true" && normalized !== "false" && normalized !== "1" && normalized !== "0") {
+                return false;
+            }
+            value = normalized === "true" || normalized === "1";
+        } else if (event.event_type === "parameter") {
+            const change = JSON.parse(event.event_value || "{}");
+            parameter = change.parameter;
+            value = change.value;
+        } else {
+            return false;
+        }
+    } catch (error) {
+        return false;
+    }
+
+    const stateTime = new Date(event.timestamp).getTime();
+    if (!parameter || Number.isNaN(stateTime)) return false;
+
+    return eventList.some(commandEvent => {
+        if (
+            commandEvent.event_type !== "command" ||
+            commandEvent.device_id !== event.device_id ||
+            (Number.isFinite(commandEvent.id) && Number.isFinite(event.id) && commandEvent.id <= event.id)
+        ) {
+            return false;
+        }
+
+        try {
+            const command = JSON.parse(commandEvent.event_value || "{}");
+            if (command.status !== "succeeded" || command.parameter !== parameter) {
+                return false;
+            }
+            const commandValue = command.result_value ?? command.requested_value;
+            const commandTime = new Date(commandEvent.timestamp).getTime();
+            return commandValue === value &&
+                !Number.isNaN(commandTime) &&
+                Math.abs(commandTime - stateTime) <= 5000;
+        } catch (error) {
+            return false;
+        }
+    });
 }
 
 // =========================
@@ -583,8 +1106,10 @@ function renderEvents() {
 
     const filterOptions = [
         { value: "all", label: "Все события" },
-        { value: "led", label: "LED" },
-        { value: "connection", label: "Подключения" }
+        { value: "connection", label: "Подключения" },
+        { value: "command", label: "Команды" },
+        { value: "state", label: "Изменения состояния" },
+        { value: "schema", label: "Обновления Schema" }
     ];
 
     for (const option of filterOptions) {
@@ -619,6 +1144,10 @@ function renderEvents() {
     const lastLedValues = new Map();
 
     for (const event of events) {
+        if (isCommandEchoEvent(event, events)) {
+            continue;
+        }
+
         if (event.event_type === "led") {
             const value = String(event.event_value).toLowerCase();
             const previousValue = lastLedValues.get(event.device_id);
@@ -634,10 +1163,19 @@ function renderEvents() {
     }
 
     const filteredEvents = deduplicatedEvents.filter(event => {
-        return (
-            eventFilter === "all" ||
-            event.event_type === eventFilter
-        );
+        if (eventFilter === "all") {
+            return true;
+        }
+
+        if (eventFilter === "command") {
+            return event.event_type === "command";
+        }
+
+        if (eventFilter === "state") {
+            return event.event_type === "led" || event.event_type === "parameter";
+        }
+
+        return event.event_type === eventFilter;
     });
 
     const summary = document.createElement("p");
@@ -670,6 +1208,16 @@ function renderEvents() {
     for (const event of filteredEvents) {
         const row = document.createElement("article");
         row.className = "event-entry";
+        if (event.event_type === "command") {
+            try {
+                const command = JSON.parse(event.event_value || "{}");
+                if (["succeeded", "failed", "timeout", "unavailable"].includes(command.status)) {
+                    row.classList.add(`event-status-${command.status}`);
+                }
+            } catch (error) {
+                // Older command entries may contain plain text.
+            }
+        }
 
         const top = document.createElement("div");
         top.className = "event-entry-top";
@@ -682,10 +1230,16 @@ function renderEvents() {
         const typeBadge = document.createElement("span");
         typeBadge.className = "event-type";
 
-        if (event.event_type === "led") {
-            typeBadge.textContent = "LED";
-        } else if (event.event_type === "connection") {
+        if (event.event_type === "connection") {
             typeBadge.textContent = "Подключение";
+        } else if (event.event_type === "schema") {
+            typeBadge.textContent = "Обновление Schema";
+        } else if (event.event_type === "parameter") {
+            typeBadge.textContent = "Изменение состояния";
+        } else if (event.event_type === "led") {
+            typeBadge.textContent = "Изменение состояния";
+        } else if (event.event_type === "command") {
+            typeBadge.textContent = "Результат команды";
         } else {
             typeBadge.textContent = event.event_type || "Событие";
         }
@@ -732,10 +1286,10 @@ function renderLoadMoreButton(container) {
 }
 
 // =========================
-// ОТПРАВКА КОМАНД LED
+// ОТПРАВКА КОМАНД ДЛЯ ПАРАМЕТРОВ
 // =========================
 
-function sendLedCommand(deviceId, value) {
+function sendParameterCommand(deviceId, parameter, value) {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
         setActivity("Нет соединения с Gateway.");
         return;
@@ -750,14 +1304,36 @@ function sendLedCommand(deviceId, value) {
         return;
     }
 
+    if (device.pending_schema) {
+        setActivity("Сначала рассмотрите предложенное изменение Schema устройства.");
+        return;
+    }
+
+    if (hasPendingParameterCommand(deviceId, parameter)) {
+        setActivity(`Для параметра ${parameter} уже ожидается ответ.`);
+        return;
+    }
+
+    const definition = device.schema?.parameters?.[parameter];
+    if (
+        !definition ||
+        definition.access !== "read_write" ||
+        !isValueCompatible(value, definition)
+    ) {
+        setActivity("Значение не соответствует разрешениям или типу параметра.");
+        return;
+    }
+
     const pending = {
         commandId: createCommandId(),
         deviceId: deviceId,
+        parameter: parameter,
         value: value,
         timer: null
     };
 
     pendingCommands.set(pending.commandId, pending);
+    updateDevicePanel(device);
 
     pending.timer = setTimeout(() => {
         if (pendingCommands.get(pending.commandId) !== pending) {
@@ -765,6 +1341,7 @@ function sendLedCommand(deviceId, value) {
         }
 
         pendingCommands.delete(pending.commandId);
+        updateDevicePanel(device);
 
         setActivity(
             `Gateway не сообщил результат команды для ${deviceId}. ` +
@@ -778,7 +1355,7 @@ function sendLedCommand(deviceId, value) {
             action: "command",
             device: deviceId,
             command_id: pending.commandId,
-            parameter: "led",
+            parameter: parameter,
             value: value
         }));
 
@@ -794,6 +1371,204 @@ function sendLedCommand(deviceId, value) {
     }
 }
 
+function createActionArgumentInput(definition) {
+    const input = ["boolean", "enum"].includes(definition.type)
+        ? document.createElement("select")
+        : document.createElement("input");
+    const required = definition.required !== false;
+    input.className = "device-parameter-input";
+    input.required = required;
+
+    if (definition.type === "boolean") {
+        if (!required) {
+            const empty = document.createElement("option");
+            empty.value = "";
+            empty.textContent = "Не указывать";
+            input.appendChild(empty);
+        }
+        for (const value of [true, false]) {
+            const option = document.createElement("option");
+            option.value = String(value);
+            option.textContent = value ? "Да" : "Нет";
+            input.appendChild(option);
+        }
+    } else if (definition.type === "enum") {
+        if (!required) {
+            const empty = document.createElement("option");
+            empty.value = "";
+            empty.textContent = "Не указывать";
+            input.appendChild(empty);
+        }
+        for (const option of definition.options || []) {
+            const item = document.createElement("option");
+            item.value = JSON.stringify(option.value);
+            item.textContent = option.label;
+            input.appendChild(item);
+        }
+    } else {
+        input.type = definition.type === "string" ? "text" : "number";
+        if (definition.type === "integer") {
+            input.step = String(definition.step || 1);
+        } else if (definition.type === "number") {
+            input.step = String(definition.step || "any");
+        }
+        if (definition.min !== undefined) input.min = definition.min;
+        if (definition.max !== undefined) input.max = definition.max;
+    }
+
+    return input;
+}
+
+function openActionDialog(deviceId, actionId, definition) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "action-dialog";
+    const form = document.createElement("form");
+    form.className = "action-dialog-form";
+
+    const heading = document.createElement("h3");
+    heading.textContent = definition.label || actionId;
+    form.appendChild(heading);
+
+    if (definition.description) {
+        const description = document.createElement("p");
+        description.textContent = definition.description;
+        form.appendChild(description);
+    }
+
+    const fields = [];
+    for (const [argumentId, argumentDefinition] of Object.entries(
+        definition.arguments || {}
+    )) {
+        const label = document.createElement("label");
+        label.className = "action-argument";
+        const argumentLabel = argumentDefinition.label || argumentId;
+        label.textContent = argumentDefinition.unit
+            ? `${argumentLabel} (${argumentDefinition.unit})`
+            : argumentLabel;
+        const input = createActionArgumentInput(argumentDefinition);
+        label.appendChild(input);
+        form.appendChild(label);
+        fields.push({ argumentId, definition: argumentDefinition, input });
+    }
+
+    const buttons = document.createElement("div");
+    buttons.className = "action-dialog-buttons";
+    const submit = document.createElement("button");
+    submit.type = "button";
+    submit.textContent = "Выполнить";
+    submit.addEventListener("click", () => {
+        for (const field of fields) {
+            if (!field.input.checkValidity()) {
+                field.input.reportValidity();
+                return;
+            }
+        }
+
+        const argumentsValue = {};
+        for (const field of fields) {
+            const { argumentId, definition: argumentDefinition, input } = field;
+            if (input.value === "" && argumentDefinition.required === false) {
+                continue;
+            }
+
+            let value = input.value;
+            if (argumentDefinition.type === "boolean") {
+                value = value === "true";
+            } else if (argumentDefinition.type === "enum") {
+                value = JSON.parse(value);
+            } else if (argumentDefinition.type === "integer") {
+                value = Number.parseInt(value, 10);
+            } else if (argumentDefinition.type === "number") {
+                value = Number(value);
+            }
+            argumentsValue[argumentId] = value;
+        }
+
+        dialog.close();
+        sendDeviceAction(deviceId, actionId, argumentsValue);
+    });
+
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "secondary-button";
+    cancel.textContent = "Отмена";
+    cancel.addEventListener("click", () => dialog.close());
+    buttons.append(submit, cancel);
+    form.appendChild(buttons);
+    dialog.appendChild(form);
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+
+    document.body.appendChild(dialog);
+    if (typeof dialog.showModal === "function") {
+        dialog.showModal();
+    } else {
+        dialog.remove();
+        setActivity("Браузер не поддерживает форму аргументов действия.");
+    }
+}
+
+function sendDeviceAction(deviceId, actionId, argumentsValue = {}) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setActivity("Нет соединения с Gateway.");
+        return;
+    }
+    const device = devices.find(item => item.device === deviceId);
+    if (!device || !device.connected || !device.schema?.actions?.[actionId]) {
+        setActivity(`Действие ${actionId} недоступно для ${deviceId}.`);
+        return;
+    }
+    if (device.pending_schema) {
+        setActivity("Сначала рассмотрите предложенное изменение Schema устройства.");
+        return;
+    }
+    if (hasPendingAction(deviceId, actionId)) {
+        setActivity(`Действие ${actionId} уже выполняется на ${deviceId}.`);
+        return;
+    }
+
+    const pending = {
+        commandId: createCommandId(),
+        deviceId,
+        actionId,
+        arguments: argumentsValue,
+        timer: null
+    };
+    pendingCommands.set(pending.commandId, pending);
+    updateDevicePanel(device);
+    pending.timer = setTimeout(() => {
+        if (pendingCommands.get(pending.commandId) !== pending) return;
+        pendingCommands.delete(pending.commandId);
+        updateDevicePanel(device);
+        setActivity(`Gateway не сообщил результат действия для ${deviceId}.`);
+    }, COMMAND_TIMEOUT_MS);
+
+    try {
+        socket.send(JSON.stringify({
+            type: "browser_message",
+            action: "invoke_action",
+            device: deviceId,
+            action_id: actionId,
+            arguments: argumentsValue,
+            command_id: pending.commandId
+        }));
+        setActivity(`Действие отправлено ${deviceId}. Ожидаем результат...`);
+    } catch (error) {
+        clearPendingCommand(pending.commandId);
+        setActivity("Ошибка отправки действия в Gateway.");
+    }
+}
+
+function isValueCompatible(value, definition) {
+    if (definition.type === "boolean") return typeof value === "boolean";
+    if (definition.type === "integer") return Number.isInteger(value);
+    if (definition.type === "number") return Number.isFinite(value);
+    if (definition.type === "string") return typeof value === "string";
+    if (definition.type === "enum") {
+        return definition.options?.some(option => option.value === value) === true;
+    }
+    return false;
+}
+
 // =========================
 // ЗАПРОСЫ К GATEWAY
 // =========================
@@ -804,6 +1579,40 @@ function requestDevices() {
             type: "browser_message",
             action: "get_devices"
         }));
+    }
+}
+
+function sendSchemaDecision(deviceId, proposalId, decision) {
+    if (!isGatewayConnected()) {
+        setActivity("Нет соединения с Gateway.");
+        return;
+    }
+
+    const decisionKey = `${deviceId}\u0000${proposalId}`;
+    if (pendingSchemaDecisions.has(decisionKey)) return;
+    pendingSchemaDecisions.add(decisionKey);
+
+    const panel = [...(deviceCard?.querySelectorAll(".device-panel") || [])]
+        .find(item => item.dataset.deviceId === deviceId);
+    for (const button of panel?.querySelectorAll(".schema-review-buttons button") || []) {
+        button.disabled = true;
+    }
+
+    try {
+        socket.send(JSON.stringify({
+            type: "browser_message",
+            action: "decide_schema",
+            device: deviceId,
+            proposal_id: proposalId,
+            decision
+        }));
+        setActivity(decision === "accept"
+            ? `Принимаем новую Schema устройства ${deviceId}...`
+            : `Оставляем прежнюю Schema устройства ${deviceId}; предложение повторится при следующем подключении.`);
+    } catch (error) {
+        pendingSchemaDecisions.delete(decisionKey);
+        requestDevices();
+        setActivity("Не удалось отправить решение по Schema в Gateway.");
     }
 }
 
