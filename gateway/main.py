@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +49,7 @@ device_metadata = {}
 last_device_heartbeat = {}
 pending_device_schemas = {}
 deferred_device_schemas = {}
+pending_device_connections = {}
 
 # Команды, ожидающие результата: command_id -> контекст команды.
 pending_commands = {}
@@ -56,9 +58,8 @@ EVENTS_PAGE_SIZE = 30
 DEVICE_STALE_SECONDS = 45
 MAX_WEBSOCKET_MESSAGE_BYTES = 64 * 1024
 MAX_SCHEMA_BYTES = 60 * 1024
-
-command_counter = 0
-
+DEVICE_APPROVAL_TIMEOUT_SECONDS = 180
+COMMAND_RETRY_LIMIT = 3
 
 # =========================
 # ВРЕМЯ
@@ -74,7 +75,13 @@ def current_time():
 # SQLITE
 # =========================
 
+GATEWAY_SESSION_STARTED_AT = None
+GATEWAY_RUNTIME_CHECKPOINT_SECONDS = 30
+
+
 def init_db():
+    global GATEWAY_SESSION_STARTED_AT
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -100,6 +107,47 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_device_events_device_id_id
             ON device_events (device_id, id)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_schema_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                schema_version INTEGER,
+                firmware_version TEXT,
+                schema_json TEXT NOT NULL,
+                schema_hash TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                source TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_device_schema_history_device
+            ON device_schema_history (device_id, id DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS command_queue (
+                command_id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                operation_json TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS gateway_runtime (
+                singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                total_seconds REAL NOT NULL DEFAULT 0,
+                checkpoint_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_command_queue_device_status
+            ON command_queue (device_id, status)
+        """)
 
         existing_columns = {
             row[1]
@@ -109,9 +157,11 @@ def init_db():
             "name": "TEXT",
             "protocol_version": "INTEGER",
             "firmware_version": "TEXT",
+            "command_dedup": "INTEGER DEFAULT 0",
             "schema_version": "INTEGER",
             "schema_json": "TEXT",
-            "state_json": "TEXT"
+            "state_json": "TEXT",
+            "trust_policy": "TEXT DEFAULT 'allow'"
         }
 
         for column, column_type in metadata_columns.items():
@@ -122,9 +172,175 @@ def init_db():
 
         conn.execute("UPDATE devices SET connected = 0")
 
+        # Existing enrolled devices retain access across this migration.
+        # New devices receive a trust policy only after an explicit decision.
+        rows = conn.execute("""
+            SELECT device_id, schema_version, firmware_version, schema_json, last_seen
+            FROM devices
+            WHERE schema_json IS NOT NULL
+        """).fetchall()
+        for device_id, schema_version, firmware_version, schema_json, last_seen in rows:
+            try:
+                schema = json.loads(schema_json)
+                canonical = json.dumps(
+                    schema, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")
+                ).encode("utf-8")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            schema_hash = hashlib.sha256(canonical).hexdigest()
+            existing_snapshot = conn.execute("""
+                SELECT 1 FROM device_schema_history
+                WHERE device_id = ? AND schema_hash = ?
+                  AND schema_version IS ? AND firmware_version IS ?
+                LIMIT 1
+            """, (
+                device_id, schema_hash, schema_version, firmware_version
+            )).fetchone()
+            if existing_snapshot:
+                continue
+            conn.execute("""
+                INSERT INTO device_schema_history (
+                    device_id, schema_version, firmware_version, schema_json,
+                    schema_hash, accepted_at, source
+                ) VALUES (?, ?, ?, ?, ?, ?, 'migration')
+            """, (
+                device_id, schema_version, firmware_version, schema_json,
+                schema_hash, last_seen or current_time()
+            ))
+
+        # A command sent just before a Gateway restart may have reached the
+        # device without its result reaching SQLite. Re-delivery keeps the
+        # same command ID so compatible devices can safely replay their ACK.
+        conn.execute("""
+            UPDATE command_queue SET status = 'queued', updated_at = ?
+            WHERE status = 'sent'
+        """, (current_time(),))
+
+        runtime_checkpoint_at = datetime.now(timezone.utc).isoformat()
+        conn.execute("""
+            INSERT OR IGNORE INTO gateway_runtime (
+                singleton_id, total_seconds, checkpoint_at
+            ) VALUES (1, 0, ?)
+        """, (runtime_checkpoint_at,))
+        # Count only persisted runtime checkpoints, never offline time.
+        conn.execute("""
+            UPDATE gateway_runtime SET checkpoint_at = ?
+            WHERE singleton_id = 1
+        """, (runtime_checkpoint_at,))
+
         conn.commit()
 
     print(f"База данных: {DB_PATH}")
+
+
+    GATEWAY_SESSION_STARTED_AT = datetime.now(timezone.utc)
+
+
+def checkpoint_gateway_runtime(final=False):
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("""
+            SELECT total_seconds, checkpoint_at
+            FROM gateway_runtime WHERE singleton_id = 1
+        """).fetchone()
+        if row is None:
+            return
+
+        total_seconds = max(0.0, float(row[0] or 0))
+        if row[1]:
+            try:
+                previous_checkpoint = datetime.fromisoformat(row[1])
+                if previous_checkpoint.tzinfo is None:
+                    previous_checkpoint = previous_checkpoint.replace(tzinfo=timezone.utc)
+                total_seconds += max(
+                    0.0,
+                    (now - previous_checkpoint.astimezone(timezone.utc)).total_seconds()
+                )
+            except ValueError:
+                pass
+
+        conn.execute("""
+            UPDATE gateway_runtime
+            SET total_seconds = ?, checkpoint_at = ?
+            WHERE singleton_id = 1
+        """, (
+            total_seconds,
+            None if final else now.isoformat(timespec="microseconds")
+        ))
+        conn.commit()
+
+
+def get_database_stats():
+    now = datetime.now(timezone.utc)
+    with sqlite3.connect(DB_PATH) as conn:
+        device_count = conn.execute(
+            "SELECT COUNT(*) FROM devices"
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM device_events"
+        ).fetchone()[0]
+        ever_connected_device_count = conn.execute("""
+            SELECT COUNT(DISTINCT device_id)
+            FROM device_events WHERE event_type = 'connection'
+        """).fetchone()[0]
+        schema_snapshot_count = conn.execute(
+            "SELECT COUNT(*) FROM device_schema_history"
+        ).fetchone()[0]
+        command_record_count = conn.execute(
+            "SELECT COUNT(*) FROM command_queue"
+        ).fetchone()[0]
+        runtime = conn.execute("""
+            SELECT total_seconds, checkpoint_at
+            FROM gateway_runtime WHERE singleton_id = 1
+        """).fetchone()
+
+    total_uptime_seconds = max(0.0, float(runtime[0] or 0)) if runtime else 0.0
+    if runtime and runtime[1]:
+        try:
+            checkpoint_at = datetime.fromisoformat(runtime[1])
+            if checkpoint_at.tzinfo is None:
+                checkpoint_at = checkpoint_at.replace(tzinfo=timezone.utc)
+            total_uptime_seconds += max(
+                0.0,
+                (now - checkpoint_at.astimezone(timezone.utc)).total_seconds()
+            )
+        except ValueError:
+            pass
+
+    session_uptime_seconds = (
+        max(0.0, (now - GATEWAY_SESSION_STARTED_AT).total_seconds())
+        if GATEWAY_SESSION_STARTED_AT
+        else 0.0
+    )
+    database_size_bytes = 0
+    for path in (DB_PATH, Path(f"{DB_PATH}-wal"), Path(f"{DB_PATH}-shm")):
+        try:
+            database_size_bytes += path.stat().st_size
+        except OSError:
+            pass
+
+    return {
+        "database_size_bytes": database_size_bytes,
+        "record_count": (
+            device_count + event_count + schema_snapshot_count + command_record_count
+        ),
+        "device_count": device_count,
+        "ever_connected_device_count": ever_connected_device_count,
+        "connected_device_count": len(devices),
+        "event_count": event_count,
+        "schema_snapshot_count": schema_snapshot_count,
+        "command_record_count": command_record_count,
+        "session_uptime_seconds": session_uptime_seconds,
+        "total_uptime_seconds": total_uptime_seconds,
+        "sampled_at": now.timestamp()
+    }
+
+
+async def gateway_runtime_checkpoint_loop():
+    while True:
+        await asyncio.sleep(GATEWAY_RUNTIME_CHECKPOINT_SECONDS)
+        checkpoint_gateway_runtime()
 
 
 def is_schema_value(value, parameter_schema):
@@ -526,29 +742,56 @@ def save_device_metadata(device_id, metadata):
     timestamp = current_time()
 
     with sqlite3.connect(DB_PATH) as conn:
+        previous = conn.execute(
+            "SELECT schema_json, schema_version, firmware_version FROM devices WHERE device_id = ?",
+            (device_id,)
+        ).fetchone()
         conn.execute("""
             INSERT INTO devices (
                 device_id, last_seen, connected, name,
-                protocol_version, firmware_version, schema_version, schema_json
+                protocol_version, firmware_version, command_dedup,
+                schema_version, schema_json,
+                trust_policy
             )
-            VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 last_seen = excluded.last_seen,
                 connected = 1,
                 name = excluded.name,
                 protocol_version = excluded.protocol_version,
                 firmware_version = excluded.firmware_version,
+                command_dedup = excluded.command_dedup,
                 schema_version = excluded.schema_version,
-                schema_json = excluded.schema_json
+                schema_json = excluded.schema_json,
+                trust_policy = excluded.trust_policy
         """, (
             device_id,
             timestamp,
             metadata.get("name"),
             metadata.get("protocol_version"),
             metadata.get("firmware_version"),
+            int(metadata.get("command_dedup") is True),
             metadata.get("schema_version"),
-            schema_json
+            schema_json,
+            metadata.get("trust_policy")
         ))
+
+        previous_schema = None
+        if previous is not None and previous[0]:
+            try:
+                previous_schema = json.loads(previous[0])
+            except (TypeError, json.JSONDecodeError):
+                previous_schema = None
+        snapshot_changed = (
+            previous_schema is None
+            or not schemas_match(previous_schema, metadata["schema"])
+            or previous[1] != metadata.get("schema_version")
+            or previous[2] != metadata.get("firmware_version")
+        ) if previous is not None else True
+        if snapshot_changed:
+            record_schema_snapshot_in_connection(
+                conn, device_id, metadata, timestamp, "accepted"
+            )
         conn.commit()
 
     device_metadata[device_id] = metadata
@@ -564,7 +807,7 @@ def load_device_metadata(device_id):
         row = conn.execute(
             """
             SELECT name, protocol_version, firmware_version,
-                   schema_version, schema_json
+                   command_dedup, schema_version, schema_json, trust_policy
             FROM devices WHERE device_id = ?
             """,
             (device_id,)
@@ -584,9 +827,354 @@ def load_device_metadata(device_id):
         "name": row["name"],
         "protocol_version": row["protocol_version"],
         "firmware_version": row["firmware_version"],
+        "command_dedup": bool(row["command_dedup"]),
         "schema_version": row["schema_version"],
-        "schema": schema
+        "schema": schema,
+        "trust_policy": row["trust_policy"]
     }
+
+
+def device_supports_command_dedup(device_id):
+    metadata = device_metadata.get(device_id) or load_device_metadata(device_id)
+    return metadata is not None and metadata.get("command_dedup") is True
+
+
+def record_schema_snapshot_in_connection(conn, device_id, metadata, timestamp, source):
+    schema_json = json.dumps(metadata["schema"], ensure_ascii=False)
+    canonical = json.dumps(
+        metadata["schema"], ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")
+    ).encode("utf-8")
+    exists = conn.execute("""
+        SELECT 1 FROM device_schema_history
+        WHERE device_id = ? AND schema_hash = ?
+          AND schema_version IS ? AND firmware_version IS ?
+        LIMIT 1
+    """, (
+        device_id, hashlib.sha256(canonical).hexdigest(),
+        metadata.get("schema_version"), metadata.get("firmware_version")
+    )).fetchone()
+    if exists:
+        return
+
+    conn.execute("""
+        INSERT INTO device_schema_history (
+            device_id, schema_version, firmware_version, schema_json,
+            schema_hash, accepted_at, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        device_id, metadata.get("schema_version"),
+        metadata.get("firmware_version"), schema_json,
+        hashlib.sha256(canonical).hexdigest(), timestamp, source
+    ))
+
+
+def get_schema_history(device_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, schema_version, firmware_version, schema_json,
+                   accepted_at, source
+            FROM device_schema_history
+            WHERE device_id = ?
+            ORDER BY id DESC
+        """, (device_id,)).fetchall()
+
+    history = []
+    for row in rows:
+        try:
+            schema = json.loads(row["schema_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not validate_schema(schema):
+            continue
+        history.append({
+            "id": row["id"],
+            "schema_version": row["schema_version"],
+            "firmware_version": row["firmware_version"],
+            "accepted_at": row["accepted_at"],
+            "source": row["source"],
+            "schema": schema
+        })
+    return history
+
+
+def delete_schema_history_item(device_id, history_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM device_schema_history WHERE id = ? AND device_id = ?",
+            (history_id, device_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def restore_device_schema(device_id, history_id):
+    if device_id in devices:
+        return False, "Отключите устройство перед восстановлением Schema."
+
+    history = next(
+        (item for item in get_schema_history(device_id) if item["id"] == history_id),
+        None
+    )
+    if history is None:
+        return False, "Снимок Schema не найден."
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("""
+            UPDATE devices
+            SET schema_version = ?, firmware_version = ?, schema_json = ?,
+                connected = 0
+            WHERE device_id = ?
+        """, (
+            history.get("schema_version"), history.get("firmware_version"),
+            json.dumps(history["schema"], ensure_ascii=False), device_id
+        ))
+        conn.commit()
+        if cursor.rowcount == 0:
+            return False, "Устройство не найдено."
+
+    device_metadata.pop(device_id, None)
+    pending_device_schemas.pop(device_id, None)
+    deferred_device_schemas.pop(device_id, None)
+    save_device_event(
+        device_id,
+        "schema",
+        f"Восстановлена Schema из истории (снимок {history_id})"
+    )
+    return True, "Schema Gateway восстановлена. При следующем подключении она будет сравнена с Schema устройства."
+
+
+def get_device_trust_policy(device_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT trust_policy FROM devices WHERE device_id = ?",
+            (device_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def set_device_trust_policy(device_id, policy, name=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO devices (device_id, connected, trust_policy, name)
+            VALUES (?, 0, ?, ?)
+            ON CONFLICT(device_id) DO UPDATE SET
+                trust_policy = excluded.trust_policy,
+                name = COALESCE(excluded.name, devices.name)
+        """, (device_id, policy, name))
+        conn.commit()
+    if device_id in device_metadata:
+        device_metadata[device_id]["trust_policy"] = policy
+
+
+def get_blocked_devices():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT device_id, name, last_seen
+            FROM devices
+            WHERE trust_policy = 'deny'
+            ORDER BY device_id
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_pending_device_requests():
+    return [
+        {
+            "request_id": request["request_id"],
+            "device": device_id,
+            "name": request["metadata"].get("name"),
+            "firmware_version": request["metadata"].get("firmware_version"),
+            "protocol_version": request["metadata"].get("protocol_version")
+        }
+        for device_id, request in pending_device_connections.items()
+        if not request["decision_event"].is_set()
+    ]
+
+
+async def send_device_access_state(websocket=None):
+    messages = (
+        {
+            "type": "device_access_requests",
+            "requests": get_pending_device_requests()
+        },
+        {
+            "type": "blocked_devices",
+            "devices": get_blocked_devices()
+        }
+    )
+    targets = [websocket] if websocket is not None else list(browser_clients)
+    for target in targets:
+        for message in messages:
+            try:
+                await send_json(target, message)
+            except Exception:
+                if target in browser_clients:
+                    browser_clients.discard(target)
+
+
+def load_pending_commands():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT command_id, device_id, operation_json, payload_json,
+                   status, attempts
+            FROM command_queue
+            WHERE status IN ('queued', 'sent')
+            ORDER BY created_at
+        """).fetchall()
+
+    for command_id, device_id, operation_json, payload_json, status, attempts in rows:
+        try:
+            operation = json.loads(operation_json)
+            payload = json.loads(payload_json)
+        except (TypeError, json.JSONDecodeError):
+            print(f"[WARN] Skipping unreadable queued command {command_id}.")
+            continue
+        if not isinstance(operation, dict) or not isinstance(payload, dict):
+            continue
+        pending_commands[command_id] = {
+            "command_id": command_id,
+            "device": device_id,
+            "browser": None,
+            "operation": operation,
+            "payload": payload,
+            "attempts": attempts,
+            "status": "queued",
+            "timeout_task": None,
+            "sending": False
+        }
+
+
+def create_command_queue_record(pending):
+    timestamp = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO command_queue (
+                command_id, device_id, operation_json, payload_json,
+                status, attempts, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'queued', 0, ?, ?)
+        """, (
+            pending["command_id"], pending["device"],
+            json.dumps(pending["operation"], ensure_ascii=False),
+            json.dumps(pending["payload"], ensure_ascii=False),
+            timestamp, timestamp
+        ))
+        conn.commit()
+
+
+def update_command_queue_record(pending, status, result=None, error=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            UPDATE command_queue
+            SET status = ?, attempts = ?, updated_at = ?,
+                result_json = ?, error = ?
+            WHERE command_id = ?
+        """, (
+            status, pending.get("attempts", 0), current_time(),
+            json.dumps(result, ensure_ascii=False) if result is not None else None,
+            error, pending["command_id"]
+        ))
+        conn.commit()
+
+
+async def send_command_queue_state(websocket=None):
+    commands = [
+        {
+            "command_id": pending["command_id"],
+            "device": pending["device"],
+            "operation": pending["operation"],
+            "status": pending.get("status", "queued"),
+            "attempts": pending.get("attempts", 0)
+        }
+        for pending in pending_commands.values()
+    ]
+    message = {"type": "command_queue", "commands": commands}
+    if websocket is not None:
+        await send_json(websocket, message)
+    else:
+        await broadcast(message)
+
+
+async def notify_command_queued(pending):
+    pending["status"] = "queued"
+    update_command_queue_record(pending, "queued")
+    if pending.get("browser") is not None:
+        try:
+            await send_json(pending["browser"], {
+                "type": "command_queued",
+                "command_id": pending["command_id"],
+                "device": pending["device"],
+                "attempts": pending.get("attempts", 0)
+            })
+        except Exception:
+            pending["browser"] = None
+    await send_command_queue_state()
+
+
+async def deliver_pending_command(pending):
+    if pending.get("sending"):
+        return False
+    device_id = pending["device"]
+    websocket = devices.get(device_id)
+    if websocket is None or device_id in pending_device_schemas:
+        await notify_command_queued(pending)
+        return False
+
+    pending["sending"] = True
+    try:
+        pending["attempts"] = pending.get("attempts", 0) + 1
+        pending["status"] = "sent"
+        update_command_queue_record(pending, "sent")
+        await send_json(websocket, pending["payload"])
+    except Exception:
+        await notify_command_queued(pending)
+        return False
+    finally:
+        pending["sending"] = False
+
+    if pending_commands.get(pending["command_id"]) is not pending:
+        return True
+
+    old_task = pending.get("timeout_task")
+    if old_task is not None and old_task is not asyncio.current_task():
+        old_task.cancel()
+    pending["timeout_task"] = asyncio.create_task(
+        expire_pending_command(pending["command_id"])
+    )
+    if pending.get("browser") is not None:
+        try:
+            await send_json(pending["browser"], {
+                "type": "command_sent",
+                "device": device_id,
+                "command_id": pending["command_id"],
+                "status": "sent",
+                "attempts": pending["attempts"]
+            })
+        except Exception:
+            pending["browser"] = None
+    await send_command_queue_state()
+    return True
+
+
+async def deliver_queued_commands(device_id):
+    for pending in list(pending_commands.values()):
+        if pending["device"] == device_id and pending.get("status") == "queued":
+            if (
+                pending.get("attempts", 0) > 0
+                and not device_supports_command_dedup(device_id)
+            ):
+                pending = remove_pending_command(pending["command_id"])
+                if pending is not None:
+                    await send_pending_command_result(
+                        pending,
+                        "unavailable",
+                        pending["operation"].get("value"),
+                        "Повтор отключён: прошивка не объявила защиту от повторного command_id."
+                    )
+                continue
+            await deliver_pending_command(pending)
 
 
 def schemas_match(left, right):
@@ -619,7 +1207,10 @@ def offer_device_schema(device_id, offered_metadata, is_legacy=False):
     # уже принятую Schema современного устройства.
     if is_legacy and previous.get("schema_version") is not None:
         active_metadata = dict(previous)
-        for key in ("name", "protocol_version", "firmware_version"):
+        for key in (
+            "name", "protocol_version", "firmware_version",
+            "command_dedup", "trust_policy"
+        ):
             active_metadata[key] = offered_metadata.get(key)
         save_device_metadata(device_id, active_metadata)
         return "preserved"
@@ -643,7 +1234,10 @@ def offer_device_schema(device_id, offered_metadata, is_legacy=False):
         offered_metadata["schema"], offered_metadata.get("schema_version")
     )
     active_metadata = dict(previous)
-    for key in ("name", "protocol_version", "firmware_version"):
+    for key in (
+        "name", "protocol_version", "firmware_version",
+        "command_dedup", "trust_policy"
+    ):
         active_metadata[key] = offered_metadata.get(key)
     save_device_metadata(device_id, active_metadata)
 
@@ -953,8 +1547,12 @@ def get_all_devices():
         rows = conn.execute("""
             SELECT
                 device_id, last_seen, led, connected, name, state_json,
-                protocol_version, firmware_version, schema_version, schema_json
+                protocol_version, firmware_version, command_dedup,
+                schema_version, schema_json,
+                trust_policy
             FROM devices
+            WHERE trust_policy IS NULL
+               OR trust_policy NOT IN ('deny', 'forgotten')
             ORDER BY device_id
         """).fetchall()
 
@@ -1003,8 +1601,10 @@ def get_all_devices():
                 "name": row["name"],
                 "protocol_version": row["protocol_version"],
                 "firmware_version": row["firmware_version"],
+                "command_dedup": bool(row["command_dedup"]),
                 "schema_version": row["schema_version"],
-                "schema": stored_schema
+                "schema": stored_schema,
+                "trust_policy": row["trust_policy"]
             }
 
         result.append({
@@ -1016,6 +1616,7 @@ def get_all_devices():
             "schema": metadata["schema"],
             "protocol_version": metadata.get("protocol_version"),
             "firmware_version": metadata.get("firmware_version"),
+            "command_dedup": metadata.get("command_dedup", False),
             "schema_version": metadata.get("schema_version"),
             "schema_source": (
                 "device"
@@ -1024,6 +1625,7 @@ def get_all_devices():
                 if metadata["schema"].get("parameters")
                 else "missing"
             ),
+            "trust_policy": metadata.get("trust_policy"),
             "pending_schema": public_schema_proposal(device_id)
         })
 
@@ -1043,6 +1645,7 @@ def get_all_devices():
                 "schema": metadata["schema"],
                 "protocol_version": metadata.get("protocol_version"),
                 "firmware_version": metadata.get("firmware_version"),
+                "command_dedup": metadata.get("command_dedup", False),
                 "schema_version": metadata.get("schema_version"),
                 "schema_source": (
                     "device"
@@ -1051,6 +1654,7 @@ def get_all_devices():
                     if metadata["schema"].get("parameters")
                     else "missing"
                 ),
+                "trust_policy": metadata.get("trust_policy"),
                 "pending_schema": public_schema_proposal(device_id)
             })
 
@@ -1102,6 +1706,17 @@ async def send_device_list(websocket=None):
         await broadcast(message)
 
 
+async def send_database_stats(websocket=None):
+    message = {
+        "type": "database_stats",
+        **get_database_stats()
+    }
+    if websocket is not None:
+        await send_json(websocket, message)
+    else:
+        await broadcast(message)
+
+
 async def send_event_history(
     websocket=None,
     device_id=None,
@@ -1129,6 +1744,8 @@ async def send_event_history(
     else:
         await broadcast(message)
 
+    await send_database_stats(websocket)
+
 
 def remove_pending_command(command_id):
     pending = pending_commands.pop(command_id, None)
@@ -1147,6 +1764,9 @@ def remove_pending_command(command_id):
 
 async def send_pending_command_result(pending, status, value, error):
     operation = pending["operation"]
+    result_record = {"status": status, "value": value, "error": error}
+    pending["status"] = status
+    update_command_queue_record(pending, status, result_record, error)
     deferred_state_events = pending.pop("deferred_state_events", [])
     for state_event in deferred_state_events:
         is_confirmed_command_state = (
@@ -1184,6 +1804,7 @@ async def send_pending_command_result(pending, status, value, error):
         print(f"[ОШИБКА] Не удалось сохранить результат команды: {log_error}")
 
     if pending["browser"] is None:
+        await send_command_queue_state()
         print(
             f"[КОМАНДА] {pending['command_id']} ({pending['device']}): "
             f"{status}; {error or value}"
@@ -1207,22 +1828,35 @@ async def send_pending_command_result(pending, status, value, error):
         await send_json(pending["browser"], message)
     except Exception:
         pass
+    await send_command_queue_state()
 
 
 async def expire_pending_command(command_id):
     await asyncio.sleep(COMMAND_TIMEOUT_SECONDS)
-    pending = remove_pending_command(command_id)
+    pending = pending_commands.get(command_id)
+    if pending is None:
+        return
 
-    if pending is not None:
-        await send_pending_command_result(
-            pending,
-            "timeout",
-            pending["operation"].get("value"),
-            "Устройство не подтвердило выполнение за отведённое время."
-        )
+    pending["timeout_task"] = None
+    if not device_supports_command_dedup(pending["device"]):
+        pending = remove_pending_command(command_id)
+        if pending is not None:
+            await send_pending_command_result(
+                pending,
+                "timeout",
+                pending["operation"].get("value"),
+                "Устройство не подтвердило команду. Повтор отключён, так как прошивка не объявила защиту от дублей."
+            )
+        return
+    if pending.get("attempts", 0) < COMMAND_RETRY_LIMIT:
+        if await deliver_pending_command(pending):
+            return
+    await notify_command_queued(pending)
 
 
-async def finish_pending_commands_for_device(device_id, status, error):
+async def finish_pending_commands_for_device(
+    device_id, status, error, retry=True
+):
     command_ids = [
         command_id
         for command_id, pending in pending_commands.items()
@@ -1230,14 +1864,31 @@ async def finish_pending_commands_for_device(device_id, status, error):
     ]
 
     for command_id in command_ids:
-        pending = remove_pending_command(command_id)
+        pending = pending_commands.get(command_id)
+        if pending is None:
+            continue
+        if retry:
+            if not device_supports_command_dedup(device_id):
+                pending = remove_pending_command(command_id)
+                if pending is not None:
+                    await send_pending_command_result(
+                        pending,
+                        status,
+                        pending["operation"].get("value"),
+                        "Результат команды неизвестен после разрыва. Автоповтор отключён для прошивки без защиты от дублей."
+                    )
+                continue
+            task = pending.get("timeout_task")
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+            pending["timeout_task"] = None
+            await notify_command_queued(pending)
+            continue
 
+        pending = remove_pending_command(command_id)
         if pending is not None:
             await send_pending_command_result(
-                pending,
-                status,
-                pending["operation"].get("value"),
-                error
+                pending, status, pending["operation"].get("value"), error
             )
 
 
@@ -1260,8 +1911,6 @@ async def dispatch_device_command(
     browser=None,
     requested_command_id=None
 ):
-    global command_counter
-
     async def reject(message, command_id=requested_command_id):
         if browser is None:
             print(message)
@@ -1312,9 +1961,8 @@ async def dispatch_device_command(
         return False
 
     if requested_command_id is None:
-        command_counter += 1
         prefix = "cmd" if browser is not None else "console"
-        command_id = f"{prefix}-{command_counter:06d}"
+        command_id = f"{prefix}-{uuid.uuid4().hex}"
     elif isinstance(requested_command_id, str) and 1 <= len(requested_command_id) <= 80:
         command_id = requested_command_id
     else:
@@ -1343,32 +1991,19 @@ async def dispatch_device_command(
         "device": device_id,
         "browser": browser,
         "operation": {"kind": "parameter", "name": parameter, "value": value},
-        "timeout_task": None
+        "payload": payload,
+        "attempts": 0,
+        "status": "queued",
+        "timeout_task": None,
+        "sending": False
     }
-    pending_commands[command_id] = pending
-
     try:
-        await send_json(devices[device_id], payload)
-    except Exception as error:
-        remove_pending_command(command_id)
-        await reject(f"Не удалось отправить команду: {error}", command_id)
+        create_command_queue_record(pending)
+    except sqlite3.IntegrityError:
+        await reject("Команда с таким command_id уже использовалась.", command_id)
         return False
-
-    pending["timeout_task"] = asyncio.create_task(
-        expire_pending_command(command_id)
-    )
-    if browser is not None:
-        try:
-            await send_json(browser, {
-                "type": "command_sent",
-                "device": device_id,
-                "command_id": command_id,
-                "status": "sent"
-            })
-        except Exception:
-            pass
-    else:
-        print(f"Команда отправлена: {device_id} — {parameter} = {value}")
+    pending_commands[command_id] = pending
+    await deliver_pending_command(pending)
 
     print(f"[КОМАНДА] {device_id}: {parameter} = {value} ({command_id})")
     return True
@@ -1381,8 +2016,6 @@ async def dispatch_device_action(
     browser=None,
     requested_command_id=None
 ):
-    global command_counter
-
     async def reject(message, command_id=requested_command_id):
         if browser is None:
             print(message)
@@ -1424,9 +2057,8 @@ async def dispatch_device_action(
         return False
 
     if requested_command_id is None:
-        command_counter += 1
         prefix = "cmd" if browser is not None else "console"
-        command_id = f"{prefix}-{command_counter:06d}"
+        command_id = f"{prefix}-{uuid.uuid4().hex}"
     elif isinstance(requested_command_id, str) and 1 <= len(requested_command_id) <= 80:
         command_id = requested_command_id
     else:
@@ -1456,26 +2088,20 @@ async def dispatch_device_action(
             "name": action,
             "arguments": arguments
         },
-        "timeout_task": None
+        "payload": payload,
+        "attempts": 0,
+        "status": "queued",
+        "timeout_task": None,
+        "sending": False
     }
-    pending_commands[command_id] = pending
     try:
-        await send_json(devices[device_id], payload)
-    except Exception as error:
-        remove_pending_command(command_id)
-        await reject(f"Не удалось отправить действие: {error}", command_id)
+        create_command_queue_record(pending)
+    except sqlite3.IntegrityError:
+        await reject("Команда с таким command_id уже использовалась.", command_id)
         return False
-
-    pending["timeout_task"] = asyncio.create_task(expire_pending_command(command_id))
-    if browser is not None:
-        try:
-            await send_json(browser, {
-                "type": "command_sent", "device": device_id,
-                "command_id": command_id, "status": "sent"
-            })
-        except Exception:
-            pass
-    else:
+    pending_commands[command_id] = pending
+    await deliver_pending_command(pending)
+    if browser is None:
         print(f"Действие отправлено: {device_id} — {definition.get('label', action)}")
     return True
 
@@ -1484,8 +2110,261 @@ async def handle_browser_message(websocket, message):
 
     action = message.get("action")
 
+    if action == "device_access_decision":
+        device_id = message.get("device")
+        request = pending_device_connections.get(device_id)
+        decision = message.get("decision")
+        remember = message.get("remember")
+        request_id = message.get("request_id")
+        valid = (
+            isinstance(device_id, str)
+            and request is not None
+            and request["request_id"] == request_id
+            and isinstance(decision, str)
+            and decision in {"allow", "deny"}
+            and type(remember) is bool
+            and not request["decision_event"].is_set()
+        )
+        if not valid:
+            await send_json(websocket, {
+                "type": "device_access_decision_result",
+                "success": False,
+                "device": device_id,
+                "request_id": request_id,
+                "message": "Запрос подключения уже обработан или истёк."
+            })
+            return
+
+        request["decision"] = decision
+        request["remember"] = remember
+        request["decision_event"].set()
+        if decision == "deny" and remember:
+            set_device_trust_policy(
+                device_id, "deny", request["metadata"].get("name")
+            )
+            active_socket = devices.pop(device_id, None)
+            last_device_heartbeat.pop(device_id, None)
+            pending_device_schemas.pop(device_id, None)
+            deferred_device_schemas.pop(device_id, None)
+            await finish_pending_commands_for_device(
+                device_id,
+                "unavailable",
+                "Подключение устройства запрещено.",
+                retry=False
+            )
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE devices SET connected = 0 WHERE device_id = ?",
+                    (device_id,)
+                )
+                conn.commit()
+            save_device_event(
+                device_id,
+                "connection",
+                "Для устройства сохранён постоянный запрет подключения"
+            )
+            if active_socket is not None:
+                try:
+                    await active_socket.close(
+                        code=4003, reason="Device access denied"
+                    )
+                except Exception:
+                    pass
+        await send_json(websocket, {
+            "type": "device_access_decision_result",
+            "success": True,
+            "device": device_id,
+            "request_id": request_id,
+            "message": (
+                "Подключение устройства разрешено."
+                if decision == "allow"
+                else "Подключение устройства отклонено."
+            )
+        })
+        await send_device_access_state()
+        if decision == "deny" and remember:
+            await send_device_list()
+            await send_event_history()
+        if decision == "deny":
+            try:
+                await request["websocket"].close(
+                    code=4003, reason="Device access denied"
+                )
+            except Exception:
+                pass
+        return
+
+    if action == "forget_device":
+        device_id = message.get("device")
+        if not isinstance(device_id, str) or not 1 <= len(device_id) <= 64:
+            await send_json(websocket, {
+                "type": "device_forget_result",
+                "success": False,
+                "device": device_id,
+                "message": "Некорректный идентификатор устройства."
+            })
+            return
+
+        with sqlite3.connect(DB_PATH) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM devices WHERE device_id = ?",
+                (device_id,)
+            ).fetchone()
+        if exists is None:
+            await send_json(websocket, {
+                "type": "device_forget_result",
+                "success": False,
+                "device": device_id,
+                "message": "Устройство не найдено."
+            })
+            return
+
+        set_device_trust_policy(device_id, "forgotten")
+        active_socket = devices.pop(device_id, None)
+        last_device_heartbeat.pop(device_id, None)
+        pending_device_schemas.pop(device_id, None)
+        deferred_device_schemas.pop(device_id, None)
+        await finish_pending_commands_for_device(
+            device_id,
+            "unavailable",
+            "Доступ к устройству отозван.",
+            retry=False
+        )
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE devices SET connected = 0 WHERE device_id = ?",
+                (device_id,)
+            )
+            conn.commit()
+        save_device_event(
+            device_id,
+            "connection",
+            "Устройство забыто; при следующем подключении потребуется подтверждение"
+        )
+        if active_socket is not None:
+            try:
+                await active_socket.close(code=4002, reason="Device forgotten")
+            except Exception:
+                pass
+        await send_json(websocket, {
+            "type": "device_forget_result",
+            "success": True,
+            "device": device_id,
+            "message": "Устройство отключено. При следующем подключении Gateway снова запросит разрешение."
+        })
+        await send_device_list()
+        await send_event_history()
+        await send_device_access_state()
+        return
+
+    if action == "clear_device_block":
+        device_id = message.get("device")
+        if not isinstance(device_id, str) or get_device_trust_policy(device_id) != "deny":
+            await send_json(websocket, {
+                "type": "blocked_device_result",
+                "success": False,
+                "device": device_id,
+                "message": "Для устройства не найдена постоянная блокировка."
+            })
+            return
+        set_device_trust_policy(device_id, "forgotten")
+        save_device_event(
+            device_id, "connection", "Постоянная блокировка подключения снята"
+        )
+        await send_json(websocket, {
+            "type": "blocked_device_result",
+            "success": True,
+            "device": device_id,
+            "message": "Блокировка снята. При следующем подключении появится запрос разрешения."
+        })
+        await send_device_list()
+        await send_device_access_state()
+        await send_event_history()
+        return
+
+    if action == "get_schema_history":
+        device_id = message.get("device")
+        request_id = message.get("request_id")
+        if not isinstance(device_id, str) or not 1 <= len(device_id) <= 64:
+            await send_json(websocket, {
+                "type": "schema_history",
+                "device": device_id,
+                "request_id": request_id,
+                "history": []
+            })
+            return
+        await send_json(websocket, {
+            "type": "schema_history",
+            "device": device_id,
+            "request_id": request_id,
+            "history": get_schema_history(device_id)
+        })
+        return
+
+    if action == "restore_schema":
+        device_id = message.get("device")
+        history_id = message.get("history_id")
+        if (
+            not isinstance(device_id, str)
+            or type(history_id) is not int
+            or history_id < 1
+        ):
+            success, message_text = False, "Некорректный снимок Schema."
+        else:
+            success, message_text = restore_device_schema(device_id, history_id)
+        await send_json(websocket, {
+            "type": "schema_restore_result",
+            "success": success,
+            "device": device_id,
+            "history_id": history_id,
+            "message": message_text
+        })
+        if success:
+            await send_device_list()
+            await send_event_history()
+        return
+
+    if action == "delete_schema_history":
+        device_id = message.get("device")
+        history_id = message.get("history_id")
+        if (
+            not isinstance(device_id, str)
+            or not 1 <= len(device_id) <= 64
+            or type(history_id) is not int
+            or history_id < 1
+        ):
+            success = False
+            message_text = "Некорректный снимок Schema."
+        else:
+            success = delete_schema_history_item(device_id, history_id)
+            message_text = (
+                "Снимок Schema удалён из истории. Текущая Schema устройства не изменена."
+                if success
+                else "Снимок Schema не найден; история не изменена."
+            )
+        if success:
+            save_device_event(
+                device_id,
+                "schema",
+                f"Удалён снимок Schema из истории (ID {history_id})"
+            )
+        await send_json(websocket, {
+            "type": "schema_history_delete_result",
+            "success": success,
+            "device": device_id,
+            "history_id": history_id,
+            "message": message_text
+        })
+        if success:
+            await send_event_history()
+        return
+
     if action == "get_devices":
         await send_device_list(websocket)
+        return
+
+    if action == "get_database_stats":
+        await send_database_stats(websocket)
         return
 
     if action == "get_events":
@@ -1543,6 +2422,7 @@ async def handle_browser_message(websocket, message):
             not isinstance(device_id, str)
             or not 1 <= len(device_id) <= 64
             or not isinstance(proposal_id, str)
+            or not isinstance(decision, str)
             or decision not in {"accept", "reject"}
             or proposal is None
             or proposal["proposal_id"] != proposal_id
@@ -1568,6 +2448,7 @@ async def handle_browser_message(websocket, message):
                 "schema",
                 f"Принята версия Schema {version or 'без номера'}"
             )
+            await deliver_queued_commands(device_id)
             message_text = f"Новая Schema устройства {device_id} принята."
         else:
             pending_device_schemas.pop(device_id, None)
@@ -1577,6 +2458,7 @@ async def handle_browser_message(websocket, message):
                 "schema",
                 f"Оставлена текущая Schema; предложение версии {version or 'без номера'} отклонено"
             )
+            await deliver_queued_commands(device_id)
             message_text = f"Текущая Schema устройства {device_id} оставлена. При следующем подключении Gateway снова предложит это изменение, если Schema всё ещё отличается."
 
         await send_json(websocket, {
@@ -1588,6 +2470,7 @@ async def handle_browser_message(websocket, message):
         })
         await send_device_list()
         await send_event_history()
+        await send_command_queue_state()
         return
 
     if action == "command":
@@ -1674,6 +2557,9 @@ async def handle_client(websocket):
                 print("[БРАУЗЕР] Подключён")
 
                 await send_device_list(websocket)
+                await send_device_access_state(websocket)
+                await send_command_queue_state(websocket)
+                await send_database_stats(websocket)
                 continue
 
             if client_type == "browser":
@@ -1735,10 +2621,13 @@ async def handle_client(websocket):
                 schema_version = message.get(
                     "schema_version", None if is_legacy else 1
                 )
+                command_dedup = message.get("command_dedup", False)
                 if not is_legacy and schema_version is None:
                     schema_version = 1
 
                 if (
+                    type(command_dedup) is not bool
+                ) or (
                     protocol_version is not None
                     and (type(protocol_version) is not int or protocol_version < 1)
                 ) or (
@@ -1759,21 +2648,100 @@ async def handle_client(websocket):
                     "name": name,
                     "protocol_version": protocol_version,
                     "firmware_version": firmware_version,
+                    "command_dedup": command_dedup,
                     "schema_version": schema_version,
                     "schema": schema
                 }
 
                 device_id = str(incoming_id)
+                trust_policy = get_device_trust_policy(device_id)
+                if trust_policy == "deny":
+                    await send_json(websocket, {
+                        "type": "error",
+                        "message": "Для этого устройства сохранён запрет подключения."
+                    })
+                    await websocket.close(code=4003, reason="Device access denied")
+                    break
+
+                if trust_policy != "allow":
+                    if device_id in pending_device_connections:
+                        await send_json(websocket, {
+                            "type": "error",
+                            "message": "Для этого устройства уже ожидается решение."
+                        })
+                        await websocket.close(code=4004, reason="Approval already pending")
+                        break
+
+                    request = {
+                        "request_id": uuid.uuid4().hex,
+                        "websocket": websocket,
+                        "metadata": metadata,
+                        "decision": None,
+                        "remember": False,
+                        "decision_event": asyncio.Event()
+                    }
+                    pending_device_connections[device_id] = request
+                    await send_device_access_state()
+                    approval_wait = asyncio.create_task(
+                        request["decision_event"].wait()
+                    )
+                    closed_wait = asyncio.create_task(websocket.wait_closed())
+                    done, waiting = await asyncio.wait(
+                        {approval_wait, closed_wait},
+                        timeout=DEVICE_APPROVAL_TIMEOUT_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in waiting:
+                        task.cancel()
+                    if waiting:
+                        await asyncio.gather(*waiting, return_exceptions=True)
+
+                    if closed_wait in done:
+                        if pending_device_connections.get(device_id) is request:
+                            pending_device_connections.pop(device_id, None)
+                        await send_device_access_state()
+                        break
+
+                    if approval_wait not in done:
+                        if pending_device_connections.get(device_id) is request:
+                            pending_device_connections.pop(device_id, None)
+                        await send_device_access_state()
+                        try:
+                            await websocket.close(
+                                code=4000, reason="Device approval timed out"
+                            )
+                        except Exception:
+                            pass
+                        break
+
+                    if pending_device_connections.get(device_id) is request:
+                        pending_device_connections.pop(device_id, None)
+                    await send_device_access_state()
+                    if request["decision"] != "allow":
+                        try:
+                            await websocket.close(
+                                code=4003, reason="Device access denied"
+                            )
+                        except Exception:
+                            pass
+                        break
+
+                    metadata["trust_policy"] = (
+                        "allow" if request["remember"] else None
+                    )
+                else:
+                    metadata["trust_policy"] = "allow"
+
                 client_type = "device"
 
                 old_connection = devices.get(device_id)
 
                 devices[device_id] = websocket
                 last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
-                save_device_seen(device_id, True)
                 schema_status = offer_device_schema(
                     device_id, metadata, is_legacy=is_legacy
                 )
+                save_device_seen(device_id, True)
                 if schema_status == "pending":
                     print(
                         f"[Schema] Для {device_id} ожидает подтверждения "
@@ -1807,6 +2775,9 @@ async def handle_client(websocket):
 
                 await send_device_list()
                 await send_event_history()
+                if schema_status != "pending":
+                    await deliver_queued_commands(device_id)
+                await send_command_queue_state()
                 continue
 
             if client_type == "device" and message_type == "schema_update":
@@ -2065,6 +3036,15 @@ async def handle_client(websocket):
     finally:
         browser_clients.discard(websocket)
 
+        if device_id:
+            pending_access = pending_device_connections.get(device_id)
+            if (
+                pending_access is not None
+                and pending_access.get("websocket") is websocket
+            ):
+                pending_device_connections.pop(device_id, None)
+                await send_device_access_state()
+
         # Обрабатываем отключение только текущего соединения.
         # Это не даст старому соединению ошибочно отметить
         # новое соединение того же устройства отключённым.
@@ -2100,6 +3080,7 @@ async def handle_client(websocket):
 
             await send_device_list()
             await send_event_history()
+            await send_command_queue_state()
 
         elif client_type == "browser":
             detach_pending_commands_for_browser(websocket)
@@ -2310,6 +3291,7 @@ async def device_presence_watchdog():
 
 async def main():
     init_db()
+    load_pending_commands()
 
     print("=" * 48)
     print("        IoT Gateway запускается")
@@ -2328,6 +3310,7 @@ async def main():
         print(f"WebSocket-сервер запущен на порту {PORT}")
         print("Ожидание подключений ESP32 и браузера...")
         watchdog_task = asyncio.create_task(device_presence_watchdog())
+        runtime_task = asyncio.create_task(gateway_runtime_checkpoint_loop())
         try:
             if sys.stdin.isatty():
                 await console_loop()
@@ -2336,10 +3319,16 @@ async def main():
                 await asyncio.Event().wait()
         finally:
             watchdog_task.cancel()
+            runtime_task.cancel()
             try:
                 await watchdog_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await runtime_task
+            except asyncio.CancelledError:
+                pass
+            checkpoint_gateway_runtime(final=True)
 
 
 if __name__ == "__main__":

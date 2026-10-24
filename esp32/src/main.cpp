@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "secrets.h"
 #include "device_config.h"
 
@@ -12,9 +13,53 @@ const unsigned long STATE_INTERVAL_MS = 10000;
 const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 
 WebSocketsClient webSocket;
+Preferences commandCache;
+bool commandCacheReady = false;
+const uint8_t COMMAND_CACHE_SLOTS = 16;
 unsigned long lastStateSentAt = 0;
 unsigned long lastWifiReconnectAt = 0;
 uint32_t stateSequence = 0;
+
+bool replayCachedCommandResult(const char* commandId) {
+    if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
+        return false;
+    }
+
+    for (uint8_t slot = 0; slot < COMMAND_CACHE_SLOTS; slot++) {
+        String idKey = "id";
+        idKey += String(slot);
+        if (commandCache.getString(idKey.c_str(), "") != commandId) {
+            continue;
+        }
+
+        String resultKey = "r";
+        resultKey += String(slot);
+        const String cachedResult = commandCache.getString(resultKey.c_str(), "");
+        if (cachedResult.length() == 0) {
+            return false;
+        }
+        webSocket.sendTXT(cachedResult);
+        Serial.println("Replayed cached result for duplicate command");
+        return true;
+    }
+    return false;
+}
+
+void rememberCommandResult(const char* commandId, const String& result) {
+    if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
+        return;
+    }
+
+    const uint8_t slot = commandCache.getUChar("next", 0) % COMMAND_CACHE_SLOTS;
+    String idKey = "id";
+    idKey += String(slot);
+    String resultKey = "r";
+    resultKey += String(slot);
+    commandCache.putString(idKey.c_str(), "");
+    commandCache.putString(resultKey.c_str(), result);
+    commandCache.putString(idKey.c_str(), commandId);
+    commandCache.putUChar("next", (slot + 1) % COMMAND_CACHE_SLOTS);
+}
 
 void sendHello() {
     JsonDocument doc;
@@ -24,6 +69,7 @@ void sendHello() {
     doc["device"] = DEVICE_ID;
     doc["name"] = DEVICE_NAME;
     doc["protocol_version"] = 2;
+    doc["command_dedup"] = commandCacheReady;
     doc["firmware_version"] = "1.1.0";
     doc["schema_version"] = 2;
 
@@ -89,6 +135,7 @@ void sendCommandResult(
 
     String message;
     serializeJson(doc, message);
+    rememberCommandResult(commandId, message);
     webSocket.sendTXT(message);
 
     Serial.print("Command result sent: ");
@@ -109,6 +156,7 @@ void sendActionResult(const char* commandId, const char* action, bool success) {
 
     String message;
     serializeJson(doc, message);
+    rememberCommandResult(commandId, message);
     webSocket.sendTXT(message);
     Serial.print("Action result sent: ");
     Serial.println(message);
@@ -148,6 +196,9 @@ void onWebSocketEvent(
 
                 if (commandId[0] == '\0') {
                     Serial.println("Command has no command_id");
+                    break;
+                }
+                if (replayCachedCommandResult(commandId)) {
                     break;
                 }
 
@@ -237,6 +288,7 @@ void onWebSocketEvent(
 
 void setup() {
     Serial.begin(9600);
+    commandCacheReady = commandCache.begin("command_ack", false);
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 #if DEVICE_HAS_IDENTIFY_INDICATOR && IDENTIFY_PIN != LED_PIN

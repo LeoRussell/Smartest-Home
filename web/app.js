@@ -1,10 +1,71 @@
 const deviceCard = document.querySelector(".device-card");
 const activityMessage = document.getElementById("activity-message");
+const actionFeedback = document.getElementById("action-feedback");
 const refreshButton = document.getElementById("refresh-button");
 const activityCard = document.querySelector(".activity-card");
 const overview = document.getElementById("dashboard-overview");
+const blockedDevicesSection = document.getElementById("blocked-devices");
+const blockedDevicesList = document.getElementById("blocked-devices-list");
+const blockedDeviceCount = document.getElementById("blocked-device-count");
 const gatewayStatus = document.getElementById("gateway-status");
 const gatewayStatusDot = document.getElementById("gateway-status-dot");
+const navigation = document.getElementById("main-navigation");
+const notificationButton = document.getElementById("notification-button");
+const notificationPanel = document.getElementById("notification-panel");
+const notificationList = document.getElementById("notification-list");
+const notificationCount = document.getElementById("notification-count");
+const notificationSummary = document.getElementById("notification-summary");
+const markNotificationsReadButton = document.getElementById("mark-notifications-read");
+const settingNavigation = document.getElementById("setting-navigation");
+const settingLanguage = document.getElementById("setting-language");
+const settingTimezone = document.getElementById("setting-timezone");
+const settingImportantOnly = document.getElementById("setting-important-only");
+const settingsSavedMessage = document.getElementById("settings-saved");
+const databaseStatistics = document.getElementById("database-statistics");
+
+const UI_SETTINGS_KEY = "iot-gateway-ui-settings-v1";
+const NOTIFICATION_STATE_KEY = "iot-gateway-notifications-v1";
+
+function readLocalState(key, fallback) {
+    try {
+        const value = JSON.parse(localStorage.getItem(key));
+        return value ?? fallback;
+    } catch (error) {
+        return fallback;
+    }
+}
+
+const savedUiSettings = readLocalState(UI_SETTINGS_KEY, {});
+const uiSettings = {
+    navigation: savedUiSettings.navigation === "side" ? "side" : "top",
+    language: savedUiSettings.language === "en" ? "en" : "ru",
+    timezone: typeof savedUiSettings.timezone === "string" ? savedUiSettings.timezone : "local",
+    importantOnly: savedUiSettings.importantOnly === true
+};
+const savedNotificationState = readLocalState(NOTIFICATION_STATE_KEY, {});
+let unreadNotifications = Array.isArray(savedNotificationState.unread)
+    ? savedNotificationState.unread.filter(item => item && Number.isFinite(Number(item.id))).slice(0, 50)
+    : [];
+let lastReadEventId = typeof savedNotificationState.lastReadEventId === "number" && Number.isFinite(savedNotificationState.lastReadEventId)
+    ? Number(savedNotificationState.lastReadEventId)
+    : null;
+let readNotificationIds = new Set(
+    Array.isArray(savedNotificationState.readIds)
+        ? savedNotificationState.readIds.map(String).slice(-500)
+        : []
+);
+let notificationStateReady = false;
+let observedMaxEventId = lastReadEventId || 0;
+let notificationBackfillSequence = 0;
+let notificationBackfillActive = null;
+let pendingEventFocusId = null;
+let activePage = "devices";
+let lastActivityMessage = "";
+let lastGatewayStatusMessage = "Нет соединения с Gateway";
+let gatewayIsConnectedState = false;
+let databaseStats = null;
+let databaseStatsReceivedAt = 0;
+let databaseStatsFrozenElapsed = null;
 
 // =========================
 // СОСТОЯНИЕ ПРИЛОЖЕНИЯ
@@ -15,6 +76,10 @@ let reconnectTimer = null;
 
 let devices = [];
 let events = [];
+let blockedDevices = [];
+let pendingDeviceAccessRequests = [];
+let deviceAccessDialog = null;
+let deviceAccessDialogRequestId = null;
 let eventFilter = "all";
 let eventDeviceFilter = "all";
 let eventCursor = null;
@@ -25,7 +90,9 @@ let activeEventRequest = null;
 
 const pendingCommands = new Map();
 const pendingSchemaDecisions = new Set();
-const COMMAND_TIMEOUT_MS = 7000;
+const schemaHistoryByDevice = new Map();
+const schemaHistoryRequests = new Set();
+const openSchemaHistoryDevices = new Set();
 let commandSequence = 0;
 
 function createCommandId() {
@@ -51,18 +118,529 @@ function mergeEventPages(existingEvents, newEvents) {
     );
 }
 
+function localized(russian, english) {
+    return uiSettings.language === "en" ? english : russian;
+}
+
+function formatDatabaseDuration(value, elapsedSeconds = 0) {
+    let seconds = Math.max(0, Math.floor(Number(value) + elapsedSeconds));
+    const days = Math.floor(seconds / 86400);
+    seconds %= 86400;
+    const hours = Math.floor(seconds / 3600);
+    seconds %= 3600;
+    const minutes = Math.floor(seconds / 60);
+    seconds %= 60;
+    const parts = [];
+
+    if (uiSettings.language === "en") {
+        if (days) parts.push(`${days}d`);
+        if (hours) parts.push(`${hours}h`);
+        if (minutes) parts.push(`${minutes}m`);
+        if (parts.length === 0) parts.push(`${seconds}s`);
+    } else {
+        if (days) parts.push(`${days} д`);
+        if (hours) parts.push(`${hours} ч`);
+        if (minutes) parts.push(`${minutes} мин`);
+        if (parts.length === 0) parts.push(`${seconds} с`);
+    }
+
+    return parts.join(" ");
+}
+
+function formatDatabaseSize(value) {
+    const units = uiSettings.language === "en"
+        ? ["B", "KB", "MB", "GB", "TB"]
+        : ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let size = Math.max(0, Number(value) || 0);
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit += 1;
+    }
+    const locale = uiSettings.language === "en" ? "en-US" : "ru-RU";
+    const digits = unit === 0 ? 0 : 1;
+    return `${new Intl.NumberFormat(locale, { maximumFractionDigits: digits }).format(size)} ${units[unit]}`;
+}
+
+function renderDatabaseStats() {
+    if (!databaseStatistics || !databaseStats) return;
+    const elapsed = databaseStatsFrozenElapsed ?? Math.max(
+        0,
+        performance.now() / 1000 - databaseStatsReceivedAt
+    );
+    const locale = uiSettings.language === "en" ? "en-US" : "ru-RU";
+
+    for (const element of databaseStatistics.querySelectorAll("[data-db-stat]")) {
+        const key = element.dataset.dbStat;
+        const value = Number(databaseStats[key]);
+        if (!Number.isFinite(value)) continue;
+
+        if (key === "database_size_bytes") {
+            element.textContent = formatDatabaseSize(value);
+        } else if (key.endsWith("_uptime_seconds")) {
+            element.textContent = formatDatabaseDuration(value, elapsed);
+        } else {
+            element.textContent = new Intl.NumberFormat(locale).format(value);
+        }
+    }
+}
+
+function localizeActivityMessage(message) {
+    if (uiSettings.language !== "en") return message;
+    const exact = {
+        "Нет соединения с Gateway.": "No connection to Gateway.",
+        "Не удалось отправить запрос в Gateway.": "Could not send the request to Gateway.",
+        "Подключено к Gateway.": "Connected to Gateway.",
+        "Gateway доступен, устройств пока нет.": "Gateway is online. No devices found yet.",
+        "Обновляем устройства и историю...": "Refreshing devices and event history...",
+        "Не удалось запросить историю событий.": "Could not load event history.",
+        "Запрос обработан.": "Request completed.",
+        "Подключение устройства разрешено.": "Device connection allowed.",
+        "Подключение устройства отклонено.": "Device connection denied.",
+        "Блокировка снята. При следующем подключении появится запрос разрешения.": "Block removed. Gateway will ask for approval next time the device connects.",
+        "Снимок Schema удалён из истории. Текущая Schema устройства не изменена.": "Schema snapshot deleted from history. The device's current Schema was not changed.",
+        "Schema Gateway восстановлена. При следующем подключении она будет сравнена с Schema устройства.": "Gateway Schema restored. It will be compared with the device Schema next time it connects."
+    };
+    if (exact[message]) return exact[message];
+    let match = message.match(/^Найдено устройств: (\d+)\.$/);
+    if (match) return `Devices found: ${match[1]}.`;
+    match = message.match(/^Действие «(.+)» на (.+) выполнено\.$/);
+    if (match) return `Action “${match[1]}” completed on ${match[2]}.`;
+    match = message.match(/^Подтверждено: (.+) на (.+) обновлено\.$/);
+    if (match) return `Confirmed: ${match[1]} updated on ${match[2]}.`;
+    match = message.match(/^Действие отправлено (.+)\. Ожидаем результат\.\.\.$/);
+    if (match) return `Action sent to ${match[1]}. Waiting for the result...`;
+    match = message.match(/^Команда отправлена (.+)\. Ожидаем результат выполнения\.\.\.$/);
+    if (match) return `Command sent to ${match[1]}. Waiting for completion...`;
+    return message;
+}
+
+function formatDisplayedParameterValue(value, definition) {
+    if (uiSettings.language === "en" && typeof value === "boolean") {
+        return value ? "On" : "Off";
+    }
+    return formatParameterValue(value, definition);
+}
+
+function saveUiSettings() {
+    try {
+        localStorage.setItem(UI_SETTINGS_KEY, JSON.stringify(uiSettings));
+    } catch (error) {
+        console.warn("Не удалось сохранить настройки интерфейса:", error);
+    }
+}
+
+function saveNotificationState() {
+    try {
+        localStorage.setItem(NOTIFICATION_STATE_KEY, JSON.stringify({
+            unread: unreadNotifications.slice(0, 50),
+            lastReadEventId,
+            readIds: [...readNotificationIds].slice(-500)
+        }));
+    } catch (error) {
+        console.warn("Не удалось сохранить уведомления:", error);
+    }
+}
+
+function applyLanguage() {
+    document.documentElement.lang = uiSettings.language;
+    for (const element of document.querySelectorAll("[data-ru][data-en]")) {
+        element.textContent = element.dataset[uiSettings.language] || element.dataset.ru;
+    }
+    if (notificationButton) {
+        notificationButton.setAttribute(
+            "aria-label",
+            localized("Уведомления", "Notifications")
+        );
+    }
+    if (navigation) {
+        navigation.setAttribute(
+            "aria-label",
+            localized("Главное меню", "Main navigation")
+        );
+    }
+    renderBlockedDevices();
+    renderNotifications();
+    renderDevices();
+    renderEvents();
+    renderDatabaseStats();
+    setGatewayConnectionStatus(lastGatewayStatusMessage, gatewayIsConnectedState);
+    if (lastActivityMessage) setActivity(lastActivityMessage);
+}
+
+function setActivePage(page) {
+    if (!document.querySelector(`[data-page-panel="${page}"]`)) return;
+    activePage = page;
+    for (const panel of document.querySelectorAll("[data-page-panel]")) {
+        panel.hidden = panel.dataset.pagePanel !== page;
+    }
+    for (const button of navigation?.querySelectorAll("[data-page]") || []) {
+        const active = button.dataset.page === page;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-selected", String(active));
+        button.tabIndex = active ? 0 : -1;
+    }
+    if (page === "events" && events.length === 0 && !pendingEventFocusId && isGatewayConnected()) {
+        requestEvents({ reset: true });
+    }
+}
+
+function isImportantNotification(event) {
+    if (event.event_type === "connection" || event.event_type === "schema") return true;
+    if (event.event_type !== "command") return false;
+    try {
+        return ["failed", "timeout", "unavailable"].includes(
+            JSON.parse(event.event_value || "{}").status
+        );
+    } catch (error) {
+        return false;
+    }
+}
+
+function observeEventNotifications(incomingEvents, initialize = false) {
+    const validEvents = incomingEvents.filter(event => Number.isFinite(Number(event.id)));
+    for (const event of validEvents) {
+        observedMaxEventId = Math.max(observedMaxEventId, Number(event.id));
+    }
+
+    if (initialize && !notificationStateReady) {
+        notificationStateReady = true;
+        if (lastReadEventId === null) {
+            lastReadEventId = observedMaxEventId;
+            saveNotificationState();
+            return;
+        }
+    }
+    if (!notificationStateReady) return;
+
+    const existingIds = new Set(unreadNotifications.map(item => String(item.id)));
+    let added = false;
+    let stateChanged = false;
+    for (const event of validEvents) {
+        const eventId = Number(event.id);
+        const id = String(eventId);
+        if (
+            uiSettings.importantOnly &&
+            !isImportantNotification(event) &&
+            (lastReadEventId === null || eventId > lastReadEventId)
+        ) {
+            readNotificationIds.add(id);
+            stateChanged = true;
+            continue;
+        }
+        if (
+            (lastReadEventId !== null && eventId <= lastReadEventId) ||
+            readNotificationIds.has(id) ||
+            existingIds.has(id)
+        ) continue;
+        unreadNotifications.unshift(event);
+        existingIds.add(id);
+        added = true;
+    }
+    if (added) {
+        unreadNotifications.sort((left, right) => Number(right.id) - Number(left.id));
+        unreadNotifications = unreadNotifications.slice(0, 50);
+        stateChanged = true;
+    }
+    if (stateChanged) {
+        saveNotificationState();
+    }
+    renderNotifications();
+}
+
+function requestNotificationBackfill(beforeId) {
+    if (
+        !isGatewayConnected() ||
+        !Number.isInteger(beforeId) ||
+        beforeId < 1 ||
+        notificationBackfillActive
+    ) return;
+    const requestId = `notification-backfill-${++notificationBackfillSequence}`;
+    notificationBackfillActive = requestId;
+    try {
+        socket.send(JSON.stringify({
+            type: "browser_message",
+            action: "get_events",
+            device: "all",
+            before_id: beforeId,
+            request_id: requestId
+        }));
+    } catch (error) {
+        notificationBackfillActive = null;
+    }
+}
+
+function eventKindLabel(event) {
+    const labels = {
+        connection: localized("Подключение", "Connection"),
+        schema: localized("Schema", "Schema"),
+        command: localized("Команда", "Command"),
+        led: localized("Изменение состояния", "State change"),
+        parameter: localized("Изменение состояния", "State change")
+    };
+    return labels[event.event_type] || localized("Событие", "Event");
+}
+
+function renderNotifications() {
+    if (!notificationList) return;
+    const count = unreadNotifications.length;
+    notificationButton?.classList.toggle("has-unread", count > 0);
+    notificationButton?.setAttribute(
+        "aria-label",
+        count
+            ? localized(`Уведомления, непрочитанных: ${count}`, `Notifications, ${count} unread`)
+            : localized("Уведомления", "Notifications")
+    );
+    if (notificationCount) {
+        notificationCount.hidden = count === 0;
+        notificationCount.textContent = count > 99 ? "99+" : String(count);
+    }
+    if (notificationSummary) {
+        notificationSummary.textContent = count
+            ? localized(`Непрочитанных: ${count}`, `Unread: ${count}`)
+            : localized("Новых событий нет", "No new events");
+    }
+
+    notificationList.replaceChildren();
+    if (count === 0) {
+        const empty = document.createElement("p");
+        empty.className = "notification-empty";
+        empty.textContent = localized(
+            "Здесь появятся новые события Gateway.",
+            "New Gateway events will appear here."
+        );
+        notificationList.appendChild(empty);
+        return;
+    }
+
+    for (const event of unreadNotifications) {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "notification-item";
+        const title = document.createElement("span");
+        title.className = "notification-item-title";
+        title.textContent = `${event.device_id || localized("Устройство", "Device")} · ${eventKindLabel(event)}`;
+        const description = document.createElement("span");
+        description.className = "notification-item-description";
+        description.textContent = getEventDescription(event);
+        const timestamp = document.createElement("span");
+        timestamp.className = "notification-item-time";
+        timestamp.textContent = formatEventTime(event.timestamp);
+        item.append(title, description, timestamp);
+        item.addEventListener("click", () => openNotificationEvent(event));
+        notificationList.appendChild(item);
+    }
+}
+
+function closeNotificationPanel() {
+    if (!notificationPanel || !notificationButton) return;
+    notificationPanel.hidden = true;
+    notificationButton.setAttribute("aria-expanded", "false");
+}
+
+function markNotificationRead(eventId) {
+    const id = String(eventId);
+    unreadNotifications = unreadNotifications.filter(item => String(item.id) !== id);
+    readNotificationIds.add(id);
+    readNotificationIds = new Set([...readNotificationIds].slice(-500));
+    saveNotificationState();
+    renderNotifications();
+}
+
+function markAllNotificationsRead() {
+    for (const event of events) {
+        observedMaxEventId = Math.max(observedMaxEventId, Number(event.id) || 0);
+    }
+    for (const event of unreadNotifications) {
+        observedMaxEventId = Math.max(observedMaxEventId, Number(event.id) || 0);
+    }
+    if (notificationStateReady || observedMaxEventId > 0) {
+        lastReadEventId = Math.max(lastReadEventId || 0, observedMaxEventId);
+    }
+    unreadNotifications = [];
+    readNotificationIds.clear();
+    saveNotificationState();
+    renderNotifications();
+}
+
+function openNotificationEvent(event) {
+    markNotificationRead(event.id);
+    closeNotificationPanel();
+    eventDeviceFilter = "all";
+    eventFilter = ["led", "parameter"].includes(event.event_type)
+        ? "state"
+        : ["connection", "schema", "command"].includes(event.event_type)
+            ? event.event_type
+            : "all";
+    pendingEventFocusId = String(event.id);
+    setActivePage("events");
+    if (events.some(item => String(item.id) === pendingEventFocusId)) {
+        renderEvents();
+        focusPendingEvent();
+    } else {
+        requestEvents({ reset: true });
+    }
+}
+
+function focusPendingEvent() {
+    if (!pendingEventFocusId || eventsLoading) return;
+    const row = [...(activityCard?.querySelectorAll("[data-event-id]") || [])]
+        .find(item => item.dataset.eventId === pendingEventFocusId);
+    if (row) {
+        row.classList.add("event-focus");
+        row.scrollIntoView({ behavior: "smooth", block: "center" });
+        pendingEventFocusId = null;
+        return;
+    }
+    if (eventsHasMore && isGatewayConnected()) {
+        requestEvents();
+    } else {
+        pendingEventFocusId = null;
+    }
+}
+
+function initializeInterface() {
+    if (settingNavigation) settingNavigation.value = uiSettings.navigation;
+    if (settingLanguage) settingLanguage.value = uiSettings.language;
+    if (settingTimezone) {
+        settingTimezone.value = [...settingTimezone.options].some(option => option.value === uiSettings.timezone)
+            ? uiSettings.timezone
+            : "local";
+        uiSettings.timezone = settingTimezone.value;
+    }
+    if (settingImportantOnly) settingImportantOnly.checked = uiSettings.importantOnly;
+    document.body.classList.toggle("nav-side", uiSettings.navigation === "side");
+    navigation?.setAttribute("aria-orientation", uiSettings.navigation === "side" ? "vertical" : "horizontal");
+    applyLanguage();
+    setActivePage(activePage);
+
+    navigation?.addEventListener("click", event => {
+        const button = event.target.closest("[data-page]");
+        if (button) setActivePage(button.dataset.page);
+    });
+    document.querySelector(".brand")?.addEventListener("click", event => {
+        event.preventDefault();
+        setActivePage("devices");
+    });
+    navigation?.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+        const buttons = [...navigation.querySelectorAll("[data-page]")];
+        const currentIndex = buttons.findIndex(button => button.classList.contains("is-active"));
+        const delta = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
+        buttons[(currentIndex + delta + buttons.length) % buttons.length]?.focus();
+        event.preventDefault();
+    });
+    for (const button of document.querySelectorAll('[data-action="refresh-events"]')) {
+        button.addEventListener("click", () => requestEvents({ reset: true }));
+    }
+    settingNavigation?.addEventListener("change", () => {
+        uiSettings.navigation = settingNavigation.value === "side" ? "side" : "top";
+        document.body.classList.toggle("nav-side", uiSettings.navigation === "side");
+        navigation?.setAttribute("aria-orientation", uiSettings.navigation === "side" ? "vertical" : "horizontal");
+        saveUiSettings();
+        showSettingsSaved();
+    });
+    settingLanguage?.addEventListener("change", () => {
+        uiSettings.language = settingLanguage.value === "en" ? "en" : "ru";
+        saveUiSettings();
+        applyLanguage();
+        showSettingsSaved();
+    });
+    settingTimezone?.addEventListener("change", () => {
+        uiSettings.timezone = settingTimezone.value;
+        saveUiSettings();
+        renderEvents();
+        renderNotifications();
+        showSettingsSaved();
+    });
+    settingImportantOnly?.addEventListener("change", () => {
+        uiSettings.importantOnly = settingImportantOnly.checked;
+        if (uiSettings.importantOnly) {
+            for (const event of unreadNotifications) {
+                if (!isImportantNotification(event)) {
+                    readNotificationIds.add(String(event.id));
+                }
+            }
+            unreadNotifications = unreadNotifications.filter(isImportantNotification);
+            renderNotifications();
+            saveNotificationState();
+        }
+        saveUiSettings();
+        showSettingsSaved();
+    });
+    notificationButton?.addEventListener("click", () => {
+        const open = notificationPanel.hidden;
+        notificationPanel.hidden = !open;
+        notificationButton.setAttribute("aria-expanded", String(open));
+        if (open) renderNotifications();
+    });
+    markNotificationsReadButton?.addEventListener("click", markAllNotificationsRead);
+    document.addEventListener("click", event => {
+        if (!event.target.closest(".notification-area")) closeNotificationPanel();
+    });
+    document.addEventListener("keydown", event => {
+        if (event.key === "Escape") closeNotificationPanel();
+    });
+}
+
+let settingsSavedTimer = null;
+function showSettingsSaved() {
+    if (!settingsSavedMessage) return;
+    settingsSavedMessage.textContent = localized("Настройки сохранены", "Settings saved");
+    clearTimeout(settingsSavedTimer);
+    settingsSavedTimer = setTimeout(() => {
+        settingsSavedMessage.textContent = "";
+    }, 1800);
+}
+
 // =========================
 // СТАТУС ПОДКЛЮЧЕНИЯ
 // =========================
 
 function setActivity(message) {
+    message = typeof message === "string" ? message : String(message ?? "");
+    lastActivityMessage = message;
+    const displayedMessage = localizeActivityMessage(message);
     if (activityMessage) {
-        activityMessage.textContent = message;
+        activityMessage.textContent = displayedMessage;
+    }
+    if (actionFeedback) {
+        actionFeedback.textContent = displayedMessage;
+        actionFeedback.hidden = !displayedMessage;
     }
 }
 
 function setGatewayConnectionStatus(message, connected) {
-    if (gatewayStatus) gatewayStatus.textContent = message;
+    const wasConnected = gatewayIsConnectedState;
+    lastGatewayStatusMessage = message;
+    gatewayIsConnectedState = connected;
+    if (connected && !wasConnected) {
+        const now = performance.now() / 1000;
+        if (databaseStats) {
+            const previousElapsed = databaseStatsFrozenElapsed ?? Math.max(
+                0,
+                now - databaseStatsReceivedAt
+            );
+            databaseStatsReceivedAt = now - previousElapsed;
+        }
+        databaseStatsFrozenElapsed = null;
+    } else if (!connected && wasConnected && databaseStats) {
+        databaseStatsFrozenElapsed = Math.max(
+            0,
+            performance.now() / 1000 - databaseStatsReceivedAt
+        );
+    }
+    const englishStatuses = {
+        "Нет соединения с Gateway": "Gateway disconnected",
+        "Подключение к Gateway...": "Connecting to Gateway...",
+        "Gateway подключён": "Gateway connected",
+        "Ошибка соединения с Gateway": "Gateway connection error"
+    };
+    if (gatewayStatus) {
+        gatewayStatus.textContent = uiSettings.language === "en"
+            ? (englishStatuses[message] || message)
+            : message;
+    }
     if (gatewayStatusDot) {
         gatewayStatusDot.classList.toggle("connected", connected);
         gatewayStatusDot.classList.toggle("disconnected", !connected);
@@ -73,20 +651,10 @@ function clearPendingCommand(commandId) {
     const pending = pendingCommands.get(commandId);
 
     if (pending) {
-        clearTimeout(pending.timer);
         pendingCommands.delete(commandId);
         const device = devices.find(item => item.device === pending.deviceId);
         if (device) updateDevicePanel(device);
     }
-}
-
-function clearAllPendingCommands() {
-    for (const pending of pendingCommands.values()) {
-        clearTimeout(pending.timer);
-    }
-
-    pendingCommands.clear();
-    for (const device of devices) updateDevicePanel(device);
 }
 
 function hasPendingParameterCommand(deviceId, parameter) {
@@ -103,6 +671,36 @@ function hasPendingAction(deviceId, actionId) {
 
 function isGatewayConnected() {
     return socket?.readyState === WebSocket.OPEN;
+}
+
+function sendGatewayAction(action, fields = {}) {
+    if (!isGatewayConnected()) {
+        setActivity("Нет соединения с Gateway.");
+        return false;
+    }
+    try {
+        socket.send(JSON.stringify({
+            type: "browser_message",
+            action,
+            ...fields
+        }));
+        return true;
+    } catch (error) {
+        console.error("Не удалось отправить действие Gateway:", error);
+        setActivity("Не удалось отправить запрос в Gateway.");
+        return false;
+    }
+}
+
+function requestDeviceSchemaHistory(deviceId) {
+    if (!isGatewayConnected() || schemaHistoryRequests.has(deviceId)) return;
+    schemaHistoryRequests.add(deviceId);
+    if (!sendGatewayAction("get_schema_history", {
+        device: deviceId,
+        request_id: createCommandId()
+    })) {
+        schemaHistoryRequests.delete(deviceId);
+    }
 }
 
 // =========================
@@ -131,6 +729,7 @@ function connectGateway() {
         setGatewayConnectionStatus("Gateway подключён", true);
         setActivity("Подключено к Gateway.");
         for (const device of devices) updateDevicePanel(device);
+        renderBlockedDevices();
 
         socket.send(JSON.stringify({
             type: "browser_hello"
@@ -157,7 +756,10 @@ function connectGateway() {
     socket.addEventListener("close", () => {
         setGatewayConnectionStatus("Нет соединения с Gateway", false);
         pendingSchemaDecisions.clear();
-        clearAllPendingCommands();
+        schemaHistoryRequests.clear();
+        notificationBackfillActive = null;
+        for (const device of devices) updateDevicePanel(device);
+        renderBlockedDevices();
 
         setActivity(
             "Соединение потеряно. Повторное подключение..."
@@ -183,21 +785,111 @@ function connectGateway() {
 
 function handleGatewayMessage(message) {
     switch (message.type) {
+        case "device_access_requests": {
+            pendingDeviceAccessRequests = Array.isArray(message.requests)
+                ? message.requests
+                : [];
+            renderDeviceAccessDialog();
+            break;
+        }
+
+        case "blocked_devices": {
+            blockedDevices = Array.isArray(message.devices)
+                ? message.devices
+                : [];
+            renderBlockedDevices();
+            renderEvents();
+            break;
+        }
+
+        case "device_access_decision_result":
+        case "device_forget_result":
+        case "blocked_device_result":
+        case "schema_restore_result":
+        case "schema_history_delete_result": {
+            setActivity(message.message || "Запрос обработан.");
+            if (message.type === "schema_restore_result" && message.success) {
+                schemaHistoryByDevice.delete(message.device);
+                requestDevices();
+                requestDeviceSchemaHistory(message.device);
+            }
+            if (message.type === "schema_history_delete_result" && message.success) {
+                schemaHistoryByDevice.delete(message.device);
+                schemaHistoryRequests.delete(message.device);
+                requestDeviceSchemaHistory(message.device);
+            }
+            break;
+        }
+
+        case "schema_history": {
+            if (typeof message.device === "string") {
+                schemaHistoryRequests.delete(message.device);
+                schemaHistoryByDevice.set(
+                    message.device,
+                    Array.isArray(message.history) ? message.history : []
+                );
+                renderDevices();
+            }
+            break;
+        }
+
+        case "command_queue": {
+            const incoming = Array.isArray(message.commands)
+                ? message.commands
+                : [];
+            const activeIds = new Set(incoming.map(item => item.command_id));
+            for (const commandId of pendingCommands.keys()) {
+                if (!activeIds.has(commandId)) pendingCommands.delete(commandId);
+            }
+            for (const item of incoming) {
+                const operation = item.operation || {};
+                pendingCommands.set(item.command_id, {
+                    commandId: item.command_id,
+                    deviceId: item.device,
+                    parameter: operation.kind === "parameter" ? operation.name : null,
+                    value: operation.value,
+                    actionId: operation.kind === "action" ? operation.name : null,
+                    arguments: operation.arguments || {},
+                    status: item.status,
+                    attempts: item.attempts || 0
+                });
+            }
+            renderDevices();
+            break;
+        }
+
+        case "database_stats": {
+            const statKeys = [
+                "database_size_bytes",
+                "record_count",
+                "device_count",
+                "ever_connected_device_count",
+                "connected_device_count",
+                "event_count",
+                "schema_snapshot_count",
+                "command_record_count",
+                "session_uptime_seconds",
+                "total_uptime_seconds"
+            ];
+            const receivedStats = {};
+            for (const key of statKeys) {
+                const value = Number(message[key]);
+                if (!Number.isFinite(value) || value < 0) break;
+                receivedStats[key] = value;
+            }
+            if (Object.keys(receivedStats).length === statKeys.length) {
+                databaseStats = receivedStats;
+                databaseStatsReceivedAt = performance.now() / 1000;
+                databaseStatsFrozenElapsed = gatewayIsConnectedState ? null : 0;
+                renderDatabaseStats();
+            }
+            break;
+        }
+
         case "device_list": {
             devices = Array.isArray(message.devices)
                 ? message.devices
                 : [];
-
-            // Отменяем ожидание, если устройство отключилось.
-            for (const [commandId, pending] of pendingCommands) {
-                const device = devices.find(
-                    item => item.device === pending.deviceId
-                );
-
-                if (device && !device.connected) {
-                    clearPendingCommand(commandId);
-                }
-            }
 
             renderDevices();
             renderEvents();
@@ -316,6 +1008,25 @@ function handleGatewayMessage(message) {
             const incomingEvents = Array.isArray(message.events)
                 ? message.events
                 : [];
+            if (
+                typeof message.request_id === "string" &&
+                message.request_id.startsWith("notification-backfill-")
+            ) {
+                if (notificationBackfillActive !== message.request_id) break;
+                notificationBackfillActive = null;
+                observeEventNotifications(incomingEvents);
+                if (
+                    message.has_more === true &&
+                    Number.isInteger(message.next_before_id) &&
+                    lastReadEventId !== null &&
+                    message.next_before_id > lastReadEventId
+                ) {
+                    requestNotificationBackfill(message.next_before_id);
+                }
+                break;
+            }
+            let initializeNotifications = false;
+            let shouldBackfillNotifications = false;
 
             if (message.request_id) {
                 if (
@@ -333,6 +1044,8 @@ function handleGatewayMessage(message) {
 
                 if (activeEventRequest.mode === "reset") {
                     events = incomingEvents;
+                    initializeNotifications = !notificationStateReady;
+                    shouldBackfillNotifications = activeEventRequest.deviceFilter === "all";
                 } else {
                     events = mergeEventPages(events, incomingEvents);
                 }
@@ -358,7 +1071,18 @@ function handleGatewayMessage(message) {
                 }
             }
 
+            observeEventNotifications(incomingEvents, initializeNotifications);
+            if (
+                shouldBackfillNotifications &&
+                message.has_more === true &&
+                Number.isInteger(message.next_before_id) &&
+                lastReadEventId !== null &&
+                message.next_before_id > lastReadEventId
+            ) {
+                requestNotificationBackfill(message.next_before_id);
+            }
             renderEvents();
+            focusPendingEvent();
             break;
         }
 
@@ -366,6 +1090,10 @@ function handleGatewayMessage(message) {
             const pending = pendingCommands.get(message.command_id);
 
             if (pending && pending.deviceId === message.device) {
+                pending.status = "sent";
+                pending.attempts = message.attempts || pending.attempts || 0;
+                const device = devices.find(item => item.device === pending.deviceId);
+                if (device) updateDevicePanel(device);
                 setActivity(
                     `Команда отправлена ${message.device}. ` +
                     "Ожидаем результат выполнения..."
@@ -375,10 +1103,30 @@ function handleGatewayMessage(message) {
             break;
         }
 
+        case "command_queued": {
+            const pending = pendingCommands.get(message.command_id);
+            if (pending) {
+                pending.status = "queued";
+                pending.attempts = message.attempts || pending.attempts || 0;
+                const device = devices.find(item => item.device === pending.deviceId);
+                if (device) updateDevicePanel(device);
+            }
+            setActivity(
+                `Команда для ${message.device} сохранена в очереди и будет повторена при подключении устройства.`
+            );
+            break;
+        }
+
         case "schema_decision_result": {
             pendingSchemaDecisions.delete(
                 `${message.device}\u0000${message.proposal_id}`
             );
+            if (message.success) {
+                schemaHistoryByDevice.delete(message.device);
+                if (openSchemaHistoryDevices.has(message.device)) {
+                    requestDeviceSchemaHistory(message.device);
+                }
+            }
             setActivity(message.message || "Решение по Schema обработано.");
             if (message.success !== true) requestDevices();
             break;
@@ -470,12 +1218,15 @@ function createSchemaReview(device) {
     review.className = "schema-review";
 
     const heading = document.createElement("h4");
-    heading.textContent = "Обнаружено изменение Schema";
+    heading.textContent = localized("Обнаружено изменение Schema", "Schema change detected");
 
     const version = document.createElement("p");
     const oldVersion = device.schema_version ?? "не указана";
     const newVersion = proposal.schema_version ?? "не указана";
-    version.textContent = `Сохранённая версия: ${oldVersion} · новая версия: ${newVersion}`;
+    version.textContent = localized(
+        `Сохранённая версия: ${oldVersion} · новая версия: ${newVersion}`,
+        `Saved version: ${oldVersion} · new version: ${newVersion}`
+    );
 
     const list = document.createElement("ul");
     for (const change of describeSchemaChanges(device.schema, proposal.schema)) {
@@ -486,14 +1237,17 @@ function createSchemaReview(device) {
 
     const note = document.createElement("p");
     note.className = "schema-review-note";
-    note.textContent = "Пока вы выбираете, действует прежняя Schema и команды заблокированы. Если оставить её, Gateway повторит предложение при следующем подключении устройства.";
+    note.textContent = localized(
+        "Пока вы выбираете, действует прежняя Schema и команды заблокированы. Если оставить её, Gateway повторит предложение при следующем подключении устройства.",
+        "The previous Schema remains active and commands are paused while you decide. If you keep it, Gateway will ask again the next time the device connects."
+    );
 
     const buttons = document.createElement("div");
     buttons.className = "schema-review-buttons";
 
     const accept = document.createElement("button");
     accept.type = "button";
-    accept.textContent = "Принять Schema";
+    accept.textContent = localized("Принять Schema", "Accept Schema");
     const decisionKey = `${device.device}\u0000${proposal.proposal_id}`;
     accept.disabled = !isGatewayConnected() || pendingSchemaDecisions.has(decisionKey);
     accept.addEventListener("click", () => {
@@ -503,7 +1257,7 @@ function createSchemaReview(device) {
     const reject = document.createElement("button");
     reject.type = "button";
     reject.className = "secondary-button";
-    reject.textContent = "Оставить текущую Schema";
+    reject.textContent = localized("Оставить текущую Schema", "Keep current Schema");
     reject.disabled = !isGatewayConnected() || pendingSchemaDecisions.has(decisionKey);
     reject.addEventListener("click", () => {
         sendSchemaDecision(device.device, proposal.proposal_id, "reject");
@@ -512,6 +1266,248 @@ function createSchemaReview(device) {
     buttons.append(accept, reject);
     review.append(heading, version, list, note, buttons);
     return review;
+}
+
+function renderDeviceAccessDialog() {
+    const request = pendingDeviceAccessRequests[0];
+    if (!request) {
+        if (deviceAccessDialog) {
+            if (deviceAccessDialog.open) deviceAccessDialog.close();
+            deviceAccessDialog.remove();
+            deviceAccessDialog = null;
+            deviceAccessDialogRequestId = null;
+        }
+        return;
+    }
+
+    if (
+        deviceAccessDialog &&
+        deviceAccessDialogRequestId === request.request_id &&
+        deviceAccessDialog.isConnected
+    ) {
+        for (const button of deviceAccessDialog.querySelectorAll("button")) {
+            button.disabled = !isGatewayConnected();
+        }
+        return;
+    }
+
+    if (deviceAccessDialog) {
+        if (deviceAccessDialog.open) deviceAccessDialog.close();
+        deviceAccessDialog.remove();
+    }
+
+    const dialog = document.createElement("dialog");
+    dialog.className = "device-access-dialog";
+    const form = document.createElement("form");
+    form.className = "device-access-form";
+    form.method = "dialog";
+    form.addEventListener("submit", event => event.preventDefault());
+
+    const heading = document.createElement("h2");
+    heading.textContent = localized("Разрешить подключение устройства?", "Allow this device to connect?");
+
+    const intro = document.createElement("p");
+    intro.textContent = localized(
+        "Новое устройство сообщает Gateway свой идентификатор и Schema.",
+        "A new device is sharing its ID and Schema with Gateway."
+    );
+
+    const details = document.createElement("div");
+    details.className = "device-access-details";
+    const name = document.createElement("strong");
+    name.textContent = request.name || localized("Устройство без имени", "Unnamed device");
+    const identity = document.createElement("span");
+    identity.textContent = `ID: ${request.device}`;
+    details.append(name, identity);
+    if (request.firmware_version) {
+        const firmware = document.createElement("span");
+        firmware.textContent = localized(
+            `Прошивка: ${request.firmware_version}`,
+            `Firmware: ${request.firmware_version}`
+        );
+        details.appendChild(firmware);
+    }
+
+    const rememberLabel = document.createElement("label");
+    rememberLabel.className = "remember-device-choice";
+    const remember = document.createElement("input");
+    remember.type = "checkbox";
+    const rememberText = document.createElement("span");
+    rememberText.textContent = localized(
+        "Запомнить выбор для этого устройства",
+        "Remember this choice for this device"
+    );
+    rememberLabel.append(remember, rememberText);
+
+    const buttons = document.createElement("div");
+    buttons.className = "device-access-buttons";
+    const deny = document.createElement("button");
+    deny.type = "button";
+    deny.className = "device-access-deny";
+    deny.textContent = localized("Отклонить", "Deny");
+    const allow = document.createElement("button");
+    allow.type = "button";
+    allow.textContent = localized("Подключить", "Allow");
+
+    const submitDecision = (decision) => {
+        if (!sendGatewayAction("device_access_decision", {
+            device: request.device,
+            request_id: request.request_id,
+            decision,
+            remember: remember.checked
+        })) return;
+        deny.disabled = true;
+        allow.disabled = true;
+    };
+    deny.addEventListener("click", () => submitDecision("deny"));
+    allow.addEventListener("click", () => submitDecision("allow"));
+    dialog.addEventListener("cancel", event => event.preventDefault());
+
+    buttons.append(deny, allow);
+    form.append(heading, intro, details, rememberLabel, buttons);
+    dialog.appendChild(form);
+    document.body.appendChild(dialog);
+    deviceAccessDialog = dialog;
+    deviceAccessDialogRequestId = request.request_id;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+}
+
+function renderBlockedDevices() {
+    if (!blockedDevicesSection) return;
+    blockedDevicesSection.hidden = blockedDevices.length === 0;
+    if (blockedDeviceCount) blockedDeviceCount.textContent = String(blockedDevices.length);
+    if (!blockedDevicesList) return;
+    blockedDevicesList.replaceChildren();
+
+    for (const device of blockedDevices) {
+        const row = document.createElement("div");
+        row.className = "blocked-device";
+        const identity = document.createElement("span");
+        identity.className = "blocked-device-id";
+        identity.textContent = device.name
+            ? `${device.name} · ${device.device_id}`
+            : device.device_id;
+        const unblock = document.createElement("button");
+        unblock.type = "button";
+        unblock.textContent = localized("Снять блокировку", "Remove block");
+        unblock.disabled = !isGatewayConnected();
+        unblock.addEventListener("click", () => {
+            sendGatewayAction("clear_device_block", { device: device.device_id });
+        });
+        row.append(identity, unblock);
+        blockedDevicesList.appendChild(row);
+    }
+}
+
+function createSchemaHistory(device) {
+    const details = document.createElement("details");
+    details.className = "schema-history";
+    details.open = openSchemaHistoryDevices.has(device.device);
+
+    const summary = document.createElement("summary");
+    summary.textContent = localized("История Schema", "Schema history");
+    const content = document.createElement("div");
+    content.className = "schema-history-content";
+    const history = schemaHistoryByDevice.get(device.device);
+
+    if (!history) {
+        const load = document.createElement("button");
+        load.type = "button";
+        load.dataset.role = "schema-history-load";
+        load.textContent = localized("Загрузить историю", "Load history");
+        load.disabled = !isGatewayConnected();
+        load.addEventListener("click", () => {
+            requestDeviceSchemaHistory(device.device);
+        });
+        content.append(load);
+    } else if (history.length === 0) {
+        const note = document.createElement("p");
+        note.className = "schema-history-note";
+        note.textContent = localized(
+            "Для устройства пока нет сохранённых снимков Schema.",
+            "This device has no saved Schema snapshots yet."
+        );
+        content.append(note);
+    } else {
+        const select = document.createElement("select");
+        select.dataset.role = "schema-history-select";
+        for (const snapshot of history) {
+            const option = document.createElement("option");
+            option.value = String(snapshot.id);
+            const version = snapshot.schema_version ?? localized("без версии", "unversioned");
+            const firmware = snapshot.firmware_version
+                ? ` · ${snapshot.firmware_version}`
+                : "";
+            option.textContent = `Schema ${version}${firmware} · ${formatEventTime(snapshot.accepted_at)}`;
+            select.appendChild(option);
+        }
+
+        const restore = document.createElement("button");
+        restore.type = "button";
+        restore.dataset.role = "schema-restore";
+        restore.textContent = localized("Восстановить для Gateway", "Restore in Gateway");
+        restore.disabled = device.connected || !isGatewayConnected();
+        restore.addEventListener("click", () => {
+            const historyId = Number(select.value);
+            if (!Number.isInteger(historyId) || historyId < 1) return;
+            if (!window.confirm(
+                localized(
+                    "Восстановить этот снимок Schema? Устройство должно быть отключено. При следующем подключении Gateway сверит Schema и при расхождении запросит подтверждение.",
+                    "Restore this Schema snapshot? The device must be disconnected. Gateway will compare it with the device on its next connection and ask if they differ."
+                )
+            )) return;
+            sendGatewayAction("restore_schema", {
+                device: device.device,
+                history_id: historyId
+            });
+        });
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.dataset.role = "schema-delete";
+        remove.className = "schema-delete-button";
+        remove.textContent = localized("Удалить из истории", "Delete from history");
+        remove.disabled = !isGatewayConnected();
+        remove.addEventListener("click", () => {
+            const historyId = Number(select.value);
+            if (!Number.isInteger(historyId) || historyId < 1) return;
+            if (!window.confirm(
+                localized(
+                    "Удалить выбранный снимок Schema из истории? Текущая Schema устройства не изменится.",
+                    "Delete this Schema snapshot from history? The device's current Schema will not change."
+                )
+            )) return;
+            sendGatewayAction("delete_schema_history", {
+                device: device.device,
+                history_id: historyId
+            });
+        });
+        const actions = document.createElement("div");
+        actions.className = "schema-history-actions";
+        actions.append(restore, remove);
+        const note = document.createElement("p");
+        note.className = "schema-history-note";
+        note.textContent = device.connected
+            ? localized("Отключите устройство, чтобы восстановить снимок.", "Disconnect the device to restore a snapshot.")
+            : localized(
+                "Восстановится только принятая Schema Gateway; само устройство не перепрошивается. Удаление снимка затрагивает только историю.",
+                "Only Gateway's accepted Schema is restored; the device is not reflashed. Deleting a snapshot only changes history."
+            );
+        content.append(select, actions, note);
+    }
+
+    details.addEventListener("toggle", () => {
+        if (details.open) {
+            openSchemaHistoryDevices.add(device.device);
+            if (!schemaHistoryByDevice.has(device.device) && isGatewayConnected()) {
+                requestDeviceSchemaHistory(device.device);
+            }
+        } else {
+            openSchemaHistoryDevices.delete(device.device);
+        }
+    });
+    details.append(summary, content);
+    if (details.open && !history) requestDeviceSchemaHistory(device.device);
+    return details;
 }
 
 function renderDevices() {
@@ -530,7 +1526,7 @@ function renderDevices() {
     if (devices.length === 0) {
         const empty = document.createElement("p");
         empty.className = "device-empty";
-        empty.textContent = "Устройства пока не найдены.";
+        empty.textContent = localized("Устройства пока не найдены.", "No devices found yet.");
 
         deviceCard.appendChild(empty);
         renderOverview();
@@ -557,14 +1553,14 @@ function renderDevices() {
         const subtitle = document.createElement("p");
         subtitle.className = "device-id";
         const schemaNote = device.schema_source === "inferred"
-            ? "Автоматическая Schema · только чтение"
+            ? localized("Автоматическая Schema · только чтение", "Inferred Schema · read only")
             : device.schema_source === "missing"
-                ? "Schema ещё не получена"
+                ? localized("Schema ещё не получена", "Schema not received yet")
                 : null;
         subtitle.textContent = [
             device.device,
             device.firmware_version
-                ? `Прошивка ${device.firmware_version}`
+                ? localized(`Прошивка ${device.firmware_version}`, `Firmware ${device.firmware_version}`)
                 : null,
             schemaNote
         ].filter(Boolean).join(" · ");
@@ -574,10 +1570,32 @@ function renderDevices() {
         const badge = document.createElement("span");
         badge.className = "badge device-status";
         badge.textContent = device.connected
-            ? "Подключено"
-            : "Отключено";
+            ? localized("Подключено", "Online")
+            : localized("Отключено", "Offline");
 
-        heading.append(icon, titleBlock, badge);
+        const headerActions = document.createElement("div");
+        headerActions.className = "device-header-actions";
+        const forget = document.createElement("button");
+        forget.type = "button";
+        forget.className = "device-forget-button";
+        forget.dataset.role = "forget-device";
+        forget.textContent = localized("Забыть", "Forget");
+        forget.title = localized(
+            "Отключить устройство и запросить разрешение при следующем подключении",
+            "Disconnect this device and ask for approval next time it connects"
+        );
+        forget.addEventListener("click", () => {
+            if (!window.confirm(
+                localized(
+                    `Забыть устройство ${device.device}? При следующем подключении Gateway снова запросит разрешение.`,
+                    `Forget device ${device.device}? Gateway will ask for approval again the next time it connects.`
+                )
+            )) return;
+            sendGatewayAction("forget_device", { device: device.device });
+        });
+        headerActions.append(badge, forget);
+
+        heading.append(icon, titleBlock, headerActions);
         panel.appendChild(heading);
 
         const divider = document.createElement("div");
@@ -587,6 +1605,8 @@ function renderDevices() {
         if (device.pending_schema) {
             panel.appendChild(createSchemaReview(device));
         }
+
+        panel.appendChild(createSchemaHistory(device));
 
         const parameters = device.schema?.parameters || {};
 
@@ -604,7 +1624,7 @@ function renderDevices() {
             currentValue.className = "device-parameter-value";
             currentValue.dataset.role = "parameter-value";
             currentValue.dataset.parameterId = parameterId;
-            currentValue.textContent = formatParameterValue(value, definition);
+            currentValue.textContent = formatDisplayedParameterValue(value, definition);
 
             parameter.append(label, currentValue);
 
@@ -677,7 +1697,7 @@ function renderDevices() {
                     apply.type = "button";
                     apply.dataset.role = "parameter-apply";
                     apply.dataset.parameterId = parameterId;
-                    apply.textContent = "Применить";
+                    apply.textContent = localized("Применить", "Apply");
                     apply.addEventListener("click", () => {
                         if (!input.checkValidity()) {
                             input.reportValidity();
@@ -709,7 +1729,7 @@ function renderDevices() {
             const actionList = document.createElement("div");
             actionList.className = "device-actions";
             const actionHeading = document.createElement("strong");
-            actionHeading.textContent = "Действия устройства";
+            actionHeading.textContent = localized("Действия устройства", "Device actions");
             actionList.appendChild(actionHeading);
 
             for (const [actionId, definition] of availableActions) {
@@ -737,8 +1757,11 @@ function renderDevices() {
         hint.className = "hint";
 
         hint.textContent = device.connected
-            ? `Последнее сообщение: ${device.last_seen || "неизвестно"}`
-            : "Устройство сейчас не подключено.";
+            ? localized(
+                `Последнее сообщение: ${device.last_seen || "неизвестно"}`,
+                `Last message: ${device.last_seen || "unknown"}`
+            )
+            : localized("Устройство сейчас не подключено.", "Device is currently offline.");
 
         hint.dataset.role = "device-hint";
         panel.appendChild(hint);
@@ -757,7 +1780,9 @@ function updateDevicePanel(device) {
 
     const badge = panel.querySelector(".device-status");
     if (badge) {
-        badge.textContent = device.connected ? "Подключено" : "Отключено";
+        badge.textContent = device.connected
+            ? localized("Подключено", "Online")
+            : localized("Отключено", "Offline");
         badge.classList.toggle("is-online", device.connected);
         badge.classList.toggle("is-offline", !device.connected);
     }
@@ -765,7 +1790,7 @@ function updateDevicePanel(device) {
     for (const valueNode of panel.querySelectorAll('[data-role="parameter-value"]')) {
         const parameterId = valueNode.dataset.parameterId;
         const definition = device.schema?.parameters?.[parameterId];
-        valueNode.textContent = formatParameterValue(
+        valueNode.textContent = formatDisplayedParameterValue(
             device.parameters?.[parameterId],
             definition || { type: typeof device.parameters?.[parameterId] }
         );
@@ -789,11 +1814,16 @@ function updateDevicePanel(device) {
         const value = device.parameters?.[parameterId];
         const pending = hasPendingParameterCommand(device.device, parameterId);
         const label = definition?.label || parameterId;
+        const pendingCommand = [...pendingCommands.values()].find(command =>
+            command.deviceId === device.device && command.parameter === parameterId
+        );
         button.textContent = pending
-            ? `Ожидаем: ${label}…`
+            ? pendingCommand?.status === "queued"
+                ? localized(`В очереди: ${label}`, `Queued: ${label}`)
+                : localized(`Ожидаем: ${label}…`, `Waiting: ${label}…`)
             : value === true
-                ? `Выключить: ${label}`
-                : `Включить: ${label}`;
+                ? localized(`Выключить: ${label}`, `Turn off: ${label}`)
+                : localized(`Включить: ${label}`, `Turn on: ${label}`);
         button.disabled = !device.connected || !isGatewayConnected() ||
             Boolean(device.pending_schema) || typeof value !== "boolean" || pending;
     }
@@ -805,10 +1835,30 @@ function updateDevicePanel(device) {
     }
 
     for (const button of panel.querySelectorAll('[data-role="device-action"]')) {
+        const pendingAction = [...pendingCommands.values()].find(command =>
+            command.deviceId === device.device && command.actionId === button.dataset.actionId
+        );
+        if (pendingAction) {
+            const label = device.schema?.actions?.[button.dataset.actionId]?.label || button.dataset.actionId;
+            button.textContent = pendingAction.status === "queued"
+                ? localized(`В очереди: ${label}`, `Queued: ${label}`)
+                : localized(`Ожидаем: ${label}…`, `Waiting: ${label}…`);
+        } else {
+            button.textContent = device.schema?.actions?.[button.dataset.actionId]?.label || button.dataset.actionId;
+        }
         button.disabled = !device.connected || !isGatewayConnected() ||
             Boolean(device.pending_schema) ||
             hasPendingAction(device.device, button.dataset.actionId);
     }
+
+    const forgetButton = panel.querySelector('[data-role="forget-device"]');
+    if (forgetButton) forgetButton.disabled = !isGatewayConnected();
+    const restoreButton = panel.querySelector('[data-role="schema-restore"]');
+    if (restoreButton) restoreButton.disabled = device.connected || !isGatewayConnected();
+    const deleteSchemaButton = panel.querySelector('[data-role="schema-delete"]');
+    if (deleteSchemaButton) deleteSchemaButton.disabled = !isGatewayConnected();
+    const historyLoadButton = panel.querySelector('[data-role="schema-history-load"]');
+    if (historyLoadButton) historyLoadButton.disabled = !isGatewayConnected();
 
     const schemaDecisionPending = device.pending_schema && pendingSchemaDecisions.has(
         `${device.device}\u0000${device.pending_schema.proposal_id}`
@@ -820,8 +1870,11 @@ function updateDevicePanel(device) {
     const hint = panel.querySelector('[data-role="device-hint"]');
     if (hint) {
         hint.textContent = device.connected
-            ? `Последнее сообщение: ${device.last_seen || "неизвестно"}`
-            : "Устройство сейчас не подключено.";
+            ? localized(
+                `Последнее сообщение: ${device.last_seen || "неизвестно"}`,
+                `Last message: ${device.last_seen || "unknown"}`
+            )
+            : localized("Устройство сейчас не подключено.", "Device is currently offline.");
     }
     renderOverview();
 }
@@ -830,9 +1883,9 @@ function renderOverview() {
     if (!overview) return;
     const online = devices.filter(device => device.connected).length;
     const metrics = [
-        { value: String(devices.length), label: "Устройства" },
-        { value: String(online), label: "На связи" },
-        { value: String(Math.max(0, devices.length - online)), label: "Не в сети" }
+        { value: String(devices.length), label: localized("Устройства", "Devices") },
+        { value: String(online), label: localized("На связи", "Online") },
+        { value: String(Math.max(0, devices.length - online)), label: localized("Не в сети", "Offline") }
     ];
     overview.replaceChildren();
     for (const metric of metrics) {
@@ -849,14 +1902,16 @@ function renderOverview() {
 
 function formatParameterValue(value, definition) {
     if (value === undefined || value === null) {
-        return "Неизвестно";
+        return localized("Неизвестно", "Unknown");
     }
 
     let formatted = value;
     if (definition.type === "json") {
         formatted = JSON.stringify(value);
     } else if (definition.type === "boolean") {
-        formatted = value ? "Включено" : "Выключено";
+        formatted = value
+            ? localized("Включено", "On")
+            : localized("Выключено", "Off");
     } else if (definition.type === "enum") {
         formatted = definition.options?.find(option => option.value === value)?.label || value;
     } else if (typeof value === "number" && Number.isInteger(definition.precision)) {
@@ -874,7 +1929,7 @@ function formatParameterValue(value, definition) {
 
 function formatEventTime(value) {
     if (!value) {
-        return "Время неизвестно";
+        return localized("Время неизвестно", "Time unknown");
     }
 
     const date = new Date(value);
@@ -883,19 +1938,33 @@ function formatEventTime(value) {
         return value;
     }
 
-    return new Intl.DateTimeFormat("ru-RU", {
+    const options = {
         day: "2-digit",
         month: "2-digit",
         year: "numeric",
         hour: "2-digit",
         minute: "2-digit",
         second: "2-digit"
-    }).format(date);
+    };
+    if (uiSettings.timezone !== "local") options.timeZone = uiSettings.timezone;
+    return new Intl.DateTimeFormat(uiSettings.language === "en" ? "en-GB" : "ru-RU", options).format(date);
 }
 
 function getEventDescription(event) {
     const value = String(event.event_value ?? "");
     const normalized = value.toLowerCase();
+
+    if (uiSettings.language === "en" && event.event_type === "connection") {
+        const translations = [
+            ["Для устройства сохранён постоянный запрет подключения", "Permanent connection block saved for this device"],
+            ["Постоянная блокировка подключения снята", "Permanent connection block removed"],
+            ["Устройство забыто; при следующем подключении потребуется подтверждение", "Device forgotten; approval will be requested next time"],
+            ["подключено", "Device connected"],
+            ["отключено", "Device disconnected"]
+        ];
+        const match = translations.find(([russian]) => value.toLowerCase().includes(russian.toLowerCase()));
+        return match ? match[1] : `Connection: ${value}`;
+    }
 
     if (event.event_type === "command") {
         let command;
@@ -903,7 +1972,7 @@ function getEventDescription(event) {
         try {
             command = JSON.parse(value);
         } catch (error) {
-            return `Результат команды: ${value}`;
+            return localized(`Результат команды: ${value}`, `Command result: ${value}`);
         }
 
         const device = devices.find(item => item.device === event.device_id);
@@ -913,19 +1982,28 @@ function getEventDescription(event) {
             : device?.schema?.parameters?.[command.parameter];
         const operationLabel = definition?.label || command.action || command.parameter || "Команда";
         const requestedValue = isAction
-            ? "вызвать"
+            ? localized("вызвать", "invoke")
             : typeof command.requested_value === "boolean"
-                ? (command.requested_value ? "включить" : "выключить")
+                ? (command.requested_value
+                    ? localized("включить", "turn on")
+                    : localized("выключить", "turn off"))
                 : formatParameterValue(
                     command.requested_value,
                     definition || { type: typeof command.requested_value }
                 );
-        const statusLabels = {
-            succeeded: "выполнена",
-            failed: "завершилась ошибкой",
-            timeout: "не получила подтверждение",
-            unavailable: "прервана: устройство отключилось"
-        };
+        const statusLabels = uiSettings.language === "en"
+            ? {
+                succeeded: "completed",
+                failed: "failed",
+                timeout: "timed out",
+                unavailable: "interrupted: device disconnected"
+            }
+            : {
+                succeeded: "выполнена",
+                failed: "завершилась ошибкой",
+                timeout: "не получила подтверждение",
+                unavailable: "прервана: устройство отключилось"
+            };
         const status = statusLabels[command.status] || command.status;
         const actualValue = command.result_value;
         const actualText = (
@@ -935,7 +2013,7 @@ function getEventDescription(event) {
             actualValue !== null &&
             actualValue !== command.requested_value
         )
-            ? `, фактически: ${formatParameterValue(
+            ? `${localized(", фактически: ", ", actual: ")}${formatParameterValue(
                 actualValue,
                 definition || { type: typeof actualValue }
             )}`
@@ -955,39 +2033,56 @@ function getEventDescription(event) {
             const label = definition.label || change.parameter;
             return `${label}: ${formatParameterValue(change.value, definition)}`;
         } catch (error) {
-            return `Изменение параметра: ${value}`;
+            return localized(`Изменение параметра: ${value}`, `Parameter change: ${value}`);
         }
     }
 
     if (event.event_type === "schema") {
-        return `Обновление Schema: ${value}`;
+        if (uiSettings.language === "en") {
+            if (value.startsWith("Принята версия Schema ")) {
+                return value.replace("Принята версия Schema ", "Accepted Schema version ");
+            }
+            if (value.startsWith("Оставлена текущая Schema; предложение версии ")) {
+                return value
+                    .replace("Оставлена текущая Schema; предложение версии ", "Kept current Schema; proposal for version ")
+                    .replace(" отклонено", " declined");
+            }
+            if (value.startsWith("Восстановлена Schema из истории (снимок ")) {
+                return value
+                    .replace("Восстановлена Schema из истории (снимок ", "Restored Schema from history (snapshot ");
+            }
+            if (value.startsWith("Удалён снимок Schema из истории (ID ")) {
+                return value.replace("Удалён снимок Schema из истории (ID ", "Deleted Schema snapshot from history (ID ");
+            }
+        }
+        return localized(`Обновление Schema: ${value}`, `Schema update: ${value}`);
     }
 
     if (event.event_type === "led") {
         if (normalized === "true" || normalized === "1") {
-            return "Светодиод включён";
+            return localized("Светодиод включён", "LED on");
         }
 
         if (normalized === "false" || normalized === "0") {
-            return "Светодиод выключен";
+            return localized("Светодиод выключен", "LED off");
         }
 
-        return `Состояние LED: ${value}`;
+        return localized(`Состояние LED: ${value}`, `LED state: ${value}`);
     }
 
     if (event.event_type === "connection") {
         if (normalized === "подключено") {
-            return "Устройство подключилось";
+            return localized("Устройство подключилось", "Device connected");
         }
 
         if (normalized === "отключено") {
-            return "Устройство отключилось";
+            return localized("Устройство отключилось", "Device disconnected");
         }
 
-        return `Состояние подключения: ${value}`;
+        return localized(`Состояние подключения: ${value}`, `Connection status: ${value}`);
     }
 
-    return `${event.event_type}: ${value}`;
+    return localized(`${event.event_type}: ${value}`, `${event.event_type}: ${value}`);
 }
 
 function isCommandEchoEvent(event, eventList) {
@@ -1064,19 +2159,19 @@ function renderEvents() {
     container.replaceChildren();
 
     const heading = document.createElement("h2");
-    heading.textContent = "История событий";
+    heading.textContent = localized("История событий", "Activity history");
     container.appendChild(heading);
 
     const deviceFilterLabel = document.createElement("label");
     deviceFilterLabel.className = "event-device-filter-group";
-    deviceFilterLabel.textContent = "Устройство:";
+    deviceFilterLabel.textContent = localized("Устройство:", "Device:");
 
     const deviceFilter = document.createElement("select");
     deviceFilter.className = "event-device-filter";
 
     const allDevicesOption = document.createElement("option");
     allDevicesOption.value = "all";
-    allDevicesOption.textContent = "Все устройства";
+    allDevicesOption.textContent = localized("Все устройства", "All devices");
     deviceFilter.appendChild(allDevicesOption);
 
     for (const device of devices) {
@@ -1105,11 +2200,11 @@ function renderEvents() {
     filters.className = "event-filter-group";
 
     const filterOptions = [
-        { value: "all", label: "Все события" },
-        { value: "connection", label: "Подключения" },
-        { value: "command", label: "Команды" },
-        { value: "state", label: "Изменения состояния" },
-        { value: "schema", label: "Обновления Schema" }
+        { value: "all", label: localized("Все события", "All events") },
+        { value: "connection", label: localized("Подключения", "Connections") },
+        { value: "command", label: localized("Команды", "Commands") },
+        { value: "state", label: localized("Изменения состояния", "State changes") },
+        { value: "schema", label: localized("Обновления Schema", "Schema updates") }
     ];
 
     for (const option of filterOptions) {
@@ -1144,7 +2239,7 @@ function renderEvents() {
     const lastLedValues = new Map();
 
     for (const event of events) {
-        if (isCommandEchoEvent(event, events)) {
+        if (String(event.id) !== pendingEventFocusId && isCommandEchoEvent(event, events)) {
             continue;
         }
 
@@ -1152,7 +2247,7 @@ function renderEvents() {
             const value = String(event.event_value).toLowerCase();
             const previousValue = lastLedValues.get(event.device_id);
 
-            if (previousValue === value) {
+            if (previousValue === value && String(event.id) !== pendingEventFocusId) {
                 continue;
             }
 
@@ -1180,9 +2275,9 @@ function renderEvents() {
 
     const summary = document.createElement("p");
     summary.className = "event-summary";
-    summary.textContent =
-        `Показано ${filteredEvents.length} из ${deduplicatedEvents.length} ` +
-        `загруженных событий`;
+    summary.textContent = uiSettings.language === "en"
+        ? `Showing ${filteredEvents.length} of ${deduplicatedEvents.length} loaded events`
+        : `Показано ${filteredEvents.length} из ${deduplicatedEvents.length} загруженных событий`;
 
     container.appendChild(summary);
 
@@ -1191,8 +2286,8 @@ function renderEvents() {
         empty.className = "event-empty";
 
         empty.textContent = events.length === 0
-            ? "Событий пока нет."
-            : "Нет событий для выбранного фильтра.";
+            ? localized("Событий пока нет.", "No events yet.")
+            : localized("Нет событий для выбранного фильтра.", "No events match this filter.");
 
         container.appendChild(empty);
         renderLoadMoreButton(container);
@@ -1208,6 +2303,7 @@ function renderEvents() {
     for (const event of filteredEvents) {
         const row = document.createElement("article");
         row.className = "event-entry";
+        row.dataset.eventId = String(event.id);
         if (event.event_type === "command") {
             try {
                 const command = JSON.parse(event.event_value || "{}");
@@ -1231,17 +2327,17 @@ function renderEvents() {
         typeBadge.className = "event-type";
 
         if (event.event_type === "connection") {
-            typeBadge.textContent = "Подключение";
+            typeBadge.textContent = localized("Подключение", "Connection");
         } else if (event.event_type === "schema") {
-            typeBadge.textContent = "Обновление Schema";
+            typeBadge.textContent = localized("Обновление Schema", "Schema update");
         } else if (event.event_type === "parameter") {
-            typeBadge.textContent = "Изменение состояния";
+            typeBadge.textContent = localized("Изменение состояния", "State change");
         } else if (event.event_type === "led") {
-            typeBadge.textContent = "Изменение состояния";
+            typeBadge.textContent = localized("Изменение состояния", "State change");
         } else if (event.event_type === "command") {
-            typeBadge.textContent = "Результат команды";
+            typeBadge.textContent = localized("Результат команды", "Command result");
         } else {
-            typeBadge.textContent = event.event_type || "Событие";
+            typeBadge.textContent = event.event_type || localized("Событие", "Event");
         }
 
         top.append(deviceName, typeBadge);
@@ -1259,6 +2355,24 @@ function renderEvents() {
         }
 
         row.append(top, description, timestamp);
+
+        const isPermanentlyBlocked =
+            event.event_type === "connection" &&
+            String(event.event_value ?? "").includes("постоянный запрет подключения") &&
+            blockedDevices.some(device => device.device_id === event.device_id);
+        if (isPermanentlyBlocked) {
+            const undo = document.createElement("button");
+            undo.type = "button";
+            undo.className = "event-action-button";
+            undo.textContent = localized("Снять постоянный запрет", "Remove permanent block");
+            undo.disabled = !isGatewayConnected();
+            undo.addEventListener("click", () => {
+                if (sendGatewayAction("clear_device_block", { device: event.device_id })) {
+                    undo.disabled = true;
+                }
+            });
+            row.appendChild(undo);
+        }
         list.appendChild(row);
     }
 
@@ -1276,8 +2390,8 @@ function renderLoadMoreButton(container) {
     button.className = "event-load-more";
     button.disabled = eventsLoading;
     button.textContent = eventsLoading
-        ? "Загрузка..."
-        : "Показать более старые события";
+        ? localized("Загрузка...", "Loading...")
+        : localized("Показать более старые события", "Load older events");
     button.addEventListener("click", () => {
         requestEvents();
     });
@@ -1329,25 +2443,13 @@ function sendParameterCommand(deviceId, parameter, value) {
         deviceId: deviceId,
         parameter: parameter,
         value: value,
-        timer: null
+        status: "queued",
+        attempts: 0
     };
 
     pendingCommands.set(pending.commandId, pending);
     updateDevicePanel(device);
 
-    pending.timer = setTimeout(() => {
-        if (pendingCommands.get(pending.commandId) !== pending) {
-            return;
-        }
-
-        pendingCommands.delete(pending.commandId);
-        updateDevicePanel(device);
-
-        setActivity(
-            `Gateway не сообщил результат команды для ${deviceId}. ` +
-            "Проверьте соединение с сервером."
-        );
-    }, COMMAND_TIMEOUT_MS);
 
     try {
         socket.send(JSON.stringify({
@@ -1455,7 +2557,7 @@ function openActionDialog(deviceId, actionId, definition) {
     buttons.className = "action-dialog-buttons";
     const submit = document.createElement("button");
     submit.type = "button";
-    submit.textContent = "Выполнить";
+    submit.textContent = localized("Выполнить", "Run action");
     submit.addEventListener("click", () => {
         for (const field of fields) {
             if (!field.input.checkValidity()) {
@@ -1491,7 +2593,7 @@ function openActionDialog(deviceId, actionId, definition) {
     const cancel = document.createElement("button");
     cancel.type = "button";
     cancel.className = "secondary-button";
-    cancel.textContent = "Отмена";
+    cancel.textContent = localized("Отмена", "Cancel");
     cancel.addEventListener("click", () => dialog.close());
     buttons.append(submit, cancel);
     form.appendChild(buttons);
@@ -1531,16 +2633,11 @@ function sendDeviceAction(deviceId, actionId, argumentsValue = {}) {
         deviceId,
         actionId,
         arguments: argumentsValue,
-        timer: null
+        status: "queued",
+        attempts: 0
     };
     pendingCommands.set(pending.commandId, pending);
     updateDevicePanel(device);
-    pending.timer = setTimeout(() => {
-        if (pendingCommands.get(pending.commandId) !== pending) return;
-        pendingCommands.delete(pending.commandId);
-        updateDevicePanel(device);
-        setActivity(`Gateway не сообщил результат действия для ${deviceId}.`);
-    }, COMMAND_TIMEOUT_MS);
 
     try {
         socket.send(JSON.stringify({
@@ -1578,6 +2675,15 @@ function requestDevices() {
         socket.send(JSON.stringify({
             type: "browser_message",
             action: "get_devices"
+        }));
+    }
+}
+
+function requestDatabaseStats() {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+            type: "browser_message",
+            action: "get_database_stats"
         }));
     }
 }
@@ -1679,4 +2785,7 @@ if (refreshButton) {
 // ЗАПУСК ПРИЛОЖЕНИЯ
 // =========================
 
+initializeInterface();
 connectGateway();
+setInterval(renderDatabaseStats, 1000);
+setInterval(requestDatabaseStats, 30000);

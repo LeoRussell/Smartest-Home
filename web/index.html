@@ -3,48 +3,213 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0b1220">
     <title>IoT Gateway</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <header class="topbar">
-        <div class="brand">
-            <div class="brand-mark" aria-hidden="true">SH</div>
-            <div>
-                <p class="eyebrow">SMART HOME · LOCAL GATEWAY</p>
-                <h1>IoT Gateway</h1>
-                <p>Управление устройствами и состоянием системы</p>
+        <a class="brand" href="#devices-page" aria-label="IoT Gateway — устройства">
+            <span class="brand-mark" aria-hidden="true">SH</span>
+            <span class="brand-copy">
+                <span class="eyebrow">SMART HOME · LOCAL GATEWAY</span>
+                <strong class="brand-title">IoT Gateway</strong>
+            </span>
+        </a>
+
+        <div class="topbar-actions">
+            <div class="server-status" role="status" aria-live="polite">
+                <span class="status-dot" id="gateway-status-dot"></span>
+                <span id="gateway-status">Нет соединения с Gateway</span>
             </div>
-        </div>
-        <div class="server-status" role="status" aria-live="polite">
-            <span class="status-dot" id="gateway-status-dot"></span>
-            <span id="gateway-status">Нет соединения с Gateway</span>
+            <div class="notification-area">
+                <button id="notification-button" class="notification-button" type="button"
+                        aria-label="Уведомления" aria-expanded="false" aria-controls="notification-panel">
+                    <svg class="notification-bell" aria-hidden="true" viewBox="0 0 24 24" fill="none">
+                        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"
+                              stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                    <span class="notification-count" id="notification-count" hidden>0</span>
+                </button>
+                <section id="notification-panel" class="notification-panel" aria-label="Уведомления" hidden>
+                    <div class="notification-panel-heading">
+                        <div>
+                            <h2 data-ru="Уведомления" data-en="Notifications">Уведомления</h2>
+                            <p id="notification-summary">Новых событий нет</p>
+                        </div>
+                        <button id="mark-notifications-read" class="text-button" type="button"
+                                data-ru="Прочитать всё" data-en="Mark all read">Прочитать всё</button>
+                    </div>
+                    <div id="notification-list" class="notification-list"></div>
+                </section>
+            </div>
         </div>
     </header>
 
-    <main>
-        <section class="section-heading">
-            <div>
-                <h2>Устройства</h2>
-                <p>Состояние и доступные действия</p>
-            </div>
-            <button id="refresh-button">Обновить</button>
-        </section>
+    <div class="app-layout nav-top" id="app-layout">
+        <nav id="main-navigation" class="main-navigation" aria-label="Главное меню" role="tablist">
+            <button class="navigation-item is-active" type="button" role="tab" aria-selected="true"
+                    id="tab-devices" data-page="devices" aria-controls="devices-page">
+                <span class="navigation-icon" aria-hidden="true">▦</span><span class="navigation-label" data-ru="Устройства" data-en="Devices">Устройства</span>
+            </button>
+            <button class="navigation-item" type="button" role="tab" aria-selected="false"
+                    id="tab-events" data-page="events" aria-controls="events-page">
+                <span class="navigation-icon" aria-hidden="true">≋</span><span class="navigation-label" data-ru="События" data-en="Events">События</span>
+            </button>
+            <button class="navigation-item" type="button" role="tab" aria-selected="false"
+                    id="tab-settings" data-page="settings" aria-controls="settings-page">
+                <span class="navigation-icon" aria-hidden="true">⚙</span><span class="navigation-label" data-ru="Настройки" data-en="Settings">Настройки</span>
+            </button>
+        </nav>
 
-        <section id="dashboard-overview" class="dashboard-overview" aria-label="Сводка устройств"></section>
+        <div class="page-content">
+            <main>
+                <section id="devices-page" class="page-panel" data-page-panel="devices" role="tabpanel" aria-labelledby="tab-devices">
+                    <section class="section-heading">
+                        <div>
+                            <h1 data-ru="Устройства" data-en="Devices">Устройства</h1>
+                            <p data-ru="Состояние и доступные действия" data-en="Status and available controls">Состояние и доступные действия</p>
+                        </div>
+                        <button id="refresh-button" class="refresh-button" type="button">
+                            <span aria-hidden="true">↻</span>
+                            <span data-ru="Обновить" data-en="Refresh">Обновить</span>
+                        </button>
+                    </section>
 
-        <section class="device-card" aria-live="polite"></section>
+                    <p id="action-feedback" class="action-feedback" aria-live="polite" hidden></p>
 
-        <section class="activity-card">
-            <h2>События</h2>
-            <p id="activity-message">
-                Подключаемся к Gateway...
-            </p>
-        </section>
-    </main>
+                    <section id="dashboard-overview" class="dashboard-overview" aria-label="Сводка устройств"></section>
+                    <section class="device-card" aria-live="polite"></section>
+
+                    <details id="blocked-devices" class="blocked-devices" hidden>
+                        <summary>
+                            <span data-ru="Заблокированные устройства" data-en="Blocked devices">Заблокированные устройства</span>
+                            <span id="blocked-device-count" class="blocked-device-count"></span>
+                        </summary>
+                        <div id="blocked-devices-list" class="blocked-devices-list"></div>
+                    </details>
+                </section>
+
+                <section id="events-page" class="page-panel" data-page-panel="events" role="tabpanel" aria-labelledby="tab-events" hidden>
+                    <section class="section-heading page-intro">
+                        <div>
+                            <h1 data-ru="События" data-en="Events">События</h1>
+                            <p data-ru="История команд, подключений и изменений состояния" data-en="History of commands, connections and state changes">История команд, подключений и изменений состояния</p>
+                        </div>
+                        <button class="refresh-button" type="button" data-action="refresh-events">
+                            <span aria-hidden="true">↻</span>
+                            <span data-ru="Обновить" data-en="Refresh">Обновить</span>
+                        </button>
+                    </section>
+                    <section class="activity-card">
+                        <p id="activity-message" aria-live="polite">Подключаемся к Gateway...</p>
+                    </section>
+                </section>
+
+                <section id="settings-page" class="page-panel" data-page-panel="settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+                    <section class="section-heading page-intro">
+                        <div>
+                            <h1 data-ru="Настройки" data-en="Settings">Настройки</h1>
+                            <p data-ru="Персонализируйте расположение и отображение интерфейса" data-en="Customize the layout and appearance of the interface">Персонализируйте расположение и отображение интерфейса</p>
+                        </div>
+                    </section>
+
+                    <div class="settings-layout">
+                    <section class="settings-card">
+                        <div class="settings-group">
+                            <div class="settings-group-heading">
+                                <span class="settings-group-icon" aria-hidden="true">▤</span>
+                                <div>
+                                    <h2 data-ru="Интерфейс" data-en="Interface">Интерфейс</h2>
+                                    <p data-ru="Выберите язык и расположение меню" data-en="Choose the language and menu layout">Выберите язык и расположение меню</p>
+                                </div>
+                            </div>
+                            <label class="setting-field">
+                                <span data-ru="Расположение меню" data-en="Menu position">Расположение меню</span>
+                                <select id="setting-navigation">
+                                    <option value="top" data-ru="Сверху" data-en="Top">Сверху</option>
+                                    <option value="side" data-ru="Слева" data-en="Left">Слева</option>
+                                </select>
+                            </label>
+                            <label class="setting-field">
+                                <span data-ru="Язык интерфейса" data-en="Interface language">Язык интерфейса</span>
+                                <select id="setting-language">
+                                    <option value="ru">Русский</option>
+                                    <option value="en">English</option>
+                                </select>
+                            </label>
+                        </div>
+
+                        <div class="settings-group">
+                            <div class="settings-group-heading">
+                                <span class="settings-group-icon" aria-hidden="true">◷</span>
+                                <div>
+                                    <h2 data-ru="Дата и время" data-en="Date and time">Дата и время</h2>
+                                    <p data-ru="Часовой пояс применяется к журналу и уведомлениям" data-en="The time zone is used for the event log and notifications">Часовой пояс применяется к журналу и уведомлениям</p>
+                                </div>
+                            </div>
+                            <label class="setting-field">
+                                <span data-ru="Часовой пояс" data-en="Time zone">Часовой пояс</span>
+                                <select id="setting-timezone">
+                                    <option value="local" data-ru="Автоматически (часовой пояс устройства)" data-en="Automatic (device time zone)">Автоматически (часовой пояс устройства)</option>
+                                    <option value="Europe/Moscow">Europe/Moscow</option>
+                                    <option value="UTC">UTC</option>
+                                    <option value="Europe/Berlin">Europe/Berlin</option>
+                                    <option value="Europe/London">Europe/London</option>
+                                    <option value="America/New_York">America/New_York</option>
+                                    <option value="Asia/Tokyo">Asia/Tokyo</option>
+                                </select>
+                            </label>
+                        </div>
+
+                        <div class="settings-group">
+                            <div class="settings-group-heading">
+                                <span class="settings-group-icon" aria-hidden="true">♧</span>
+                                <div>
+                                    <h2 data-ru="Уведомления" data-en="Notifications">Уведомления</h2>
+                                    <p data-ru="Настройте, какие события отмечать в центре уведомлений" data-en="Choose which events appear in the notification center">Настройте, какие события отмечать в центре уведомлений</p>
+                                </div>
+                            </div>
+                            <label class="setting-toggle">
+                                <input id="setting-important-only" type="checkbox">
+                                <span class="toggle-copy">
+                                    <strong data-ru="Только важные события" data-en="Important events only">Только важные события</strong>
+                                    <small data-ru="Подключения, изменения Schema и ошибки команд" data-en="Connections, Schema changes and command failures">Подключения, изменения Schema и ошибки команд</small>
+                                </span>
+                            </label>
+                        </div>
+                        <p class="settings-saved" id="settings-saved" aria-live="polite"></p>
+                    </section>
+                    <aside class="database-summary" aria-live="off">
+                        <div class="database-summary-heading">
+                            <span class="settings-group-icon" aria-hidden="true">▦</span>
+                            <div>
+                                <h2 data-ru="Сводка Gateway" data-en="Gateway summary">Сводка Gateway</h2>
+                                <p data-ru="База данных и время работы" data-en="Database and uptime">База данных и время работы</p>
+                            </div>
+                        </div>
+                        <dl class="database-statistics" id="database-statistics">
+                            <div class="database-stat"><dt data-ru="Размер базы" data-en="Database size">Размер базы</dt><dd data-db-stat="database_size_bytes">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Всего записей" data-en="Total records">Всего записей</dt><dd data-db-stat="record_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Устройств в базе" data-en="Devices in database">Устройств в базе</dt><dd data-db-stat="device_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Подключалось устройств" data-en="Devices ever connected">Подключалось устройств</dt><dd data-db-stat="ever_connected_device_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Подключено сейчас" data-en="Connected now">Подключено сейчас</dt><dd data-db-stat="connected_device_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Событий" data-en="Events">Событий</dt><dd data-db-stat="event_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Снимков Schema" data-en="Schema snapshots">Снимков Schema</dt><dd data-db-stat="schema_snapshot_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Записей команд" data-en="Command records">Записей команд</dt><dd data-db-stat="command_record_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Текущая сессия" data-en="Current session">Текущая сессия</dt><dd data-db-stat="session_uptime_seconds">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Всего работы (с начала учёта)" data-en="Total uptime (since tracking began)">Всего работы (с начала учёта)</dt><dd data-db-stat="total_uptime_seconds">—</dd></div>
+                        </dl>
+                        <p class="database-summary-note" data-ru="Число записей суммирует устройства, события, снимки Schema и команды. Общее время копится с включения учёта в этой версии." data-en="The record total sums devices, events, Schema snapshots and commands. Total uptime accumulates from the first run with tracking enabled in this version.">Число записей суммирует устройства, события, снимки Schema и команды. Общее время копится с включения учёта в этой версии.</p>
+                    </aside>
+                    </div>
+                </section>
+            </main>
+        </div>
+    </div>
 
     <footer>
-        IoT Gateway · Локальная сеть
+        <span>IoT Gateway</span><span class="footer-separator">·</span><span data-ru="Локальная сеть" data-en="Local network">Локальная сеть</span>
     </footer>
     <script src="app.js"></script>
 </body>
