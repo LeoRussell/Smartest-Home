@@ -53,6 +53,10 @@
                 <span class="navigation-icon" aria-hidden="true">▦</span><span class="navigation-label" data-ru="Устройства" data-en="Devices">Устройства</span>
             </button>
             <button class="navigation-item" type="button" role="tab" aria-selected="false"
+                    id="tab-automations" data-page="automations" aria-controls="automations-page">
+                <span class="navigation-icon" aria-hidden="true">⚡</span><span class="navigation-label" data-ru="Автоматизация" data-en="Automation">Автоматизация</span>
+            </button>
+            <button class="navigation-item" type="button" role="tab" aria-selected="false"
                     id="tab-events" data-page="events" aria-controls="events-page">
                 <span class="navigation-icon" aria-hidden="true">≋</span><span class="navigation-label" data-ru="События" data-en="Events">События</span>
             </button>
@@ -88,6 +92,25 @@
                         </summary>
                         <div id="blocked-devices-list" class="blocked-devices-list"></div>
                     </details>
+                </section>
+
+                <section id="automations-page" class="page-panel" data-page-panel="automations" role="tabpanel" aria-labelledby="tab-automations" hidden>
+                    <section class="section-heading page-intro">
+                        <div>
+                            <h1 data-ru="Автоматизация" data-en="Automation">Автоматизация</h1>
+                            <p data-ru="Собирайте сценарии из блоков условий и действий" data-en="Build simple scenarios from condition and action blocks">Собирайте сценарии из блоков условий и действий</p>
+                        </div>
+                    </section>
+                    <section class="automation-editor-card">
+                        <h2 id="automation-editor-title" data-ru="Новый сценарий" data-en="New scenario">Новый сценарий</h2>
+                        <p class="automation-help" data-ru="Перетаскивайте блоки и соединяйте их. Gateway выполнит сценарий независимо от открытого браузера." data-en="Drag and connect blocks. The Gateway runs the saved scenario even when the browser is closed.">Перетаскивайте блоки и соединяйте их. Gateway выполнит сценарий независимо от открытого браузера.</p>
+                        <form id="automation-editor-form" class="automation-form">
+                            <label class="automation-name-field"><span data-ru="Название сценария" data-en="Scenario name">Название сценария</span><input id="automation-name" maxlength="80" required placeholder="Сценарий автоматизации" data-placeholder-ru="Сценарий автоматизации" data-placeholder-en="Automation scenario"></label>
+                            <div id="automation-workspace" class="automation-workspace" role="application" aria-label="Визуальный редактор автоматизаций"></div>
+                            <div class="automation-form-actions"><button id="automation-undo" class="automation-history-button" type="button" disabled data-ru="Отменить изменение" data-en="Undo change">Отменить изменение</button><button id="automation-redo" class="automation-history-button" type="button" disabled data-ru="Вернуть изменение" data-en="Redo change">Вернуть изменение</button><button id="automation-save-button" class="refresh-button" type="submit" data-ru="Сохранить сценарий" data-en="Save scenario">Сохранить сценарий</button><button id="automation-clear" class="event-action-button" type="button" data-ru="Очистить блоки" data-en="Clear blocks">Очистить блоки</button><button id="automation-cancel-edit" class="event-action-button" type="button" hidden data-ru="Отменить редактирование" data-en="Cancel editing">Отменить редактирование</button><span id="automation-feedback" aria-live="polite"></span></div>
+                        </form>
+                    </section>
+                    <section class="automation-list-section"><h2 data-ru="Сценарии" data-en="Scenarios">Сценарии</h2><div id="automation-list" class="automation-list"></div></section>
                 </section>
 
                 <section id="events-page" class="page-panel" data-page-panel="events" role="tabpanel" aria-labelledby="tab-events" hidden>
@@ -197,6 +220,7 @@
                             <div class="database-stat"><dt data-ru="Событий" data-en="Events">Событий</dt><dd data-db-stat="event_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Снимков Schema" data-en="Schema snapshots">Снимков Schema</dt><dd data-db-stat="schema_snapshot_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Записей команд" data-en="Command records">Записей команд</dt><dd data-db-stat="command_record_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Сценариев автоматизации" data-en="Automation scenarios">Сценариев автоматизации</dt><dd data-db-stat="automation_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Текущая сессия" data-en="Current session">Текущая сессия</dt><dd data-db-stat="session_uptime_seconds">—</dd></div>
                             <div class="database-stat"><dt data-ru="Всего работы (с начала учёта)" data-en="Total uptime (since tracking began)">Всего работы (с начала учёта)</dt><dd data-db-stat="total_uptime_seconds">—</dd></div>
                         </dl>
@@ -211,6 +235,13 @@
     <footer>
         <span>IoT Gateway</span><span class="footer-separator">·</span><span data-ru="Локальная сеть" data-en="Local network">Локальная сеть</span>
     </footer>
+    <script src="vendor/blockly/blockly_compressed.js"></script>
+    <script src="vendor/blockly/blocks_compressed.js"></script>
+    <script src="vendor/blockly/msg/en.js"></script>
+    <script>window.BlocklyLocales = { en: { ...Blockly.Msg } };</script>
+    <script src="vendor/blockly/msg/ru.js"></script>
+    <script>window.BlocklyLocales.ru = { ...Blockly.Msg };</script>
+    <script src="automation-blockly.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

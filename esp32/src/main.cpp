@@ -1,5 +1,6 @@
 
 #include <Arduino.h>
+#include <cstring>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
@@ -20,6 +21,136 @@ unsigned long lastStateSentAt = 0;
 unsigned long lastWifiReconnectAt = 0;
 uint32_t stateSequence = 0;
 
+enum DeviceModeCapability : uint8_t {
+    MODE_CAN_SELECT = 1 << 0,
+    MODE_CAN_ENABLE = 1 << 1,
+    MODE_CAN_DISABLE = 1 << 2
+};
+
+using DeviceModeHandler = bool (*)();
+
+struct DeviceModeRegistration {
+    const char* id;
+    const char* label;
+    const char* description;
+    uint8_t capabilities;
+    DeviceModeHandler select;
+    DeviceModeHandler enable;
+    DeviceModeHandler disable;
+    DeviceModeHandler isActive;
+};
+
+// Register only implemented firmware modes here. Each advertised operation
+// becomes a validated Gateway action; boards with no modes leave only sentinel.
+const DeviceModeRegistration deviceModes[] = {
+    {nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr}
+};
+
+bool isValidModeId(const char* value) {
+    if (value == nullptr || value[0] == '\0' || strlen(value) > 47) return false;
+    if (!((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'))) return false;
+    for (const char* ch = value + 1; *ch != '\0'; ++ch) {
+        if (!((*ch >= 'A' && *ch <= 'Z') || (*ch >= 'a' && *ch <= 'z') ||
+              (*ch >= '0' && *ch <= '9') || *ch == '_' || *ch == '-' || *ch == '.')) return false;
+    }
+    return true;
+}
+
+String modeOperationActionId(const char* modeId, const char* operation) {
+    String actionId = "mode_";
+    actionId += modeId;
+    actionId += '_';
+    actionId += operation;
+    return actionId;
+}
+
+bool modeHasRegisteredOperation(const DeviceModeRegistration& mode) {
+    return ((mode.capabilities & MODE_CAN_SELECT) && mode.select) ||
+           ((mode.capabilities & MODE_CAN_ENABLE) && mode.enable) ||
+           ((mode.capabilities & MODE_CAN_DISABLE) && mode.disable);
+}
+
+DeviceModeHandler registeredModeHandler(const char* actionId) {
+    if (actionId == nullptr) return nullptr;
+    for (const DeviceModeRegistration& mode : deviceModes) {
+        if (mode.id == nullptr) break;
+        if (!isValidModeId(mode.id)) continue;
+        if ((mode.capabilities & MODE_CAN_SELECT) && mode.select && modeOperationActionId(mode.id, "select") == actionId) return mode.select;
+        if ((mode.capabilities & MODE_CAN_ENABLE) && mode.enable && modeOperationActionId(mode.id, "enable") == actionId) return mode.enable;
+        if ((mode.capabilities & MODE_CAN_DISABLE) && mode.disable && modeOperationActionId(mode.id, "disable") == actionId) return mode.disable;
+    }
+    return nullptr;
+}
+
+void appendModeOperation(
+    JsonObject schema,
+    JsonObject operationMap,
+    const DeviceModeRegistration& mode,
+    const char* operation,
+    DeviceModeHandler handler,
+    uint8_t capability
+) {
+    if (handler == nullptr || !(mode.capabilities & capability)) return;
+    const String actionId = modeOperationActionId(mode.id, operation);
+    JsonObject actions = schema["actions"].as<JsonObject>();
+    if (actions[actionId].is<JsonObject>()) return;
+
+    JsonObject action = actions[actionId].to<JsonObject>();
+    String label = mode.label ? mode.label : mode.id;
+    label += operation[0] == 's' ? " — Выбрать" : operation[0] == 'e' ? " — Включить" : " — Выключить";
+    action["label"] = label;
+    if (mode.description && mode.description[0] != '\0') action["description"] = mode.description;
+    operationMap[operation] = actionId;
+}
+
+void appendRegisteredModes(JsonObject schema) {
+    bool hasRegisteredMode = false;
+    for (const DeviceModeRegistration& mode : deviceModes) {
+        if (mode.id == nullptr) break;
+        if (isValidModeId(mode.id) && mode.label && mode.label[0] != '\0' && modeHasRegisteredOperation(mode)) {
+            hasRegisteredMode = true;
+            break;
+        }
+    }
+    if (!hasRegisteredMode) return;
+
+    JsonObject modes = schema["modes"].to<JsonObject>();
+    schema["actions"].to<JsonObject>();
+    JsonObject parameters = schema["parameters"].as<JsonObject>();
+    for (const DeviceModeRegistration& mode : deviceModes) {
+        if (mode.id == nullptr) break;
+        if (!isValidModeId(mode.id) || mode.label == nullptr || mode.label[0] == '\0' || !modeHasRegisteredOperation(mode)) continue;
+
+        JsonObject definition = modes[mode.id].to<JsonObject>();
+        definition["label"] = mode.label;
+        if (mode.description && mode.description[0] != '\0') definition["description"] = mode.description;
+        JsonObject operations = definition["operations"].to<JsonObject>();
+        appendModeOperation(schema, operations, mode, "select", mode.select, MODE_CAN_SELECT);
+        appendModeOperation(schema, operations, mode, "enable", mode.enable, MODE_CAN_ENABLE);
+        appendModeOperation(schema, operations, mode, "disable", mode.disable, MODE_CAN_DISABLE);
+        if (operations.size() == 0) {
+            modes.remove(mode.id);
+            continue;
+        }
+
+        if (mode.isActive) {
+            String statusParameter = "mode_";
+            statusParameter += mode.id;
+            statusParameter += "_active";
+            if (parameters.size() < 64 && !parameters[statusParameter].is<JsonObject>()) {
+                JsonObject status = parameters[statusParameter].to<JsonObject>();
+                String statusLabel = mode.label;
+                statusLabel += " — активно";
+                status["label"] = statusLabel;
+                status["type"] = "boolean";
+                status["access"] = "read_only";
+                definition["status_parameter"] = statusParameter;
+                definition["status_value"] = true;
+            }
+        }
+    }
+}
+
 bool replayCachedCommandResult(const char* commandId) {
     if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
         return false;
@@ -34,7 +165,7 @@ bool replayCachedCommandResult(const char* commandId) {
 
         String resultKey = "r";
         resultKey += String(slot);
-        const String cachedResult = commandCache.getString(resultKey.c_str(), "");
+        String cachedResult = commandCache.getString(resultKey.c_str(), "");
         if (cachedResult.length() == 0) {
             return false;
         }
@@ -71,7 +202,7 @@ void sendHello() {
     doc["protocol_version"] = 2;
     doc["command_dedup"] = commandCacheReady;
     doc["firmware_version"] = "1.1.0";
-    doc["schema_version"] = 2;
+    doc["schema_version"] = 3;
 
     JsonObject led = doc["schema"]["parameters"]["led"].to<JsonObject>();
     led["label"] = "Светодиод";
@@ -83,6 +214,8 @@ void sendHello() {
     identify["label"] = "Найти устройство";
     identify["description"] = "Трижды мигает индикатором устройства.";
 #endif
+
+    appendRegisteredModes(doc["schema"].to<JsonObject>());
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
@@ -100,7 +233,16 @@ void sendState(bool ledOn, bool logMessage = true) {
     doc["type"] = "state";
     doc["id"] = ++stateSequence;
     doc["device"] = DEVICE_ID;
-    doc["data"]["parameters"]["led"] = ledOn;
+    JsonObject parameters = doc["data"]["parameters"].to<JsonObject>();
+    parameters["led"] = ledOn;
+    for (const DeviceModeRegistration& mode : deviceModes) {
+        if (mode.id == nullptr) break;
+        if (!isValidModeId(mode.id) || mode.isActive == nullptr) continue;
+        String statusParameter = "mode_";
+        statusParameter += mode.id;
+        statusParameter += "_active";
+        parameters[statusParameter] = mode.isActive();
+    }
 
     String message;
     serializeJson(doc, message);
@@ -142,7 +284,7 @@ void sendCommandResult(
     Serial.println(message);
 }
 
-void sendActionResult(const char* commandId, const char* action, bool success) {
+void sendActionResult(const char* commandId, const char* action, bool success, const char* errorMessage = nullptr) {
     JsonDocument doc;
     doc["type"] = "command_result";
     doc["id"] = commandId;
@@ -151,7 +293,7 @@ void sendActionResult(const char* commandId, const char* action, bool success) {
     doc["success"] = success;
     doc["data"]["action"] = action;
     if (!success) {
-        doc["data"]["error"] = "Unsupported action";
+        doc["data"]["error"] = errorMessage ? errorMessage : "Unsupported action";
     }
 
     String message;
@@ -204,7 +346,20 @@ void onWebSocketEvent(
 
                 if (strcmp(commandName, "invoke") == 0) {
                     const char* action = doc["data"]["action"] | "";
-                    if (
+                    DeviceModeHandler modeHandler = registeredModeHandler(action);
+                    if (modeHandler != nullptr) {
+                        const bool success = modeHandler();
+                        if (success) {
+                            sendState(digitalRead(LED_PIN) == HIGH, false);
+                            lastStateSentAt = millis();
+                        }
+                        sendActionResult(
+                            commandId,
+                            action,
+                            success,
+                            success ? nullptr : "Registered mode operation failed"
+                        );
+                    } else if (
                         DEVICE_HAS_IDENTIFY_INDICATOR &&
                         strcmp(action, "identify") == 0
                     ) {

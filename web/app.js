@@ -22,6 +22,14 @@ const settingTimezone = document.getElementById("setting-timezone");
 const settingImportantOnly = document.getElementById("setting-important-only");
 const settingsSavedMessage = document.getElementById("settings-saved");
 const databaseStatistics = document.getElementById("database-statistics");
+const automationForm = document.getElementById("automation-editor-form");
+const automationList = document.getElementById("automation-list");
+const automationFeedback = document.getElementById("automation-feedback");
+const automationCancelEdit = document.getElementById("automation-cancel-edit");
+const automationSaveButton = document.getElementById("automation-save-button");
+const automationClearButton = document.getElementById("automation-clear");
+const automationUndoButton = document.getElementById("automation-undo");
+const automationRedoButton = document.getElementById("automation-redo");
 
 const UI_SETTINGS_KEY = "iot-gateway-ui-settings-v1";
 const NOTIFICATION_STATE_KEY = "iot-gateway-notifications-v1";
@@ -66,6 +74,9 @@ let gatewayIsConnectedState = false;
 let databaseStats = null;
 let databaseStatsReceivedAt = 0;
 let databaseStatsFrozenElapsed = null;
+let automations = [];
+let editingAutomationId = null;
+let pendingAutomationWorkspaceState = null;
 
 // =========================
 // СОСТОЯНИЕ ПРИЛОЖЕНИЯ
@@ -75,11 +86,13 @@ let socket = null;
 let reconnectTimer = null;
 
 let devices = [];
+const selectedDeviceModes = new Map();
 let events = [];
 let blockedDevices = [];
 let pendingDeviceAccessRequests = [];
 let deviceAccessDialog = null;
 let deviceAccessDialogRequestId = null;
+let deviceIdentityDialog = null;
 let eventFilter = "all";
 let eventDeviceFilter = "all";
 let eventCursor = null;
@@ -197,12 +210,23 @@ function localizeActivityMessage(message) {
         "Запрос обработан.": "Request completed.",
         "Подключение устройства разрешено.": "Device connection allowed.",
         "Подключение устройства отклонено.": "Device connection denied.",
+        "Чтобы изменить ID, сначала отключите устройство.": "Disconnect the device before changing its ID.",
+        "Сначала обработайте ожидающий запрос на подключение устройства.": "Resolve the pending device connection request first.",
+        "Сначала дождитесь завершения или остановите выполняющиеся сценарии.": "Wait for or stop running automations first.",
+        "Такой ID уже занят другим устройством.": "This ID is already used by another device.",
+        "Такой ID уже запрашивает подключение.": "A device with this ID is requesting connection approval.",
+        "Устройство не найдено.": "Device not found.",
+        "Некорректный ID устройства.": "Invalid device ID.",
+        "Имя устройства должно быть не длиннее 60 символов.": "The display name must be 60 characters or fewer.",
+        "ID должен начинаться с английской буквы и содержать только английские буквы, цифры, дефис или подчёркивание.": "The ID must start with an English letter and contain only English letters, digits, hyphens, or underscores.",
         "Блокировка снята. При следующем подключении появится запрос разрешения.": "Block removed. Gateway will ask for approval next time the device connects.",
         "Снимок Schema удалён из истории. Текущая Schema устройства не изменена.": "Schema snapshot deleted from history. The device's current Schema was not changed.",
         "Schema Gateway восстановлена. При следующем подключении она будет сравнена с Schema устройства.": "Gateway Schema restored. It will be compared with the device Schema next time it connects."
     };
     if (exact[message]) return exact[message];
-    let match = message.match(/^Найдено устройств: (\d+)\.$/);
+    let match = message.match(/^Имя и ID устройства обновлены\. В Blockly используется ID «(.+)»\.$/);
+    if (match) return `Device name and ID updated. Blockly uses “${match[1]}”.`;
+    match = message.match(/^Найдено устройств: (\d+)\.$/);
     if (match) return `Devices found: ${match[1]}.`;
     match = message.match(/^Действие «(.+)» на (.+) выполнено\.$/);
     if (match) return `Action “${match[1]}” completed on ${match[2]}.`;
@@ -247,6 +271,10 @@ function applyLanguage() {
     for (const element of document.querySelectorAll("[data-ru][data-en]")) {
         element.textContent = element.dataset[uiSettings.language] || element.dataset.ru;
     }
+    const automationNameInput = document.getElementById("automation-name");
+    if (automationNameInput) {
+        automationNameInput.placeholder = automationNameInput.dataset[`placeholder${uiSettings.language === "en" ? "En" : "Ru"}`] || "";
+    }
     if (notificationButton) {
         notificationButton.setAttribute(
             "aria-label",
@@ -264,6 +292,9 @@ function applyLanguage() {
     renderDevices();
     renderEvents();
     renderDatabaseStats();
+    refreshAutomationEditor();
+    renderAutomations();
+    updateAutomationEditorMode();
     setGatewayConnectionStatus(lastGatewayStatusMessage, gatewayIsConnectedState);
     if (lastActivityMessage) setActivity(lastActivityMessage);
 }
@@ -280,6 +311,7 @@ function setActivePage(page) {
         button.setAttribute("aria-selected", String(active));
         button.tabIndex = active ? 0 : -1;
     }
+    if (page === "automations") refreshAutomationEditor();
     if (page === "events" && events.length === 0 && !pendingEventFocusId && isGatewayConnected()) {
         requestEvents({ reset: true });
     }
@@ -518,6 +550,22 @@ function initializeInterface() {
         const button = event.target.closest("[data-page]");
         if (button) setActivePage(button.dataset.page);
     });
+    automationForm?.addEventListener("submit", submitAutomation);
+    document.addEventListener("automation-history-change", event => {
+        if (automationUndoButton) automationUndoButton.disabled = !event.detail?.canUndo;
+        if (automationRedoButton) automationRedoButton.disabled = !event.detail?.canRedo;
+    });
+    automationUndoButton?.addEventListener("click", () => window.AutomationBlockly?.undo());
+    automationRedoButton?.addEventListener("click", () => window.AutomationBlockly?.redo());
+    automationCancelEdit?.addEventListener("click", () => {
+        editingAutomationId = null;
+        automationForm?.reset();
+        window.AutomationBlockly?.clear();
+        document.getElementById("automation-editor-title").textContent = localized("Новый сценарий", "New scenario");
+        updateAutomationEditorMode();
+        if (automationFeedback) automationFeedback.textContent = "";
+    });
+    automationClearButton?.addEventListener("click", () => window.AutomationBlockly?.clear());
     document.querySelector(".brand")?.addEventListener("click", event => {
         event.preventDefault();
         setActivePage("devices");
@@ -692,6 +740,215 @@ function sendGatewayAction(action, fields = {}) {
     }
 }
 
+function automationActionCount(statements = []) {
+    let count = 0;
+    for (const statement of statements || []) {
+        if (["set_parameter", "invoke_action", "wait"].includes(statement.type)) count += 1;
+        if (statement.type === "if") {
+            for (const branch of statement.branches || []) count += automationActionCount(branch.then);
+            count += automationActionCount(statement.else);
+        }
+    }
+    return count;
+}
+
+function automationSummary(config) {
+    if (config.trigger && config.target) {
+        const source = devices.find(item => item.device === config.trigger.device);
+        const target = devices.find(item => item.device === config.target.device);
+        const sensor = source?.schema?.parameters?.[config.trigger.parameter];
+        const operation = config.target.kind === "action"
+            ? target?.schema?.actions?.[config.target.name]?.label || config.target.name
+            : target?.schema?.parameters?.[config.target.name]?.label || config.target.name;
+        const words = { below: "меньше", above: "больше", at_most: "не больше", at_least: "не меньше" };
+        const opEn = { below: "below", above: "above", at_most: "at most", at_least: "at least" };
+        return localized(
+            `${source?.name || source?.device || config.trigger.device} · ${sensor?.label || config.trigger.parameter} ${words[config.trigger.operator] || config.trigger.operator} ${config.trigger.threshold} → ${target?.name || target?.device || config.target.device} · ${operation}`,
+            `${source?.name || source?.device || config.trigger.device} · ${sensor?.label || config.trigger.parameter} ${opEn[config.trigger.operator] || config.trigger.operator} ${config.trigger.threshold} → ${target?.name || target?.device || config.target.device} · ${operation}`
+        );
+    }
+    const program = config.program;
+    if (!program?.trigger) return localized("Сценарий требует проверки.", "Scenario needs review.");
+    const trigger = program.trigger;
+    let triggerText;
+    if (trigger.type === "parameter_changed") {
+        const source = devices.find(item => item.device === trigger.device);
+        const definition = source?.schema?.parameters?.[trigger.parameter];
+        triggerText = localized(
+            `При изменении ${source?.name || trigger.device} · ${definition?.label || trigger.parameter}`,
+            `When ${source?.name || trigger.device} · ${definition?.label || trigger.parameter} changes`
+        );
+    } else if (trigger.type === "device_connected") {
+        triggerText = localized(`При подключении ${trigger.device}`, `When ${trigger.device} connects`);
+    } else if (trigger.type === "device_disconnected") {
+        triggerText = localized(`При отключении ${trigger.device}`, `When ${trigger.device} disconnects`);
+    } else {
+        triggerText = localized("При запуске Gateway", "When Gateway starts");
+    }
+    return `${triggerText} → ${automationActionCount(program.body)} ${localized("действий", "actions")}`;
+}
+
+function refreshAutomationEditor(config = null) {
+    const BlocklyEditor = window.AutomationBlockly;
+    if (config) {
+        editingAutomationId = config.automation_id || editingAutomationId;
+        document.getElementById("automation-name").value = config.name || "";
+        document.getElementById("automation-editor-title").textContent = localized("Изменить сценарий", "Edit scenario");
+        pendingAutomationWorkspaceState = config.workspace || null;
+        setActivePage("automations");
+        if (BlocklyEditor?.isReady()) {
+            try {
+                if (config.trigger && config.target) BlocklyEditor.loadLegacy(config);
+                else BlocklyEditor.load(config.workspace || null);
+            } catch (error) {
+                editingAutomationId = null;
+                pendingAutomationWorkspaceState = null;
+                automationFeedback.textContent = error.message || localized("Не удалось открыть сценарий.", "Could not open the scenario.");
+                updateAutomationEditorMode();
+                return;
+            }
+            pendingAutomationWorkspaceState = null;
+        }
+        updateAutomationEditorMode();
+        return;
+    }
+    if (activePage !== "automations" || !BlocklyEditor) return;
+    if (!BlocklyEditor.isReady()) {
+        BlocklyEditor.initialize(
+            "automation-workspace", devices, uiSettings.language, pendingAutomationWorkspaceState
+        );
+        pendingAutomationWorkspaceState = null;
+    } else {
+        BlocklyEditor.update(devices, uiSettings.language);
+    }
+    updateAutomationEditorMode();
+}
+
+function renderAutomations() {
+    if (!automationList) return;
+    automationList.replaceChildren();
+    if (automations.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "automation-empty";
+        empty.textContent = localized("Сценариев пока нет. Перетащите блоки в редактор выше.", "No scenarios yet. Drag blocks into the editor above.");
+        automationList.append(empty);
+        return;
+    }
+    for (const item of automations) {
+        const card = document.createElement("article");
+        card.className = `automation-card${item.enabled ? "" : " is-disabled"}`;
+        const copy = document.createElement("div");
+        copy.className = "automation-card-copy";
+        const title = document.createElement("h3");
+        title.textContent = item.config.name || localized("Без названия", "Untitled scenario");
+        const description = document.createElement("p");
+        description.textContent = automationSummary(item.config);
+        const status = document.createElement("small");
+        const runtimeStatus = item.run_status || "idle";
+        if (runtimeStatus === "running") {
+            status.textContent = localized("Выполняется…", "Running…");
+        } else if (item.last_error) {
+            status.textContent = `${localized("Ошибка", "Error")}: ${item.last_error}`;
+            status.classList.add("automation-status-error");
+        } else if (item.last_triggered_at) {
+            const runLabels = {
+                succeeded: localized("успешно", "succeeded"),
+                failed: localized("ошибка", "failed"),
+                stopped: localized("остановлен", "stopped")
+            };
+            status.textContent = localized(
+                `Последний запуск: ${formatEventTime(item.last_triggered_at)}${item.last_run_status ? ` · ${runLabels[item.last_run_status] || item.last_run_status}` : ""}`,
+                `Last run: ${formatEventTime(item.last_triggered_at)}${item.last_run_status ? ` · ${runLabels[item.last_run_status] || item.last_run_status}` : ""}`
+            );
+        } else {
+            status.textContent = localized("Ожидает событие запуска", "Waiting for its trigger");
+        }
+        copy.append(title, description, status);
+        const actions = document.createElement("div");
+        actions.className = "automation-card-actions";
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "event-action-button";
+        toggle.textContent = item.enabled ? localized("Отключить", "Disable") : localized("Включить", "Enable");
+        toggle.addEventListener("click", () => sendGatewayAction("set_automation_enabled", {
+            automation_id: item.automation_id, enabled: !item.enabled
+        }));
+        if (runtimeStatus === "running") {
+            const stop = document.createElement("button");
+            stop.type = "button";
+            stop.className = "event-action-button";
+            stop.textContent = localized("Остановить", "Stop");
+            stop.addEventListener("click", () => sendGatewayAction("stop_automation", {
+                automation_id: item.automation_id
+            }));
+            actions.append(stop);
+        }
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "event-action-button";
+        edit.textContent = localized("Изменить", "Edit");
+        edit.addEventListener("click", () => refreshAutomationEditor({
+            ...item.config, automation_id: item.automation_id
+        }));
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "event-action-button";
+        remove.textContent = localized("Удалить", "Delete");
+        remove.addEventListener("click", () => {
+            if (window.confirm(localized(`Удалить сценарий «${item.config.name}»?`, `Delete scenario “${item.config.name}”?`))) {
+                sendGatewayAction("delete_automation", { automation_id: item.automation_id });
+            }
+        });
+        actions.append(toggle, edit, remove);
+        card.append(copy, actions);
+        automationList.append(card);
+    }
+}
+
+function submitAutomation(event) {
+    event.preventDefault();
+    let program;
+    try {
+        program = window.AutomationBlockly?.compile();
+        if (!program) throw new Error(localized("Редактор блоков пока не готов.", "The block editor is not ready."));
+    } catch (error) {
+        automationFeedback.textContent = error.message || localized("Проверьте структуру блоков.", "Check the block structure.");
+        return;
+    }
+    const name = document.getElementById("automation-name").value.trim();
+    if (!name) {
+        automationFeedback.textContent = localized("Введите название сценария.", "Enter a scenario name.");
+        return;
+    }
+    const config = {
+        version: 2,
+        name,
+        workspace: window.AutomationBlockly.getState(),
+        program
+    };
+    const existing = automations.find(item => item.automation_id === editingAutomationId);
+    if (sendGatewayAction("save_automation", {
+        automation_id: editingAutomationId,
+        enabled: existing?.enabled ?? true,
+        config
+    })) {
+        automationFeedback.textContent = localized("Проверяю и сохраняю…", "Validating and saving…");
+    }
+}
+
+function updateAutomationEditorMode() {
+    if (automationCancelEdit) automationCancelEdit.hidden = !editingAutomationId;
+    const title = document.getElementById("automation-editor-title");
+    if (title) title.textContent = editingAutomationId
+        ? localized("Изменить сценарий", "Edit scenario")
+        : localized("Новый сценарий", "New scenario");
+    if (automationSaveButton) {
+        automationSaveButton.textContent = editingAutomationId
+            ? localized("Сохранить изменения", "Save changes")
+            : localized("Сохранить сценарий", "Save scenario");
+    }
+}
+
 function requestDeviceSchemaHistory(deviceId) {
     if (!isGatewayConnected() || schemaHistoryRequests.has(deviceId)) return;
     schemaHistoryRequests.add(deviceId);
@@ -737,6 +994,7 @@ function connectGateway() {
 
         requestDevices();
         requestEvents({ reset: true });
+        sendGatewayAction("get_automations");
     });
 
     socket.addEventListener("message", (event) => {
@@ -785,6 +1043,39 @@ function connectGateway() {
 
 function handleGatewayMessage(message) {
     switch (message.type) {
+        case "automation_list": {
+            automations = Array.isArray(message.automations) ? message.automations : [];
+            renderAutomations();
+            break;
+        }
+
+        case "automation_save_result":
+        case "automation_update_result":
+        case "automation_delete_result": {
+            automationFeedback.textContent = message.success
+                ? localized("Готово.", "Done.")
+                : (message.message || localized("Не удалось изменить сценарий.", "Could not update the scenario."));
+            if (message.success && message.type === "automation_delete_result" && message.automation_id === editingAutomationId) {
+                editingAutomationId = null;
+                automationForm?.reset();
+                window.AutomationBlockly?.clear();
+                updateAutomationEditorMode();
+            }
+            if (message.success && message.type === "automation_save_result") {
+                editingAutomationId = null;
+                automationForm?.reset();
+                window.AutomationBlockly?.clear();
+                document.getElementById("automation-editor-title").textContent = localized("Новый сценарий", "New scenario");
+                refreshAutomationEditor();
+                updateAutomationEditorMode();
+            }
+            break;
+        }
+
+        case "automation_stop_result":
+            automationFeedback.textContent = message.message || localized("Запрос остановки обработан.", "Stop request processed.");
+            break;
+
         case "device_access_requests": {
             pendingDeviceAccessRequests = Array.isArray(message.requests)
                 ? message.requests
@@ -868,6 +1159,7 @@ function handleGatewayMessage(message) {
                 "event_count",
                 "schema_snapshot_count",
                 "command_record_count",
+                "automation_count",
                 "session_uptime_seconds",
                 "total_uptime_seconds"
             ];
@@ -893,6 +1185,8 @@ function handleGatewayMessage(message) {
 
             renderDevices();
             renderEvents();
+            refreshAutomationEditor();
+            renderAutomations();
 
             if (devices.length === 0) {
                 setActivity(
@@ -904,6 +1198,41 @@ function handleGatewayMessage(message) {
                 );
             }
 
+            break;
+        }
+
+        case "device_identity_result": {
+            if (message.success && deviceIdentityDialog) {
+                deviceIdentityDialog.close();
+                deviceIdentityDialog = null;
+            } else {
+                const saveButton = deviceIdentityDialog?.querySelector('[data-role="identity-save"]');
+                if (saveButton) saveButton.disabled = false;
+                const feedback = deviceIdentityDialog?.querySelector('[data-role="identity-feedback"]');
+                if (feedback) {
+                    feedback.textContent = localizeActivityMessage(message.message || "Не удалось изменить ID устройства.");
+                    feedback.hidden = false;
+                }
+            }
+            if (message.success) {
+                if (message.device !== message.new_device_id) {
+                    window.AutomationBlockly?.replaceDeviceId(message.device, message.new_device_id);
+                    selectedDeviceModes.delete(message.device);
+                    if (eventDeviceFilter === message.device) eventDeviceFilter = message.new_device_id;
+                    for (const event of unreadNotifications) {
+                        if (event.device_id === message.device) event.device_id = message.new_device_id;
+                    }
+                    saveNotificationState();
+                    for (const pending of pendingCommands.values()) {
+                        if (pending.deviceId === message.device) pending.deviceId = message.new_device_id;
+                    }
+                    schemaHistoryByDevice.delete(message.device);
+                    if (openSchemaHistoryDevices.delete(message.device)) {
+                        openSchemaHistoryDevices.add(message.new_device_id);
+                    }
+                }
+            }
+            setActivity(message.message || localized("Идентификаторы устройства обновлены.", "Device identity updated."));
             break;
         }
 
@@ -1183,7 +1512,8 @@ function describeSchemaChanges(previousSchema, nextSchema) {
     const changes = [];
     const groups = [
         ["parameters", "Параметр"],
-        ["actions", "Действие"]
+        ["actions", "Действие"],
+        ["modes", "Режим"]
     ];
 
     for (const [group, label] of groups) {
@@ -1210,6 +1540,152 @@ function describeSchemaChanges(previousSchema, nextSchema) {
         changes.push("Изменились другие поля Schema");
     }
     return changes;
+}
+
+function modeActionIds(device) {
+    const ids = new Set();
+    for (const mode of Object.values(device.schema?.modes || {})) {
+        for (const actionId of Object.values(mode.operations || {})) ids.add(actionId);
+    }
+    return ids;
+}
+
+function createDeviceModeControls(device) {
+    const modes = device.schema?.modes || {};
+    const entries = Object.entries(modes);
+    const section = document.createElement("section");
+    section.className = "device-modes";
+    section.dataset.role = "device-modes";
+
+    const heading = document.createElement("strong");
+    heading.className = "device-modes-heading";
+    heading.textContent = localized("Режим работы", "Operating mode");
+
+    const label = document.createElement("label");
+    label.className = "device-mode-select-wrap";
+    const labelText = document.createElement("span");
+    labelText.textContent = localized("Сценарий устройства", "Device mode");
+    const select = document.createElement("select");
+    select.className = "device-mode-select";
+    select.dataset.role = "mode-select";
+    label.append(labelText, select);
+
+    const actions = document.createElement("div");
+    actions.className = "device-mode-actions";
+    actions.dataset.role = "mode-actions";
+
+    const status = document.createElement("p");
+    status.className = "device-mode-status";
+    status.dataset.role = "mode-status";
+
+    if (!entries.length) {
+        select.disabled = true;
+        select.setAttribute("aria-label", localized("Нет объявленных режимов", "No registered modes"));
+        status.textContent = localized("У этого устройства нет зарегистрированных режимов.", "This device has no registered modes.");
+        section.append(heading, label, actions, status);
+        return section;
+    }
+
+    for (const [modeId, definition] of entries) {
+        const option = document.createElement("option");
+        option.value = modeId;
+        option.textContent = definition.label || modeId;
+        select.append(option);
+    }
+    const storedMode = selectedDeviceModes.get(device.device);
+    const selectedModeId = modes[storedMode] ? storedMode : entries[0][0];
+    selectedDeviceModes.set(device.device, selectedModeId);
+    select.value = selectedModeId;
+    select.addEventListener("change", () => {
+        selectedDeviceModes.set(device.device, select.value);
+        updateDeviceModePanel(device);
+    });
+
+    for (const [modeId, mode] of entries) {
+        for (const [operation, actionId] of Object.entries(mode.operations || {})) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.dataset.role = "mode-operation";
+            button.dataset.modeId = modeId;
+            button.dataset.modeOperation = operation;
+            button.dataset.actionId = actionId;
+            const label = {
+                select: localized("Выбрать режим", "Select mode"),
+                enable: localized("Включить", "Enable"),
+                disable: localized("Выключить", "Disable")
+            }[operation] || operation;
+            button.dataset.baseLabel = label;
+            button.textContent = label;
+            button.title = mode.description || "";
+            button.addEventListener("click", () => {
+                const action = device.schema?.actions?.[actionId];
+                if (!action) return;
+                if (Object.keys(action.arguments || {}).length > 0) {
+                    openActionDialog(device.device, actionId, action);
+                } else {
+                    sendDeviceAction(device.device, actionId);
+                }
+            });
+            actions.append(button);
+        }
+    }
+
+    section.append(heading, label, actions, status);
+    return section;
+}
+
+function updateDeviceModePanel(device) {
+    const panel = [...(deviceCard?.querySelectorAll(".device-panel") || [])]
+        .find(item => item.dataset.deviceId === device.device);
+    const section = panel?.querySelector('[data-role="device-modes"]');
+    const select = section?.querySelector('[data-role="mode-select"]');
+    if (!section || !select) return;
+
+    const modes = device.schema?.modes || {};
+    const entries = Object.entries(modes);
+    if (!entries.length) {
+        select.disabled = true;
+        return;
+    }
+
+    let selectedModeId = selectedDeviceModes.get(device.device);
+    if (!modes[selectedModeId]) {
+        selectedModeId = entries[0][0];
+        selectedDeviceModes.set(device.device, selectedModeId);
+    }
+    select.value = selectedModeId;
+    select.disabled = !device.connected || !isGatewayConnected() || Boolean(device.pending_schema);
+
+    const definition = modes[selectedModeId];
+    const status = section.querySelector('[data-role="mode-status"]');
+    if (definition.status_parameter && status) {
+        const currentValue = device.parameters?.[definition.status_parameter];
+        status.textContent = currentValue === undefined
+            ? localized("Состояние режима: неизвестно", "Mode status: unknown")
+            : Object.is(currentValue, definition.status_value)
+                ? localized(`Активен режим «${definition.label || selectedModeId}»`, `Mode “${definition.label || selectedModeId}” is active`)
+                : localized(`Режим «${definition.label || selectedModeId}» не активен`, `Mode “${definition.label || selectedModeId}” is inactive`);
+        status.hidden = false;
+    } else if (status) {
+        status.hidden = false;
+        status.textContent = definition.description || "";
+    }
+
+    for (const button of section.querySelectorAll('[data-role="mode-operation"]')) {
+        const visible = button.dataset.modeId === selectedModeId;
+        button.hidden = !visible;
+        if (!visible) continue;
+        const actionId = button.dataset.actionId;
+        const pending = [...pendingCommands.values()].find(command =>
+            command.deviceId === device.device && command.actionId === actionId
+        );
+        button.textContent = pending
+            ? pending.status === "queued"
+                ? localized(`В очереди: ${button.dataset.baseLabel}`, `Queued: ${button.dataset.baseLabel}`)
+                : localized(`Ожидаем: ${button.dataset.baseLabel}…`, `Waiting: ${button.dataset.baseLabel}…`)
+            : button.dataset.baseLabel;
+        button.disabled = !device.connected || !isGatewayConnected() || Boolean(device.pending_schema) || Boolean(pending);
+    }
 }
 
 function createSchemaReview(device) {
@@ -1548,7 +2024,7 @@ function renderDevices() {
         const titleBlock = document.createElement("div");
 
         const title = document.createElement("h3");
-        title.textContent = device.name || device.device;
+        title.textContent = device.display_name || device.name || device.device;
 
         const subtitle = document.createElement("p");
         subtitle.className = "device-id";
@@ -1575,6 +2051,13 @@ function renderDevices() {
 
         const headerActions = document.createElement("div");
         headerActions.className = "device-header-actions";
+        const editIdentity = document.createElement("button");
+        editIdentity.type = "button";
+        editIdentity.className = "device-identity-button";
+        editIdentity.textContent = localized("Изменить", "Edit");
+        editIdentity.setAttribute("aria-label", localized("Изменить имя и ID", "Edit name and ID"));
+        editIdentity.title = localized("Изменить отображаемое имя и ID Gateway", "Edit the display name and Gateway ID");
+        editIdentity.addEventListener("click", () => openDeviceIdentityDialog(device));
         const forget = document.createElement("button");
         forget.type = "button";
         forget.className = "device-forget-button";
@@ -1593,7 +2076,7 @@ function renderDevices() {
             )) return;
             sendGatewayAction("forget_device", { device: device.device });
         });
-        headerActions.append(badge, forget);
+        headerActions.append(editIdentity, badge, forget);
 
         heading.append(icon, titleBlock, headerActions);
         panel.appendChild(heading);
@@ -1723,8 +2206,11 @@ function renderDevices() {
             panel.appendChild(parameter);
         }
 
+        panel.appendChild(createDeviceModeControls(device));
+
         const actions = device.schema?.actions || {};
-        const availableActions = Object.entries(actions);
+        const modeActions = modeActionIds(device);
+        const availableActions = Object.entries(actions).filter(([actionId]) => !modeActions.has(actionId));
         if (availableActions.length > 0) {
             const actionList = document.createElement("div");
             actionList.className = "device-actions";
@@ -1850,6 +2336,8 @@ function updateDevicePanel(device) {
             Boolean(device.pending_schema) ||
             hasPendingAction(device.device, button.dataset.actionId);
     }
+
+    updateDeviceModePanel(device);
 
     const forgetButton = panel.querySelector('[data-role="forget-device"]');
     if (forgetButton) forgetButton.disabled = !isGatewayConnected();
@@ -2020,7 +2508,10 @@ function getEventDescription(event) {
             : "";
         const errorText = command.error ? ` — ${command.error}` : "";
 
-        return `${operationLabel}: ${requestedValue}, ${status}${actualText}${errorText}`;
+        const sourceLabel = command.command_id?.startsWith("auto-")
+            ? localized("Автоматизация · ", "Automation · ")
+            : "";
+        return `${sourceLabel}${operationLabel}: ${requestedValue}, ${status}${actualText}${errorText}`;
     }
 
     if (event.event_type === "parameter") {
@@ -2519,6 +3010,116 @@ function createActionArgumentInput(definition) {
     }
 
     return input;
+}
+
+function openDeviceIdentityDialog(device) {
+    const dialog = document.createElement("dialog");
+    dialog.className = "action-dialog device-identity-dialog";
+    const form = document.createElement("form");
+    form.className = "action-dialog-form";
+    form.addEventListener("submit", event => event.preventDefault());
+
+    const heading = document.createElement("h3");
+    heading.textContent = localized("Имя и ID устройства", "Device name and ID");
+    form.append(heading);
+
+    const nameLabel = document.createElement("label");
+    nameLabel.className = "action-argument";
+    nameLabel.textContent = localized("Отображаемое имя", "Display name");
+    const nameInput = document.createElement("input");
+    nameInput.className = "device-identity-input";
+    nameInput.type = "text";
+    nameInput.maxLength = 60;
+    nameInput.value = device.display_name || "";
+    nameInput.placeholder = device.name || localized("Например, Лампа в гостиной", "For example, Living room lamp");
+    nameLabel.append(nameInput);
+    form.append(nameLabel);
+
+    const idLabel = document.createElement("label");
+    idLabel.className = "action-argument";
+    idLabel.textContent = localized("ID Gateway (используется в Blockly)", "Gateway ID (used in Blockly)");
+    const idInput = document.createElement("input");
+    idInput.className = "device-identity-input";
+    idInput.type = "text";
+    idInput.required = true;
+    idInput.maxLength = 64;
+    idInput.pattern = "[A-Za-z][A-Za-z0-9_-]{0,63}";
+    idInput.autocomplete = "off";
+    idInput.autocapitalize = "off";
+    idInput.spellcheck = false;
+    idInput.value = device.device;
+    idInput.disabled = device.connected;
+    idInput.addEventListener("input", () => {
+        idInput.setCustomValidity("");
+        const feedback = dialog.querySelector('[data-role="identity-feedback"]');
+        if (feedback) feedback.hidden = true;
+    });
+    idLabel.append(idInput);
+    form.append(idLabel);
+
+    const help = document.createElement("p");
+    help.className = "device-identity-help";
+    help.textContent = device.connected
+        ? localized("Чтобы изменить ID, сначала отключите устройство. Новое имя можно сохранить и сейчас.", "Disconnect the device before changing its ID. You can still save a new name now.")
+        : localized("ID уникален, содержит только английские буквы, цифры, дефис и подчёркивание. Blockly использует именно этот ID; Gateway запомнит связь с ID из прошивки.", "The unique ID uses English letters, digits, hyphens, and underscores. Blockly uses this ID; Gateway keeps its link to the firmware ID.");
+    form.append(help);
+
+    const feedback = document.createElement("p");
+    feedback.className = "device-identity-feedback";
+    feedback.dataset.role = "identity-feedback";
+    feedback.hidden = true;
+    feedback.setAttribute("aria-live", "polite");
+    form.append(feedback);
+
+    const buttons = document.createElement("div");
+    buttons.className = "action-dialog-buttons";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.dataset.role = "identity-save";
+    save.textContent = localized("Сохранить", "Save");
+    save.addEventListener("click", () => {
+        if (!idInput.checkValidity()) {
+            idInput.reportValidity();
+            return;
+        }
+        const nextId = device.connected ? device.device : idInput.value.trim();
+        const duplicate = devices.some(item =>
+            item.device !== device.device && item.device.toLowerCase() === nextId.toLowerCase()
+        );
+        if (duplicate) {
+            idInput.setCustomValidity(localized("Такой ID уже используется.", "This ID is already in use."));
+            idInput.reportValidity();
+            return;
+        }
+        idInput.setCustomValidity("");
+        if (sendGatewayAction("update_device_identity", {
+            device: device.device,
+            new_device_id: nextId,
+            display_name: nameInput.value.trim()
+        })) {
+            save.disabled = true;
+        }
+    });
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "secondary-button";
+    cancel.textContent = localized("Отмена", "Cancel");
+    cancel.addEventListener("click", () => dialog.close());
+    buttons.append(save, cancel);
+    form.append(buttons);
+    dialog.append(form);
+    dialog.addEventListener("close", () => {
+        dialog.remove();
+        if (deviceIdentityDialog === dialog) deviceIdentityDialog = null;
+    }, { once: true });
+    document.body.append(dialog);
+    deviceIdentityDialog = dialog;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else {
+        dialog.remove();
+        deviceIdentityDialog = null;
+        setActivity(localized("Браузер не поддерживает диалог изменения устройства.", "This browser does not support the device identity dialog."));
+    }
 }
 
 function openActionDialog(deviceId, actionId, definition) {

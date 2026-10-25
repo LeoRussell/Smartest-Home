@@ -17,6 +17,7 @@ for stream in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
+# py -m http.server 8080 --directory web
 
 # =========================
 # НАСТРОЙКИ
@@ -39,6 +40,7 @@ DB_PATH = Path(DB_PATH_VALUE).expanduser()
 
 # Активные ESP32: device_id -> WebSocket
 devices = {}
+device_wire_ids = {}
 
 # Подключённые браузеры
 browser_clients = set()
@@ -47,12 +49,16 @@ browser_clients = set()
 device_states = {}
 device_metadata = {}
 last_device_heartbeat = {}
+fresh_device_parameters = {}
+deferred_connection_automations = set()
 pending_device_schemas = {}
 deferred_device_schemas = {}
 pending_device_connections = {}
 
 # Команды, ожидающие результата: command_id -> контекст команды.
 pending_commands = {}
+automation_tasks = {}
+automation_stop_requests = set()
 COMMAND_TIMEOUT_SECONDS = 5
 EVENTS_PAGE_SIZE = 30
 DEVICE_STALE_SECONDS = 45
@@ -145,6 +151,32 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS automations (
+                automation_id TEXT PRIMARY KEY,
+                config_json TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_triggered_at TEXT,
+                run_status TEXT NOT NULL DEFAULT 'idle',
+                last_run_status TEXT,
+                last_error TEXT
+            )
+        """)
+        automation_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(automations)").fetchall()
+        }
+        for column, column_type in {
+            "run_status": "TEXT NOT NULL DEFAULT 'idle'",
+            "last_run_status": "TEXT",
+            "last_error": "TEXT"
+        }.items():
+            if column not in automation_columns:
+                conn.execute(f"ALTER TABLE automations ADD COLUMN {column} {column_type}")
+        conn.execute(
+            "UPDATE automations SET run_status = 'idle' WHERE run_status = 'running'"
+        )
+        conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_command_queue_device_status
             ON command_queue (device_id, status)
         """)
@@ -155,6 +187,8 @@ def init_db():
         }
         metadata_columns = {
             "name": "TEXT",
+            "display_name": "TEXT",
+            "firmware_id": "TEXT",
             "protocol_version": "INTEGER",
             "firmware_version": "TEXT",
             "command_dedup": "INTEGER DEFAULT 0",
@@ -169,6 +203,15 @@ def init_db():
                 conn.execute(
                     f"ALTER TABLE devices ADD COLUMN {column} {column_type}"
                 )
+
+        conn.execute(
+            "UPDATE devices SET firmware_id = device_id WHERE firmware_id IS NULL"
+        )
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_firmware_id
+            ON devices (firmware_id)
+            WHERE firmware_id IS NOT NULL
+        """)
 
         conn.execute("UPDATE devices SET connected = 0")
 
@@ -290,6 +333,9 @@ def get_database_stats():
         command_record_count = conn.execute(
             "SELECT COUNT(*) FROM command_queue"
         ).fetchone()[0]
+        automation_count = conn.execute(
+            "SELECT COUNT(*) FROM automations"
+        ).fetchone()[0]
         runtime = conn.execute("""
             SELECT total_seconds, checkpoint_at
             FROM gateway_runtime WHERE singleton_id = 1
@@ -324,7 +370,9 @@ def get_database_stats():
         "database_size_bytes": database_size_bytes,
         "record_count": (
             device_count + event_count + schema_snapshot_count + command_record_count
+            + automation_count
         ),
+        "automation_count": automation_count,
         "device_count": device_count,
         "ever_connected_device_count": ever_connected_device_count,
         "connected_device_count": len(devices),
@@ -635,6 +683,58 @@ def validate_schema(schema):
         elif "options" in definition:
             return False
 
+    modes = schema.get("modes", {})
+    if not isinstance(modes, dict) or len(modes) > 8:
+        return False
+    mode_ids = set(modes)
+    for mode_id, mode in modes.items():
+        if (
+            not isinstance(mode_id, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,47}", mode_id)
+            or not isinstance(mode, dict)
+            or not set(mode).issubset({
+                "label", "description", "operations", "status_parameter",
+                "status_value", "conflicts_with"
+            })
+        ):
+            return False
+        label = mode.get("label", mode_id)
+        description = mode.get("description", "")
+        operations = mode.get("operations")
+        if (
+            not isinstance(label, str) or not 1 <= len(label) <= 80
+            or not isinstance(description, str) or len(description) > 240
+            or not isinstance(operations, dict) or not operations
+            or len(operations) > 3
+            or not set(operations).issubset({"select", "enable", "disable"})
+        ):
+            return False
+        for action_id in operations.values():
+            if not isinstance(action_id, str) or action_id not in actions:
+                return False
+
+        has_status_parameter = "status_parameter" in mode
+        has_status_value = "status_value" in mode
+        if has_status_parameter != has_status_value:
+            return False
+        if has_status_parameter:
+            status_parameter = mode["status_parameter"]
+            status_definition = parameters.get(status_parameter) if isinstance(status_parameter, str) else None
+            if (
+                not status_definition
+                or status_definition.get("access") not in {"read_only", "read_write"}
+                or not is_schema_value(mode["status_value"], status_definition)
+            ):
+                return False
+
+        conflicts = mode.get("conflicts_with", [])
+        if (
+            not isinstance(conflicts, list) or len(conflicts) > 8
+            or any(not isinstance(item, str) or item == mode_id or item not in mode_ids for item in conflicts)
+            or len(set(conflicts)) != len(conflicts)
+        ):
+            return False
+
     return True
 
 
@@ -743,21 +843,28 @@ def save_device_metadata(device_id, metadata):
 
     with sqlite3.connect(DB_PATH) as conn:
         previous = conn.execute(
-            "SELECT schema_json, schema_version, firmware_version FROM devices WHERE device_id = ?",
+            "SELECT schema_json, schema_version, firmware_version, display_name, firmware_id FROM devices WHERE device_id = ?",
             (device_id,)
         ).fetchone()
+        if previous is not None:
+            if metadata.get("display_name") is None:
+                metadata["display_name"] = previous[3]
+            if metadata.get("firmware_id") is None:
+                metadata["firmware_id"] = previous[4]
         conn.execute("""
             INSERT INTO devices (
-                device_id, last_seen, connected, name,
+                device_id, last_seen, connected, name, display_name, firmware_id,
                 protocol_version, firmware_version, command_dedup,
                 schema_version, schema_json,
                 trust_policy
             )
-            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 last_seen = excluded.last_seen,
                 connected = 1,
                 name = excluded.name,
+                display_name = COALESCE(excluded.display_name, devices.display_name),
+                firmware_id = COALESCE(devices.firmware_id, excluded.firmware_id),
                 protocol_version = excluded.protocol_version,
                 firmware_version = excluded.firmware_version,
                 command_dedup = excluded.command_dedup,
@@ -768,6 +875,8 @@ def save_device_metadata(device_id, metadata):
             device_id,
             timestamp,
             metadata.get("name"),
+            metadata.get("display_name"),
+            metadata.get("firmware_id"),
             metadata.get("protocol_version"),
             metadata.get("firmware_version"),
             int(metadata.get("command_dedup") is True),
@@ -806,7 +915,7 @@ def load_device_metadata(device_id):
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
-            SELECT name, protocol_version, firmware_version,
+            SELECT name, display_name, firmware_id, protocol_version, firmware_version,
                    command_dedup, schema_version, schema_json, trust_policy
             FROM devices WHERE device_id = ?
             """,
@@ -825,6 +934,8 @@ def load_device_metadata(device_id):
 
     return {
         "name": row["name"],
+        "display_name": row["display_name"],
+        "firmware_id": row["firmware_id"],
         "protocol_version": row["protocol_version"],
         "firmware_version": row["firmware_version"],
         "command_dedup": bool(row["command_dedup"]),
@@ -832,6 +943,161 @@ def load_device_metadata(device_id):
         "schema": schema,
         "trust_policy": row["trust_policy"]
     }
+
+
+def resolve_device_identity(firmware_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT device_id FROM devices WHERE firmware_id = ?",
+            (firmware_id,)
+        ).fetchone()
+        if row is not None:
+            return row[0]
+
+        row = conn.execute(
+            "SELECT firmware_id FROM devices WHERE device_id = ?",
+            (firmware_id,)
+        ).fetchone()
+        if row is not None and row[0] != firmware_id:
+            conn.execute(
+                "UPDATE devices SET firmware_id = ? WHERE device_id = ?",
+                (firmware_id, firmware_id)
+            )
+            conn.commit()
+    return firmware_id
+
+
+def firmware_identity_for(device_id):
+    if device_id in device_wire_ids:
+        return device_wire_ids[device_id]
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT firmware_id FROM devices WHERE device_id = ?",
+            (device_id,)
+        ).fetchone()
+    return row[0] if row and row[0] else device_id
+
+
+def replace_device_references(value, old_id, new_id):
+    changed = False
+    if isinstance(value, list):
+        for item in value:
+            changed = replace_device_references(item, old_id, new_id) or changed
+    elif isinstance(value, dict):
+        fields = value.get("fields")
+        if isinstance(fields, dict) and fields.get("DEVICE") == old_id:
+            fields["DEVICE"] = new_id
+            changed = True
+        if value.get("name") == "DEVICE" and value.get("value") == old_id:
+            value["value"] = new_id
+            changed = True
+        for key, item in value.items():
+            if key == "device" and item == old_id:
+                value[key] = new_id
+                changed = True
+            elif isinstance(item, (dict, list)):
+                changed = replace_device_references(item, old_id, new_id) or changed
+    return changed
+
+
+def update_device_identity(device_id, new_device_id, display_name):
+    if not isinstance(device_id, str) or not isinstance(new_device_id, str):
+        return False, "Некорректный ID устройства."
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", new_device_id):
+        return False, "ID должен начинаться с английской буквы и содержать только английские буквы, цифры, дефис или подчёркивание."
+    if display_name is not None and (
+        not isinstance(display_name, str) or len(display_name) > 60
+    ):
+        return False, "Имя устройства должно быть не длиннее 60 символов."
+
+    display_name = display_name.strip() if isinstance(display_name, str) else ""
+    display_name = display_name or None
+    changing_id = device_id != new_device_id
+    if changing_id and device_id in devices:
+        return False, "Чтобы изменить ID, сначала отключите устройство."
+    if changing_id and device_id in pending_device_connections:
+        return False, "Сначала обработайте ожидающий запрос на подключение устройства."
+    if changing_id and any(task is not None and not task.done() for task in automation_tasks.values()):
+        return False, "Сначала дождитесь завершения или остановите выполняющиеся сценарии."
+    if changing_id and any(
+        pending_id != device_id and pending_id.casefold() == new_device_id.casefold()
+        for pending_id in pending_device_connections
+    ):
+        return False, "Такой ID уже запрашивает подключение."
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        existing = conn.execute(
+            "SELECT * FROM devices WHERE device_id = ?",
+            (device_id,)
+        ).fetchone()
+        if existing is None:
+            return False, "Устройство не найдено."
+
+        if changing_id:
+            collision = conn.execute("""
+                SELECT 1 FROM devices
+                WHERE (lower(device_id) = lower(?) OR lower(firmware_id) = lower(?))
+                  AND device_id != ?
+                LIMIT 1
+            """, (new_device_id, new_device_id, device_id)).fetchone()
+            if collision:
+                return False, "Такой ID уже занят другим устройством."
+
+        timestamp = current_time()
+        if changing_id:
+            conn.execute(
+                "UPDATE devices SET device_id = ?, display_name = ? WHERE device_id = ?",
+                (new_device_id, display_name, device_id)
+            )
+            for table in ("device_events", "device_schema_history", "command_queue"):
+                conn.execute(
+                    f"UPDATE {table} SET device_id = ? WHERE device_id = ?",
+                    (new_device_id, device_id)
+                )
+            automation_rows = conn.execute(
+                "SELECT automation_id, config_json FROM automations"
+            ).fetchall()
+            for row in automation_rows:
+                try:
+                    config = json.loads(row["config_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if replace_device_references(config, device_id, new_device_id):
+                    conn.execute("""
+                        UPDATE automations
+                        SET config_json = ?, updated_at = ?, last_error = NULL
+                        WHERE automation_id = ?
+                    """, (
+                        json.dumps(config, ensure_ascii=False, allow_nan=False),
+                        timestamp,
+                        row["automation_id"]
+                    ))
+        else:
+            conn.execute(
+                "UPDATE devices SET display_name = ? WHERE device_id = ?",
+                (display_name, device_id)
+            )
+        conn.commit()
+
+    metadata = device_metadata.pop(device_id, None)
+    if metadata is not None:
+        metadata["display_name"] = display_name
+        device_metadata[new_device_id] = metadata
+    for state_map in (
+        device_states, last_device_heartbeat, fresh_device_parameters,
+        pending_device_schemas, deferred_device_schemas
+    ):
+        if device_id in state_map:
+            state_map[new_device_id] = state_map.pop(device_id)
+    if device_id in deferred_connection_automations:
+        deferred_connection_automations.discard(device_id)
+        deferred_connection_automations.add(new_device_id)
+    for pending in pending_commands.values():
+        if pending.get("device") == device_id:
+            pending["device"] = new_device_id
+
+    return True, f"Имя и ID устройства обновлены. В Blockly используется ID «{new_device_id}»."
 
 
 def device_supports_command_dedup(device_id):
@@ -972,7 +1238,7 @@ def get_blocked_devices():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
-            SELECT device_id, name, last_seen
+            SELECT device_id, COALESCE(display_name, name) AS name, last_seen
             FROM devices
             WHERE trust_policy = 'deny'
             ORDER BY device_id
@@ -1127,7 +1393,9 @@ async def deliver_pending_command(pending):
         pending["attempts"] = pending.get("attempts", 0) + 1
         pending["status"] = "sent"
         update_command_queue_record(pending, "sent")
-        await send_json(websocket, pending["payload"])
+        payload = dict(pending["payload"])
+        payload["device"] = firmware_identity_for(device_id)
+        await send_json(websocket, payload)
     except Exception:
         await notify_command_queued(pending)
         return False
@@ -1546,7 +1814,7 @@ def get_all_devices():
 
         rows = conn.execute("""
             SELECT
-                device_id, last_seen, led, connected, name, state_json,
+                device_id, last_seen, led, connected, name, display_name, state_json,
                 protocol_version, firmware_version, command_dedup,
                 schema_version, schema_json,
                 trust_policy
@@ -1599,6 +1867,8 @@ def get_all_devices():
 
             metadata = {
                 "name": row["name"],
+                "display_name": row["display_name"],
+                "firmware_id": row["device_id"],
                 "protocol_version": row["protocol_version"],
                 "firmware_version": row["firmware_version"],
                 "command_dedup": bool(row["command_dedup"]),
@@ -1610,6 +1880,7 @@ def get_all_devices():
         result.append({
             "device": device_id,
             "name": metadata.get("name"),
+            "display_name": metadata.get("display_name"),
             "connected": device_id in devices,
             "last_seen": row["last_seen"],
             "parameters": parameters,
@@ -1639,6 +1910,7 @@ def get_all_devices():
             result.append({
                 "device": device_id,
                 "name": metadata.get("name"),
+                "display_name": metadata.get("display_name"),
                 "connected": True,
                 "last_seen": None,
                 "parameters": device_states.get(device_id, {}),
@@ -1767,6 +2039,9 @@ async def send_pending_command_result(pending, status, value, error):
     result_record = {"status": status, "value": value, "error": error}
     pending["status"] = status
     update_command_queue_record(pending, status, result_record, error)
+    result_future = pending.get("result_future")
+    if result_future is not None and not result_future.done():
+        result_future.set_result({"status": status, "value": value, "error": error})
     deferred_state_events = pending.pop("deferred_state_events", [])
     for state_event in deferred_state_events:
         is_confirmed_command_state = (
@@ -1851,6 +2126,16 @@ async def expire_pending_command(command_id):
     if pending.get("attempts", 0) < COMMAND_RETRY_LIMIT:
         if await deliver_pending_command(pending):
             return
+    if pending.get("automation_id"):
+        pending = remove_pending_command(command_id)
+        if pending is not None:
+            await send_pending_command_result(
+                pending,
+                "timeout",
+                pending["operation"].get("value"),
+                "Автоматизация остановлена: устройство не подтвердило действие после повторных попыток."
+            )
+        return
     await notify_command_queued(pending)
 
 
@@ -1866,6 +2151,16 @@ async def finish_pending_commands_for_device(
     for command_id in command_ids:
         pending = pending_commands.get(command_id)
         if pending is None:
+            continue
+        if pending.get("automation_id"):
+            pending = remove_pending_command(command_id)
+            if pending is not None:
+                await send_pending_command_result(
+                    pending,
+                    status,
+                    pending["operation"].get("value"),
+                    error
+                )
             continue
         if retry:
             if not device_supports_command_dedup(device_id):
@@ -1909,7 +2204,9 @@ async def dispatch_device_command(
     parameter,
     value,
     browser=None,
-    requested_command_id=None
+    requested_command_id=None,
+    wait_for_result=False,
+    automation_id=None
 ):
     async def reject(message, command_id=requested_command_id):
         if browser is None:
@@ -1995,7 +2292,9 @@ async def dispatch_device_command(
         "attempts": 0,
         "status": "queued",
         "timeout_task": None,
-        "sending": False
+        "sending": False,
+        "automation_id": automation_id,
+        "result_future": asyncio.get_running_loop().create_future() if wait_for_result else None
     }
     try:
         create_command_queue_record(pending)
@@ -2006,7 +2305,7 @@ async def dispatch_device_command(
     await deliver_pending_command(pending)
 
     print(f"[КОМАНДА] {device_id}: {parameter} = {value} ({command_id})")
-    return True
+    return pending["result_future"] if wait_for_result else True
 
 
 async def dispatch_device_action(
@@ -2014,7 +2313,9 @@ async def dispatch_device_action(
     action,
     arguments=None,
     browser=None,
-    requested_command_id=None
+    requested_command_id=None,
+    wait_for_result=False,
+    automation_id=None
 ):
     async def reject(message, command_id=requested_command_id):
         if browser is None:
@@ -2092,7 +2393,9 @@ async def dispatch_device_action(
         "attempts": 0,
         "status": "queued",
         "timeout_task": None,
-        "sending": False
+        "sending": False,
+        "automation_id": automation_id,
+        "result_future": asyncio.get_running_loop().create_future() if wait_for_result else None
     }
     try:
         create_command_queue_record(pending)
@@ -2103,12 +2406,710 @@ async def dispatch_device_action(
     await deliver_pending_command(pending)
     if browser is None:
         print(f"Действие отправлено: {device_id} — {definition.get('label', action)}")
+    return pending["result_future"] if wait_for_result else True
+
+
+def get_automations():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT automation_id, config_json, enabled, created_at,
+                   updated_at, last_triggered_at, run_status,
+                   last_run_status, last_error
+            FROM automations ORDER BY created_at, automation_id
+        """).fetchall()
+    result = []
+    for automation_id, config_json, enabled, created, updated, triggered, run_status, last_run_status, last_error in rows:
+        try:
+            config = json.loads(config_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        result.append({
+            "automation_id": automation_id,
+            "config": config,
+            "enabled": bool(enabled),
+            "created_at": created,
+            "updated_at": updated,
+            "last_triggered_at": triggered,
+            "run_status": run_status,
+            "last_run_status": last_run_status,
+            "last_error": last_error
+        })
+    return result
+
+
+def automation_device_metadata(device_id):
+    if not isinstance(device_id, str) or not 1 <= len(device_id) <= 64:
+        return None
+    return device_metadata.get(device_id) or load_device_metadata(device_id)
+
+
+def validate_automation_program(program):
+    if not isinstance(program, dict) or set(program) != {"version", "trigger", "body"} or program.get("version") != 1:
+        return "Некорректный формат программы автоматизации."
+    trigger = program.get("trigger")
+    body = program.get("body")
+    if not isinstance(trigger, dict) or not isinstance(body, list) or not body:
+        return "В сценарии нужен блок запуска и хотя бы одно действие."
+    trigger_type = trigger.get("type")
+    if not isinstance(trigger_type, str):
+        return "Неизвестный тип триггера сценария."
+    if trigger_type == "parameter_changed":
+        if set(trigger) != {"type", "device", "parameter"}:
+            return "Некорректный триггер изменения параметра."
+        device_id = trigger.get("device")
+        parameter_id = trigger.get("parameter")
+        if not isinstance(device_id, str) or not isinstance(parameter_id, str):
+            return "Триггер ссылается на неизвестный параметр устройства."
+        metadata = automation_device_metadata(device_id)
+        parameter = metadata.get("schema", {}).get("parameters", {}).get(parameter_id) if metadata else None
+        if parameter is None or parameter.get("access") not in {"read_only", "read_write"} or parameter.get("type") == "json":
+            return "Триггер ссылается на неизвестный параметр устройства."
+    elif trigger_type in {"device_connected", "device_disconnected"}:
+        if set(trigger) != {"type", "device"} or automation_device_metadata(trigger.get("device")) is None:
+            return "Триггер ссылается на неизвестное устройство."
+    elif trigger_type == "gateway_started":
+        if set(trigger) != {"type"}:
+            return "Некорректный триггер запуска Gateway."
+    else:
+        return "Неизвестный тип триггера сценария."
+
+    node_count = [0]
+
+    def count_node(depth):
+        node_count[0] += 1
+        if depth > 20 or node_count[0] > 200:
+            raise ValueError("Сценарий слишком большой или глубоко вложенный.")
+
+    def expression_type(expression, depth=0):
+        count_node(depth)
+        if not isinstance(expression, dict):
+            raise ValueError("Некорректное выражение условия.")
+        kind = expression.get("type")
+        if not isinstance(kind, str):
+            raise ValueError("Неизвестный тип выражения.")
+        if kind == "constant":
+            if set(expression) != {"type", "value"}:
+                raise ValueError("Некорректное значение в условии.")
+            value = expression["value"]
+            if value is None:
+                return "null"
+            if type(value) is bool:
+                return "boolean"
+            if type(value) is int:
+                return "integer"
+            if type(value) is float and math.isfinite(value):
+                return "number"
+            if isinstance(value, str) and len(value) <= 1024:
+                return "string"
+            raise ValueError("Значение в условии имеет неподдерживаемый тип.")
+        if kind == "parameter":
+            if set(expression) != {"type", "device", "parameter"}:
+                raise ValueError("Некорректная ссылка на параметр.")
+            device_id = expression.get("device")
+            parameter_id = expression.get("parameter")
+            if not isinstance(device_id, str) or not isinstance(parameter_id, str):
+                raise ValueError("Выражение ссылается на недоступный параметр.")
+            metadata = automation_device_metadata(device_id)
+            definition = metadata.get("schema", {}).get("parameters", {}).get(parameter_id) if metadata else None
+            if definition is None or definition.get("access") not in {"read_only", "read_write"} or definition.get("type") == "json":
+                raise ValueError("Выражение ссылается на недоступный параметр.")
+            return definition.get("type")
+        if kind == "device_connected":
+            if set(expression) != {"type", "device"} or automation_device_metadata(expression.get("device")) is None:
+                raise ValueError("Проверка соединения ссылается на неизвестное устройство.")
+            return "boolean"
+        if kind == "arithmetic":
+            operator = expression.get("operator")
+            if set(expression) != {"type", "operator", "left", "right"} or not isinstance(operator, str) or operator not in {"add", "subtract", "multiply", "divide", "power"}:
+                raise ValueError("Некорректный блок вычисления.")
+            left_type = expression_type(expression.get("left"), depth + 1)
+            right_type = expression_type(expression.get("right"), depth + 1)
+            if left_type not in {"integer", "number"} or right_type not in {"integer", "number"}:
+                raise ValueError("Вычисление принимает только числа.")
+            return "number"
+        if kind == "not":
+            if set(expression) != {"type", "operand"} or expression_type(expression.get("operand"), depth + 1) != "boolean":
+                raise ValueError("Блок НЕ должен получать логическое значение.")
+            return "boolean"
+        if kind in {"and", "or"}:
+            operands = expression.get("operands")
+            if set(expression) != {"type", "operands"} or not isinstance(operands, list) or not 2 <= len(operands) <= 16:
+                raise ValueError("Блок И/ИЛИ должен содержать от 2 до 16 условий.")
+            if any(expression_type(operand, depth + 1) != "boolean" for operand in operands):
+                raise ValueError("Блок И/ИЛИ принимает только логические значения.")
+            return "boolean"
+        if kind == "compare":
+            operator = expression.get("operator")
+            if set(expression) != {"type", "operator", "left", "right"} or not isinstance(operator, str) or operator not in {"eq", "ne", "lt", "le", "gt", "ge"}:
+                raise ValueError("Некорректный блок сравнения.")
+            left_type = expression_type(expression.get("left"), depth + 1)
+            right_type = expression_type(expression.get("right"), depth + 1)
+            comparable = (
+                left_type == right_type
+                or {left_type, right_type} <= {"integer", "number"}
+                or "enum" in {left_type, right_type} and (left_type in {"enum", "string", "integer", "number", "boolean"} and right_type in {"enum", "string", "integer", "number", "boolean"})
+            )
+            if not comparable:
+                raise ValueError("Нельзя сравнить значения разных типов.")
+            if expression["operator"] not in {"eq", "ne"} and left_type in {"boolean", "enum", "null"}:
+                raise ValueError("Для этого типа допустима только проверка равенства.")
+            return "boolean"
+        raise ValueError("Неизвестный тип выражения.")
+
+    def validate_statements(statements, depth=0):
+        if not isinstance(statements, list) or len(statements) > 100:
+            raise ValueError("Слишком много действий в одной ветке.")
+        for statement in statements:
+            count_node(depth)
+            if not isinstance(statement, dict):
+                raise ValueError("Некорректный блок действия.")
+            kind = statement.get("type")
+            if kind == "set_parameter":
+                if set(statement) != {"type", "device", "parameter", "value"}:
+                    raise ValueError("Некорректный блок установки параметра.")
+                metadata = automation_device_metadata(statement.get("device"))
+                definition = metadata.get("schema", {}).get("parameters", {}).get(statement.get("parameter")) if metadata else None
+                if not definition or definition.get("access") != "read_write":
+                    raise ValueError("Действие ссылается на неизвестный или доступный только для чтения параметр.")
+                value = statement.get("value")
+                value_type = expression_type(value, depth + 1)
+                if value.get("type") == "constant":
+                    raw_value = value.get("value")
+                    if not is_schema_value(raw_value, definition) or not value_within_schema_limits(raw_value, definition):
+                        raise ValueError("Значение команды не соответствует Schema параметра.")
+                elif value_type not in {definition.get("type"), "integer" if definition.get("type") == "number" else ""}:
+                    if definition.get("type") != "enum" or value_type not in {"enum", "string", "integer", "number", "boolean"}:
+                        raise ValueError("Тип значения команды не совпадает со Schema параметра.")
+            elif kind == "invoke_action":
+                if set(statement) != {"type", "device", "action", "arguments"}:
+                    raise ValueError("Некорректный блок вызова действия.")
+                metadata = automation_device_metadata(statement.get("device"))
+                definition = metadata.get("schema", {}).get("actions", {}).get(statement.get("action")) if metadata else None
+                arguments = statement.get("arguments")
+                if not definition or not isinstance(arguments, dict) or not validate_action_arguments(definition, arguments):
+                    raise ValueError("Вызов действия или его аргументы не соответствуют Schema.")
+            elif kind == "wait":
+                seconds = statement.get("seconds")
+                if (
+                    set(statement) != {"type", "seconds"}
+                    or type(seconds) not in (int, float)
+                    or not math.isfinite(seconds)
+                    or not 0 <= seconds <= 3600
+                ):
+                    raise ValueError("Пауза должна быть числом от 0 до 3600 секунд.")
+            elif kind == "if":
+                if set(statement) != {"type", "branches", "else"}:
+                    raise ValueError("Некорректный блок ЕСЛИ.")
+                branches = statement.get("branches")
+                if not isinstance(branches, list) or not 1 <= len(branches) <= 6:
+                    raise ValueError("Блок ЕСЛИ должен содержать от 1 до 6 ветвей.")
+                for branch in branches:
+                    count_node(depth + 1)
+                    if not isinstance(branch, dict) or set(branch) != {"condition", "then"} or expression_type(branch.get("condition"), depth + 2) != "boolean":
+                        raise ValueError("Условие ветки ЕСЛИ должно возвращать логическое значение.")
+                    validate_statements(branch.get("then"), depth + 2)
+                validate_statements(statement.get("else"), depth + 1)
+            else:
+                raise ValueError("Неизвестный тип действия в сценарии.")
+
+    try:
+        if not 1 <= len(body) <= 100:
+            return "В программе должно быть от 1 до 100 блоков действий."
+        validate_statements(body)
+    except (TypeError, ValueError, KeyError) as error:
+        return str(error)
+    return None
+
+
+def validate_automation_config(config):
+    if isinstance(config, dict) and config.get("version") == 2:
+        if set(config) != {"version", "name", "workspace", "program"}:
+            return "Некорректная структура сценария."
+        name = config.get("name")
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+            return "Укажите название сценария длиной от 1 до 80 символов."
+        try:
+            serialized = json.dumps(config, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError):
+            return "Сценарий содержит некорректные данные."
+        if len(serialized.encode("utf-8")) > 48 * 1024:
+            return "Сценарий слишком большой (лимит 48 КБ)."
+        workspace_state = config.get("workspace")
+        if not isinstance(workspace_state, dict) or not isinstance(workspace_state.get("blocks"), dict):
+            return "Не удалось сохранить блоки редактора."
+        return validate_automation_program(config.get("program"))
+    if not isinstance(config, dict) or set(config) != {"name", "trigger", "target"}:
+        return "Некорректная структура сценария."
+    name = config.get("name")
+    trigger = config.get("trigger")
+    target = config.get("target")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
+        return "Укажите название сценария длиной от 1 до 80 символов."
+    if (
+        not isinstance(trigger, dict)
+        or set(trigger) != {"device", "parameter", "operator", "threshold"}
+        or not isinstance(target, dict)
+    ):
+        return "Добавьте блок условия и блок действия."
+
+    source_id = trigger.get("device")
+    parameter = trigger.get("parameter")
+    operator = trigger.get("operator")
+    threshold = trigger.get("threshold")
+    source_metadata = (
+        device_metadata.get(source_id) or load_device_metadata(source_id)
+        if isinstance(source_id, str) else None
+    )
+    if (
+        not isinstance(source_id, str) or source_metadata is None
+        or not isinstance(parameter, str)
+        or not isinstance(operator, str)
+        or operator not in {"above", "at_least", "below", "at_most"}
+        or type(threshold) not in (int, float)
+        or not math.isfinite(threshold)
+    ):
+        return "Проверьте устройство, датчик и порог в блоке условия."
+    source_schema = source_metadata.get("schema", {})
+    sensor = source_schema.get("parameters", {}).get(parameter)
+    if not sensor or sensor.get("access") != "read_only" or sensor.get("type") not in {"integer", "number"}:
+        return "Условие можно строить только по числовому датчику, доступному для чтения."
+    if (
+        (sensor.get("type") == "integer" and type(threshold) is not int)
+        or ("min" in sensor and threshold < sensor["min"])
+        or ("max" in sensor and threshold > sensor["max"])
+    ):
+        return "Порог не соответствует типу и диапазону датчика."
+
+    target_id = target.get("device")
+    kind = target.get("kind")
+    operation_name = target.get("name")
+    if not isinstance(operation_name, str):
+        return "Выберите параметр или режим в блоке действия."
+    target_metadata = (
+        device_metadata.get(target_id) or load_device_metadata(target_id)
+        if isinstance(target_id, str) else None
+    )
+    if not isinstance(target_id, str) or target_metadata is None:
+        return "Выберите известное Gateway целевое устройство."
+    if target_id in pending_device_schemas:
+        return "Сначала примите или отклоните ожидающее изменение Schema целевого устройства."
+    schema = target_metadata.get("schema", {})
+    if kind == "parameter":
+        definition = schema.get("parameters", {}).get(operation_name)
+        value = target.get("value")
+        if (
+            not definition or definition.get("access") != "read_write"
+            or not is_schema_value(value, definition)
+            or not value_within_schema_limits(value, definition)
+            or set(target) != {"device", "kind", "name", "value"}
+        ):
+            return "Значение блока действия не соответствует доступным параметрам Schema."
+    elif kind == "action":
+        definition = schema.get("actions", {}).get(operation_name)
+        arguments = target.get("arguments", {})
+        if (
+            not definition or not isinstance(arguments, dict)
+            or not validate_action_arguments(definition, arguments)
+            or set(target) != {"device", "kind", "name", "arguments"}
+        ):
+            return "Параметры режима не соответствуют его Schema."
+    else:
+        return "Неизвестный тип блока действия."
+    return None
+
+
+def save_automation(automation_id, config, enabled=True):
+    error = validate_automation_config(config)
+    if error:
+        return False, error
+    now = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM automations WHERE automation_id = ?", (automation_id,)
+        ).fetchone()
+        if exists:
+            conn.execute("""
+                UPDATE automations SET config_json = ?, enabled = ?, updated_at = ?,
+                       last_run_status = NULL, last_error = NULL
+                WHERE automation_id = ?
+            """, (json.dumps(config, ensure_ascii=False, allow_nan=False),
+                  int(enabled), now, automation_id))
+        else:
+            conn.execute("""
+                INSERT INTO automations
+                    (automation_id, config_json, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (automation_id, json.dumps(config, ensure_ascii=False, allow_nan=False),
+                  int(enabled), now, now))
+    return True, "Сценарий сохранён."
+
+
+class AutomationExecutionError(Exception):
+    pass
+
+
+class AutomationStoppedError(AutomationExecutionError):
+    pass
+
+
+def device_is_connected(device_id):
+    heartbeat = last_device_heartbeat.get(device_id)
+    return (
+        device_id in devices
+        and heartbeat is not None
+        and asyncio.get_running_loop().time() - heartbeat <= DEVICE_STALE_SECONDS
+    )
+
+
+def evaluate_automation_expression(expression):
+    kind = expression["type"]
+    if kind == "constant":
+        return expression["value"]
+    if kind == "device_connected":
+        return device_is_connected(expression["device"])
+    if kind == "parameter":
+        device_id = expression["device"]
+        if not device_is_connected(device_id):
+            raise AutomationExecutionError(f"Устройство {device_id} отключено.")
+        parameter = expression["parameter"]
+        if parameter not in fresh_device_parameters.get(device_id, set()):
+            raise AutomationExecutionError(f"Значение {device_id}.{parameter} ещё не обновлялось в этой сессии Gateway.")
+        if parameter not in device_states.get(device_id, {}):
+            raise AutomationExecutionError(f"Нет актуального значения параметра {device_id}.{parameter}.")
+        value = device_states[device_id][parameter]
+        definition = (device_metadata.get(device_id) or load_device_metadata(device_id) or {}).get("schema", {}).get("parameters", {}).get(parameter)
+        if not definition or not is_schema_value(value, definition) or not value_within_schema_limits(value, definition):
+            raise AutomationExecutionError(f"Текущее значение {device_id}.{parameter} не соответствует Schema.")
+        return value
+    if kind == "not":
+        return not evaluate_automation_expression(expression["operand"])
+    if kind == "and":
+        return all(evaluate_automation_expression(item) for item in expression["operands"])
+    if kind == "or":
+        return any(evaluate_automation_expression(item) for item in expression["operands"])
+    if kind == "compare":
+        left = evaluate_automation_expression(expression["left"])
+        right = evaluate_automation_expression(expression["right"])
+        if type(left) is not type(right) and not (
+            type(left) in (int, float) and type(right) in (int, float)
+        ):
+            return False
+        operator = expression["operator"]
+        if operator == "eq": return left == right
+        if operator == "ne": return left != right
+        if operator == "lt": return left < right
+        if operator == "le": return left <= right
+        if operator == "gt": return left > right
+        if operator == "ge": return left >= right
+    if kind == "arithmetic":
+        operator = expression["operator"]
+        try:
+            left = float(evaluate_automation_expression(expression["left"]))
+            right = float(evaluate_automation_expression(expression["right"]))
+            if operator == "add": result = left + right
+            elif operator == "subtract": result = left - right
+            elif operator == "multiply": result = left * right
+            elif operator == "divide": result = left / right
+            elif operator == "power": result = left ** right
+            else: raise AutomationExecutionError("Неизвестная арифметическая операция.")
+        except (OverflowError, ZeroDivisionError, ValueError, TypeError) as error:
+            raise AutomationExecutionError("Не удалось вычислить числовое выражение.") from error
+        if type(result) not in (int, float) or not math.isfinite(result) or abs(result) > 1e100:
+            raise AutomationExecutionError("Результат вычисления выходит за допустимый диапазон.")
+        return result
+    raise AutomationExecutionError("В программе встретилось неподдерживаемое выражение.")
+
+
+async def execute_automation_statements(automation_id, statements):
+    for statement in statements:
+        if automation_id in automation_stop_requests:
+            raise AutomationStoppedError("Остановлено пользователем.")
+        if statement["type"] == "if":
+            branch_taken = False
+            for branch in statement["branches"]:
+                if evaluate_automation_expression(branch["condition"]):
+                    await execute_automation_statements(automation_id, branch["then"])
+                    branch_taken = True
+                    break
+            if not branch_taken:
+                await execute_automation_statements(automation_id, statement["else"])
+            continue
+
+        if statement["type"] == "wait":
+            deadline = asyncio.get_running_loop().time() + statement["seconds"]
+            while True:
+                if automation_id in automation_stop_requests:
+                    raise AutomationStoppedError("Остановлено пользователем во время паузы.")
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(remaining, 0.25))
+            continue
+
+        device_id = statement["device"]
+        if not device_is_connected(device_id):
+            raise AutomationExecutionError(f"Целевое устройство {device_id} недоступно.")
+        command_id = f"auto-{automation_id[:24]}-{uuid.uuid4().hex[:16]}"
+        if statement["type"] == "set_parameter":
+            value = evaluate_automation_expression(statement["value"])
+            result_future = await dispatch_device_command(
+                device_id, statement["parameter"], value,
+                requested_command_id=command_id,
+                wait_for_result=True,
+                automation_id=automation_id
+            )
+        else:
+            result_future = await dispatch_device_action(
+                device_id, statement["action"], statement["arguments"],
+                requested_command_id=command_id,
+                wait_for_result=True,
+                automation_id=automation_id
+            )
+        if result_future is False:
+            raise AutomationExecutionError(f"Gateway не смог отправить команду устройству {device_id}.")
+        try:
+            result = await asyncio.wait_for(
+                result_future,
+                timeout=COMMAND_TIMEOUT_SECONDS * (COMMAND_RETRY_LIMIT + 2)
+            )
+        except asyncio.TimeoutError as error:
+            raise AutomationExecutionError(f"Gateway не дождался результата от {device_id}.") from error
+        if result.get("status") != "succeeded":
+            raise AutomationExecutionError(result.get("error") or f"Устройство {device_id} не выполнило действие.")
+        if automation_id in automation_stop_requests:
+            raise AutomationStoppedError("Остановлено пользователем после текущего действия.")
+
+
+async def publish_automation_list():
+    await broadcast({"type": "automation_list", "automations": get_automations()})
+
+
+def start_automation_run(automation_id, config, reason):
+    existing_task = automation_tasks.get(automation_id)
+    if existing_task is not None and not existing_task.done():
+        return False
+    now = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            UPDATE automations SET run_status = 'running', last_error = NULL,
+                   last_triggered_at = ? WHERE automation_id = ? AND enabled = 1
+        """, (now, automation_id))
+        if conn.total_changes == 0:
+            return False
+    automation_tasks[automation_id] = asyncio.create_task(
+        execute_automation_run(automation_id, config, reason)
+    )
+    asyncio.create_task(publish_automation_list())
     return True
+
+
+async def execute_automation_run(automation_id, config, reason):
+    error_text = None
+    status = "succeeded"
+    try:
+        validation_error = validate_automation_config(config)
+        if validation_error:
+            raise AutomationExecutionError(f"Schema изменилась: {validation_error}")
+        await execute_automation_statements(automation_id, config["program"]["body"])
+        print(f"[АВТОМАТИЗАЦИЯ] {config['name']} выполнена ({reason})")
+    except AutomationStoppedError as error:
+        status = "stopped"
+        error_text = str(error)
+    except Exception as error:
+        status = "failed"
+        error_text = str(error)
+        print(f"[АВТОМАТИЗАЦИЯ] Ошибка в {config.get('name', automation_id)}: {error_text}")
+    finally:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("""
+                UPDATE automations SET run_status = 'idle', last_run_status = ?,
+                       last_error = ? WHERE automation_id = ?
+            """, (status, error_text, automation_id))
+        automation_tasks.pop(automation_id, None)
+        automation_stop_requests.discard(automation_id)
+        await publish_automation_list()
+
+
+def fire_automation_event(event_type, device_id=None, parameter=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT automation_id, config_json FROM automations WHERE enabled = 1
+        """).fetchall()
+    for automation_id, config_json in rows:
+        try:
+            config = json.loads(config_json)
+            if config.get("version") != 2:
+                continue
+            trigger = config["program"]["trigger"]
+            matches = trigger.get("type") == event_type
+            if event_type == "parameter_changed":
+                matches = (
+                    matches and trigger.get("device") == device_id
+                    and trigger.get("parameter") == parameter
+                )
+            elif event_type in {"device_connected", "device_disconnected"}:
+                matches = matches and trigger.get("device") == device_id
+            if matches:
+                start_automation_run(automation_id, config, event_type)
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            print(f"[АВТОМАТИЗАЦИЯ] Не удалось запустить сценарий {automation_id}: {error}")
+
+
+async def evaluate_automations(device_id, previous_parameters, current_parameters):
+    changed_parameters = {
+        key for key, value in current_parameters.items()
+        if key not in previous_parameters or previous_parameters[key] != value
+    }
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT automation_id, config_json, last_triggered_at
+            FROM automations WHERE enabled = 1
+        """).fetchall()
+    now = datetime.now(timezone.utc)
+    for automation_id, config_json, last_triggered in rows:
+        try:
+            config = json.loads(config_json)
+            if config.get("version") == 2:
+                trigger = config["program"]["trigger"]
+                if (
+                    trigger.get("type") == "parameter_changed"
+                    and trigger.get("device") == device_id
+                    and trigger.get("parameter") in changed_parameters
+                ):
+                    start_automation_run(automation_id, config, "parameter_changed")
+                continue
+            invalid_reason = validate_automation_config(config)
+            if invalid_reason:
+                continue
+            trigger = config["trigger"]
+            before = previous_parameters.get(trigger["parameter"])
+            after = current_parameters.get(trigger["parameter"])
+            if trigger["device"] != device_id or trigger["parameter"] not in changed_parameters or type(before) not in (int, float) or type(after) not in (int, float):
+                continue
+            threshold = trigger["threshold"]
+            crossed = {
+                "above": before <= threshold and after > threshold,
+                "at_least": before < threshold and after >= threshold,
+                "below": before >= threshold and after < threshold,
+                "at_most": before > threshold and after <= threshold
+            }[trigger["operator"]]
+            if not crossed:
+                continue
+            if last_triggered and (now - datetime.fromisoformat(last_triggered).astimezone(timezone.utc)).total_seconds() < 30:
+                continue
+            target = config["target"]
+            command_id = f"auto-{automation_id[:24]}-{uuid.uuid4().hex[:16]}"
+            if target["kind"] == "parameter":
+                await dispatch_device_command(target["device"], target["name"], target["value"], requested_command_id=command_id)
+            else:
+                await dispatch_device_action(target["device"], target["name"], target.get("arguments", {}), requested_command_id=command_id)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"[ОШИБКА] Пропуск сценария {automation_id}: {error}")
 
 
 async def handle_browser_message(websocket, message):
 
     action = message.get("action")
+
+    if action == "get_automations":
+        await send_json(websocket, {
+            "type": "automation_list", "automations": get_automations()
+        })
+        return
+
+    if action == "save_automation":
+        automation_id = message.get("automation_id")
+        config = message.get("config")
+        is_new = automation_id in (None, "")
+        if is_new:
+            automation_id = uuid.uuid4().hex
+        if not isinstance(automation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id):
+            success, message_text = False, "Некорректный ID сценария."
+        else:
+            success, message_text = save_automation(
+                automation_id, config, message.get("enabled", True) is True
+            )
+        await send_json(websocket, {
+            "type": "automation_save_result", "success": success,
+            "automation_id": automation_id, "message": message_text
+        })
+        if success:
+            await send_json(websocket, {
+                "type": "automation_list", "automations": get_automations()
+            })
+        return
+
+    if action == "set_automation_enabled":
+        automation_id = message.get("automation_id")
+        enabled = message.get("enabled")
+        valid = (
+            isinstance(automation_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id)
+            and type(enabled) is bool
+        )
+        success = False
+        if valid:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.execute(
+                    "UPDATE automations SET enabled = ?, updated_at = ? WHERE automation_id = ?",
+                    (int(enabled), current_time(), automation_id)
+                )
+                success = cursor.rowcount == 1
+        await send_json(websocket, {
+            "type": "automation_update_result", "success": success,
+            "automation_id": automation_id,
+            "message": "Сценарий обновлён." if success else "Сценарий не найден."
+        })
+        if success:
+            await send_json(websocket, {
+                "type": "automation_list", "automations": get_automations()
+            })
+        return
+
+    if action == "stop_automation":
+        automation_id = message.get("automation_id")
+        task = automation_tasks.get(automation_id) if isinstance(automation_id, str) else None
+        success = task is not None and not task.done()
+        if success:
+            automation_stop_requests.add(automation_id)
+        await send_json(websocket, {
+            "type": "automation_stop_result", "success": success,
+            "automation_id": automation_id,
+            "message": (
+                "Остановка запрошена; текущее действие завершится первым."
+                if success else "Сценарий сейчас не выполняется."
+            )
+        })
+        if success:
+            await publish_automation_list()
+        return
+
+    if action == "delete_automation":
+        automation_id = message.get("automation_id")
+        success = False
+        active_task = automation_tasks.get(automation_id) if isinstance(automation_id, str) else None
+        if active_task is not None and not active_task.done():
+            success = False
+        elif isinstance(automation_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id):
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.execute(
+                    "DELETE FROM automations WHERE automation_id = ?", (automation_id,)
+                )
+                success = cursor.rowcount == 1
+        await send_json(websocket, {
+            "type": "automation_delete_result", "success": success,
+            "automation_id": automation_id,
+            "message": (
+                "Сценарий удалён." if success else
+                "Сначала остановите выполняющийся сценарий." if active_task is not None and not active_task.done() else
+                "Сценарий не найден."
+            )
+        })
+        if success:
+            await send_json(websocket, {
+                "type": "automation_list", "automations": get_automations()
+            })
+        return
 
     if action == "device_access_decision":
         device_id = message.get("device")
@@ -2143,6 +3144,7 @@ async def handle_browser_message(websocket, message):
                 device_id, "deny", request["metadata"].get("name")
             )
             active_socket = devices.pop(device_id, None)
+            device_wire_ids.pop(device_id, None)
             last_device_heartbeat.pop(device_id, None)
             pending_device_schemas.pop(device_id, None)
             deferred_device_schemas.pop(device_id, None)
@@ -2221,6 +3223,7 @@ async def handle_browser_message(websocket, message):
 
         set_device_trust_policy(device_id, "forgotten")
         active_socket = devices.pop(device_id, None)
+        device_wire_ids.pop(device_id, None)
         last_device_heartbeat.pop(device_id, None)
         pending_device_schemas.pop(device_id, None)
         deferred_device_schemas.pop(device_id, None)
@@ -2255,6 +3258,30 @@ async def handle_browser_message(websocket, message):
         await send_device_list()
         await send_event_history()
         await send_device_access_state()
+        return
+
+    if action == "update_device_identity":
+        device_id = message.get("device")
+        new_device_id = message.get("new_device_id")
+        display_name = message.get("display_name")
+        success, message_text = update_device_identity(
+            device_id, new_device_id, display_name
+        )
+        await send_json(websocket, {
+            "type": "device_identity_result",
+            "success": success,
+            "device": device_id,
+            "new_device_id": new_device_id if success else device_id,
+            "message": message_text
+        })
+        if success:
+            await send_device_list()
+            await send_event_history()
+            await send_command_queue_state()
+            await send_json(websocket, {
+                "type": "automation_list",
+                "automations": get_automations()
+            })
         return
 
     if action == "clear_device_block":
@@ -2471,6 +3498,10 @@ async def handle_browser_message(websocket, message):
         await send_device_list()
         await send_event_history()
         await send_command_queue_state()
+        should_fire_connected = device_id in deferred_connection_automations
+        deferred_connection_automations.discard(device_id)
+        if should_fire_connected and device_is_connected(device_id):
+            fire_automation_event("device_connected", device_id)
         return
 
     if action == "command":
@@ -2506,6 +3537,7 @@ async def handle_browser_message(websocket, message):
 async def handle_client(websocket):
     client_type = None
     device_id = None
+    wire_device_id = None
 
     remote = getattr(websocket, "remote_address", None)
     print(f"[ПОДКЛЮЧЕНИЕ] Новое соединение: {remote}")
@@ -2597,6 +3629,9 @@ async def handle_client(websocket):
                     })
                     continue
 
+                wire_device_id = incoming_id
+                device_id = resolve_device_identity(wire_device_id)
+
                 legacy_data = message.get("data", {})
                 if not isinstance(legacy_data, dict):
                     legacy_data = {}
@@ -2646,6 +3681,7 @@ async def handle_client(websocket):
 
                 metadata = {
                     "name": name,
+                    "firmware_id": wire_device_id,
                     "protocol_version": protocol_version,
                     "firmware_version": firmware_version,
                     "command_dedup": command_dedup,
@@ -2653,7 +3689,6 @@ async def handle_client(websocket):
                     "schema": schema
                 }
 
-                device_id = str(incoming_id)
                 trust_policy = get_device_trust_policy(device_id)
                 if trust_policy == "deny":
                     await send_json(websocket, {
@@ -2736,8 +3771,26 @@ async def handle_client(websocket):
 
                 old_connection = devices.get(device_id)
 
+                if device_id not in device_states:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        saved_state_row = conn.execute(
+                            "SELECT state_json, led FROM devices WHERE device_id = ?",
+                            (device_id,)
+                        ).fetchone()
+                    if saved_state_row is not None:
+                        try:
+                            restored_state = json.loads(saved_state_row[0] or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            restored_state = {}
+                        if isinstance(restored_state, dict):
+                            if saved_state_row[1] is not None:
+                                restored_state.setdefault("led", bool(saved_state_row[1]))
+                            device_states[device_id] = restored_state
+
                 devices[device_id] = websocket
+                device_wire_ids[device_id] = wire_device_id
                 last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
+                fresh_device_parameters[device_id] = set()
                 schema_status = offer_device_schema(
                     device_id, metadata, is_legacy=is_legacy
                 )
@@ -2777,6 +3830,9 @@ async def handle_client(websocket):
                 await send_event_history()
                 if schema_status != "pending":
                     await deliver_queued_commands(device_id)
+                    fire_automation_event("device_connected", device_id)
+                else:
+                    deferred_connection_automations.add(device_id)
                 await send_command_queue_state()
                 continue
 
@@ -2815,7 +3871,7 @@ async def handle_client(websocket):
             # -------------------------
 
             if client_type == "device" and message_type == "command_result":
-                if message.get("device") != device_id:
+                if message.get("device") != wire_device_id:
                     continue
 
                 command_id = message.get("command_id")
@@ -2894,10 +3950,12 @@ async def handle_client(websocket):
                 # Persist and broadcast it here so the state update does not
                 # create a second, duplicate history entry for the same action.
                 if operation["kind"] == "parameter" and value is not None:
+                    previous_parameters = dict(device_states.get(device_id, {}))
                     device_states[device_id] = {
-                        **device_states.get(device_id, {}),
+                        **previous_parameters,
                         parameter: value
                     }
+                    fresh_device_parameters.setdefault(device_id, set()).add(parameter)
                     last_seen, _, _ = save_device_state(
                         device_id,
                         {parameter: value},
@@ -2912,6 +3970,10 @@ async def handle_client(websocket):
                         "parameters": device_states[device_id],
                         "last_seen": last_seen
                     })
+                    if parameter not in previous_parameters or previous_parameters[parameter] != value:
+                        await evaluate_automations(
+                            device_id, previous_parameters, device_states[device_id]
+                        )
 
                 pending = remove_pending_command(command_id)
                 await send_pending_command_result(
@@ -2923,7 +3985,7 @@ async def handle_client(websocket):
                 continue
 
             if client_type == "device" and message_type == "state":
-                if message.get("device") != device_id:
+                if message.get("device") != wire_device_id:
                     continue
 
                 data = message.get("data", {})
@@ -2979,10 +4041,16 @@ async def handle_client(websocket):
                         save_device_metadata(device_id, metadata)
                         await send_device_list()
 
+                previous_parameters = dict(device_states.get(device_id, {}))
+                telemetry_changed = any(
+                    key not in previous_parameters or previous_parameters[key] != value
+                    for key, value in accepted_parameters.items()
+                )
                 device_states[device_id] = {
                     **device_states.get(device_id, {}),
                     **accepted_parameters
                 }
+                fresh_device_parameters.setdefault(device_id, set()).update(accepted_parameters)
 
                 pending_state_echoes = {}
                 for pending in pending_commands.values():
@@ -3021,6 +4089,11 @@ async def handle_client(websocket):
 
                 await broadcast(state_message)
 
+                if telemetry_changed:
+                    await evaluate_automations(
+                        device_id, previous_parameters, device_states[device_id]
+                    )
+
                 if state_changed:
                     await send_event_history()
                 continue
@@ -3053,7 +4126,10 @@ async def handle_client(websocket):
             and devices.get(device_id) is websocket
         ):
             del devices[device_id]
+            device_wire_ids.pop(device_id, None)
             last_device_heartbeat.pop(device_id, None)
+            fresh_device_parameters.pop(device_id, None)
+            deferred_connection_automations.discard(device_id)
             deferred_device_schemas.pop(device_id, None)
 
             await finish_pending_commands_for_device(
@@ -3081,6 +4157,7 @@ async def handle_client(websocket):
             await send_device_list()
             await send_event_history()
             await send_command_queue_state()
+            fire_automation_event("device_disconnected", device_id)
 
         elif client_type == "browser":
             detach_pending_commands_for_browser(websocket)
@@ -3311,6 +4388,7 @@ async def main():
         print("Ожидание подключений ESP32 и браузера...")
         watchdog_task = asyncio.create_task(device_presence_watchdog())
         runtime_task = asyncio.create_task(gateway_runtime_checkpoint_loop())
+        fire_automation_event("gateway_started")
         try:
             if sys.stdin.isatty():
                 await console_loop()
