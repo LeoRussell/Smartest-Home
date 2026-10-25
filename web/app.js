@@ -77,6 +77,10 @@ let databaseStatsFrozenElapsed = null;
 let automations = [];
 let editingAutomationId = null;
 let pendingAutomationWorkspaceState = null;
+const automationRunHistories = new Map();
+const automationRunHistoryRequests = new Set();
+const automationRunHistoryRefreshRequested = new Set();
+const openAutomationRunHistories = new Set();
 
 // =========================
 // СОСТОЯНИЕ ПРИЛОЖЕНИЯ
@@ -848,13 +852,17 @@ function renderAutomations() {
         if (runtimeStatus === "running") {
             status.textContent = localized("Выполняется…", "Running…");
         } else if (item.last_error) {
-            status.textContent = `${localized("Ошибка", "Error")}: ${item.last_error}`;
+            const prefix = item.last_run_status === "interrupted"
+                ? localized("Прервано", "Interrupted")
+                : localized("Ошибка", "Error");
+            status.textContent = `${prefix}: ${item.last_error}`;
             status.classList.add("automation-status-error");
         } else if (item.last_triggered_at) {
             const runLabels = {
                 succeeded: localized("успешно", "succeeded"),
                 failed: localized("ошибка", "failed"),
-                stopped: localized("остановлен", "stopped")
+                stopped: localized("остановлен", "stopped"),
+                interrupted: localized("прерван", "interrupted")
             };
             status.textContent = localized(
                 `Последний запуск: ${formatEventTime(item.last_triggered_at)}${item.last_run_status ? ` · ${runLabels[item.last_run_status] || item.last_run_status}` : ""}`,
@@ -864,6 +872,7 @@ function renderAutomations() {
             status.textContent = localized("Ожидает событие запуска", "Waiting for its trigger");
         }
         copy.append(title, description, status);
+        const history = createAutomationRunHistory(item);
         const actions = document.createElement("div");
         actions.className = "automation-card-actions";
         const toggle = document.createElement("button");
@@ -900,9 +909,237 @@ function renderAutomations() {
             }
         });
         actions.append(toggle, edit, remove);
-        card.append(copy, actions);
+        card.append(copy, actions, history);
         automationList.append(card);
     }
+}
+
+function requestAutomationRunHistory(automationId) {
+    if (!isGatewayConnected() || automationRunHistoryRequests.has(automationId)) return;
+    automationRunHistoryRequests.add(automationId);
+    if (!sendGatewayAction("get_automation_run_history", { automation_id: automationId })) {
+        automationRunHistoryRequests.delete(automationId);
+    }
+}
+
+function createAutomationRunHistory(automation) {
+    const details = document.createElement("details");
+    details.className = "automation-run-history";
+    details.open = openAutomationRunHistories.has(automation.automation_id);
+
+    const summary = document.createElement("summary");
+    summary.textContent = localized("История запусков", "Run history");
+    details.append(summary);
+
+    const content = document.createElement("div");
+    content.className = "automation-run-history-list";
+    const runs = automationRunHistories.get(automation.automation_id);
+    if (!runs) {
+        const loading = document.createElement("p");
+        loading.textContent = localized("Загружаю историю…", "Loading history…");
+        content.append(loading);
+    } else if (runs.length === 0) {
+        const empty = document.createElement("p");
+        empty.textContent = localized("Запусков пока не было.", "No runs yet.");
+        content.append(empty);
+    } else {
+        for (const run of runs) {
+            content.append(createAutomationRunEntry(
+                run,
+                automation.automation_id,
+                automation.config?.name || run.name || automation.automation_id
+            ));
+        }
+    }
+    details.append(content);
+    details.addEventListener("toggle", () => {
+        const id = automation.automation_id;
+        if (details.open) {
+            openAutomationRunHistories.add(id);
+            if (!automationRunHistories.has(id)) requestAutomationRunHistory(id);
+        } else {
+            openAutomationRunHistories.delete(id);
+        }
+    });
+    if (details.open && !runs) requestAutomationRunHistory(automation.automation_id);
+    return details;
+}
+
+function automationRunStatusLabel(status) {
+    const labels = {
+        running: localized("Выполняется", "Running"),
+        succeeded: localized("Успешно", "Succeeded"),
+        failed: localized("Ошибка", "Failed"),
+        stopped: localized("Остановлен", "Stopped"),
+        interrupted: localized("Прерван перезапуском", "Interrupted by restart")
+    };
+    return labels[status] || status || localized("Неизвестно", "Unknown");
+}
+
+function automationRunTriggerLabel(run) {
+    const trigger = run.trigger || {};
+    if (trigger.type === "parameter_changed") {
+        const device = devices.find(item => item.device === trigger.device);
+        const parameter = device?.schema?.parameters?.[trigger.parameter];
+        return localized(
+            `Изменение ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}`,
+            `Change on ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}`
+        );
+    }
+    if (trigger.type === "device_connected") {
+        return localized(`Подключение ${trigger.device}`, `Connect ${trigger.device}`);
+    }
+    if (trigger.type === "device_disconnected") {
+        return localized(`Отключение ${trigger.device}`, `Disconnect ${trigger.device}`);
+    }
+    if (trigger.type === "gateway_started") {
+        return localized("Запуск Gateway", "Gateway started");
+    }
+    if (trigger.device && trigger.parameter) {
+        const device = devices.find(item => item.device === trigger.device);
+        const parameter = device?.schema?.parameters?.[trigger.parameter];
+        const operators = {
+            above: localized("больше", "above"),
+            at_least: localized("не меньше", "at least"),
+            below: localized("меньше", "below"),
+            at_most: localized("не больше", "at most")
+        };
+        return localized(
+            `Порог ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter} ${operators[trigger.operator] || trigger.operator} ${trigger.threshold}`,
+            `Threshold ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter} ${operators[trigger.operator] || trigger.operator} ${trigger.threshold}`
+        );
+    }
+    return run.trigger_reason || localized("Событие запуска", "Trigger event");
+}
+
+function formatAutomationRunValue(value, definition) {
+    let formatted;
+    if (definition) return formatDisplayedParameterValue(value, definition);
+    if (typeof value === "string") {
+        formatted = value;
+    } else {
+        try {
+            formatted = JSON.stringify(value);
+        } catch {
+            formatted = String(value);
+        }
+    }
+    return formatted.length > 160 ? `${formatted.slice(0, 157)}…` : formatted;
+}
+
+function automationRunStepLabel(step) {
+    const details = step.details || {};
+    if (step.type === "condition") {
+        const result = details.result === true
+            ? localized("условие выполнено", "condition matched")
+            : details.result === false
+                ? localized("условие не выполнено", "condition did not match")
+                : localized("проверка условия", "condition check");
+        return localized(`ЕСЛИ, ветка ${details.branch || "?"}: ${result}`, `IF, branch ${details.branch || "?"}: ${result}`);
+    }
+    if (step.type === "otherwise") return localized("Ветка ИНАЧЕ", "ELSE branch");
+    if (step.type === "wait") {
+        return localized(`Пауза ${details.seconds ?? "?"} сек.`, `Wait ${details.seconds ?? "?"} sec.`);
+    }
+    const device = devices.find(item => item.device === details.device);
+    const deviceLabel = device?.display_name || device?.name || details.device || "";
+    if (step.type === "set_parameter") {
+        const parameter = device?.schema?.parameters?.[details.parameter];
+        const requestedValue = Object.hasOwn(details, "requested_value")
+            ? ` ← ${formatAutomationRunValue(details.requested_value, parameter)}`
+            : "";
+        const resultValue = Object.hasOwn(details, "result_value")
+            ? ` · ${localized("результат", "result")}: ${formatAutomationRunValue(details.result_value, parameter)}`
+            : "";
+        return localized(
+            `Установить ${deviceLabel} · ${parameter?.label || details.parameter}${requestedValue}${resultValue}`,
+            `Set ${deviceLabel} · ${parameter?.label || details.parameter}${requestedValue}${resultValue}`
+        );
+    }
+    if (step.type === "invoke_action") {
+        const action = device?.schema?.actions?.[details.action];
+        const argumentsText = details.arguments && Object.keys(details.arguments).length
+            ? ` · ${formatAutomationRunValue(details.arguments)}`
+            : "";
+        const resultText = Object.hasOwn(details, "result_value")
+            ? ` · ${localized("результат", "result")}: ${formatAutomationRunValue(details.result_value)}`
+            : "";
+        return localized(
+            `Действие ${deviceLabel} · ${action?.label || details.action}${argumentsText}${resultText}`,
+            `Action ${deviceLabel} · ${action?.label || details.action}${argumentsText}${resultText}`
+        );
+    }
+    return step.type || localized("Шаг сценария", "Scenario step");
+}
+
+function createAutomationRunEntry(run, automationId, automationName) {
+    const entry = document.createElement("article");
+    entry.className = `automation-run-entry is-${run.status || "unknown"}`;
+
+    const heading = document.createElement("div");
+    heading.className = "automation-run-heading";
+    const time = document.createElement("time");
+    time.dateTime = run.started_at || "";
+    time.textContent = run.started_at ? formatEventTime(run.started_at) : "—";
+    const status = document.createElement("strong");
+    status.textContent = automationRunStatusLabel(run.status);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "automation-run-delete-button";
+    remove.textContent = localized("Удалить запуск", "Delete run");
+    remove.disabled = run.status === "running";
+    remove.title = run.status === "running"
+        ? localized("Нельзя удалить выполняющийся запуск.", "A running run cannot be deleted.")
+        : localized("Удалить эту запись из истории", "Delete this run from history");
+    remove.addEventListener("click", () => {
+        if (run.status === "running") return;
+        const prompt = localized(
+            `Удалить запись запуска сценария «${automationName}»?`,
+            `Delete this run of “${automationName}”?`
+        );
+        if (window.confirm(prompt)) {
+            sendGatewayAction("delete_automation_run", {
+                automation_id: automationId,
+                run_id: run.run_id
+            });
+        }
+    });
+    heading.append(time, status, remove);
+
+    const trigger = document.createElement("p");
+    trigger.className = "automation-run-trigger";
+    trigger.textContent = automationRunTriggerLabel(run);
+    entry.append(heading, trigger);
+
+    if (Array.isArray(run.steps) && run.steps.length) {
+        const list = document.createElement("ol");
+        list.className = "automation-run-steps";
+        for (const step of run.steps) {
+            const item = document.createElement("li");
+            item.className = `is-${step.status || "unknown"}`;
+            const label = document.createElement("span");
+            label.textContent = automationRunStepLabel(step);
+            const result = document.createElement("small");
+            result.textContent = automationRunStatusLabel(step.status);
+            item.append(label, result);
+            if (step.error) {
+                const error = document.createElement("p");
+                error.className = "automation-run-error";
+                error.textContent = step.error;
+                item.append(error);
+            }
+            list.append(item);
+        }
+        entry.append(list);
+    }
+
+    if (run.error) {
+        const error = document.createElement("p");
+        error.className = "automation-run-error";
+        error.textContent = run.error;
+        entry.append(error);
+    }
+    return entry;
 }
 
 function submitAutomation(event) {
@@ -1045,9 +1282,67 @@ function handleGatewayMessage(message) {
     switch (message.type) {
         case "automation_list": {
             automations = Array.isArray(message.automations) ? message.automations : [];
+            const automationIds = new Set(automations.map(item => item.automation_id));
+            for (const automationId of automationRunHistories.keys()) {
+                automationRunHistories.delete(automationId);
+                if (!automationIds.has(automationId)) {
+                    openAutomationRunHistories.delete(automationId);
+                    automationRunHistoryRequests.delete(automationId);
+                    automationRunHistoryRefreshRequested.delete(automationId);
+                }
+            }
+            for (const automationId of [...openAutomationRunHistories]) {
+                if (!automationIds.has(automationId)) {
+                    openAutomationRunHistories.delete(automationId);
+                    automationRunHistoryRequests.delete(automationId);
+                    automationRunHistoryRefreshRequested.delete(automationId);
+                }
+            }
+            for (const automationId of [...automationRunHistoryRequests]) {
+                if (!automationIds.has(automationId)) {
+                    automationRunHistoryRequests.delete(automationId);
+                    automationRunHistoryRefreshRequested.delete(automationId);
+                } else {
+                    automationRunHistoryRefreshRequested.add(automationId);
+                }
+            }
             renderAutomations();
+            for (const automationId of openAutomationRunHistories) {
+                if (!automationRunHistoryRequests.has(automationId)) {
+                    automationRunHistories.delete(automationId);
+                    requestAutomationRunHistory(automationId);
+                }
+            }
             break;
         }
+
+        case "automation_run_history": {
+            const automationId = message.automation_id;
+            automationRunHistoryRequests.delete(automationId);
+            const refreshAgain = automationRunHistoryRefreshRequested.delete(automationId);
+            if (!automations.some(item => item.automation_id === automationId)) {
+                automationRunHistories.delete(automationId);
+                break;
+            }
+            if (message.success && Array.isArray(message.runs)) {
+                automationRunHistories.set(automationId, message.runs);
+            } else {
+                automationRunHistories.set(automationId, []);
+            }
+            if (!refreshAgain) renderAutomations();
+            else {
+                automationRunHistories.delete(automationId);
+                renderAutomations();
+                requestAutomationRunHistory(automationId);
+            }
+            break;
+        }
+
+        case "automation_run_delete_result":
+            automationFeedback.textContent = message.success
+                ? localized("Запись запуска удалена.", "Run deleted.")
+                : (message.message || localized("Не удалось удалить запуск.", "Could not delete the run."));
+            break;
 
         case "automation_save_result":
         case "automation_update_result":
@@ -1160,6 +1455,7 @@ function handleGatewayMessage(message) {
                 "schema_snapshot_count",
                 "command_record_count",
                 "automation_count",
+                "automation_run_count",
                 "session_uptime_seconds",
                 "total_uptime_seconds"
             ];
@@ -1534,6 +1830,26 @@ function describeSchemaChanges(previousSchema, nextSchema) {
                     : `${label} «${oldLabel}» переименован в «${newLabel}»`);
             }
         }
+    }
+
+    const previousCapabilities = previousSchema?.capabilities || {};
+    const nextCapabilities = nextSchema?.capabilities || {};
+    const capabilityIds = new Set([
+        ...Object.keys(previousCapabilities),
+        ...Object.keys(nextCapabilities)
+    ]);
+    for (const id of capabilityIds) {
+        const wasAvailable = previousCapabilities[id] === true;
+        const isAvailable = nextCapabilities[id] === true;
+        if (wasAvailable === isAvailable) continue;
+        const label = id === "built_in_indicator"
+            ? localized("встроенный индикатор", "built-in indicator")
+            : id === "identify"
+                ? localized("поиск устройства", "device identification")
+                : id;
+        changes.push(isAvailable
+            ? localized(`Добавлена возможность: ${label}`, `Capability added: ${label}`)
+            : localized(`Удалена возможность: ${label}`, `Capability removed: ${label}`));
     }
 
     if (changes.length === 0 && canonicalJson(previousSchema) !== canonicalJson(nextSchema)) {
@@ -2118,8 +2434,19 @@ function renderDevices() {
                 if (definition.type === "boolean") {
                     const button = document.createElement("button");
                     button.type = "button";
+                    button.className = "device-boolean-switch";
+                    button.setAttribute("role", "switch");
                     button.dataset.role = "parameter-command";
                     button.dataset.parameterId = parameterId;
+                    const track = document.createElement("span");
+                    track.className = "device-boolean-switch-track";
+                    track.setAttribute("aria-hidden", "true");
+                    const thumb = document.createElement("span");
+                    thumb.className = "device-boolean-switch-thumb";
+                    track.appendChild(thumb);
+                    const stateLabel = document.createElement("span");
+                    stateLabel.className = "device-boolean-switch-label";
+                    button.append(track, stateLabel);
                     button.addEventListener("click", () => {
                         const currentDevice = devices.find(
                             item => item.device === device.device
@@ -2303,13 +2630,30 @@ function updateDevicePanel(device) {
         const pendingCommand = [...pendingCommands.values()].find(command =>
             command.deviceId === device.device && command.parameter === parameterId
         );
-        button.textContent = pending
+        const isOn = value === true;
+        button.classList.toggle("is-on", isOn);
+        button.setAttribute("aria-checked", String(isOn));
+        const stateLabel = button.querySelector(".device-boolean-switch-label");
+        if (stateLabel) {
+            stateLabel.textContent = pending
+                ? localized("Ожидание…", "Pending…")
+                : isOn
+                    ? localized("Вкл", "On")
+                    : localized("Выкл", "Off");
+        }
+        button.title = pending
             ? pendingCommand?.status === "queued"
-                ? localized(`В очереди: ${label}`, `Queued: ${label}`)
-                : localized(`Ожидаем: ${label}…`, `Waiting: ${label}…`)
-            : value === true
+                ? localized(`Команда «${label}» в очереди`, `The ${label} command is queued`)
+                : localized(`Ожидаем подтверждение: ${label}`, `Waiting for ${label} confirmation`)
+            : isOn
                 ? localized(`Выключить: ${label}`, `Turn off: ${label}`)
                 : localized(`Включить: ${label}`, `Turn on: ${label}`);
+        button.setAttribute("aria-label", pending
+            ? button.title
+            : localized(
+                `${label}: ${isOn ? "включено" : "выключено"}. ${isOn ? "Выключить" : "Включить"}`,
+                `${label}: ${isOn ? "on" : "off"}. Turn ${isOn ? "off" : "on"}`
+            ));
         button.disabled = !device.connected || !isGatewayConnected() ||
             Boolean(device.pending_schema) || typeof value !== "boolean" || pending;
     }

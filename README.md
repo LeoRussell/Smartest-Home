@@ -36,7 +36,7 @@ py -m http.server 8080 --directory web
 
 Скопируй `esp32/include/secrets.example.h` в `esp32/include/secrets.h` и укажи Wi-Fi и IP компьютера, где запущен Gateway. `secrets.h` исключён из Git. Прошивка собирается PlatformIO из каталога `esp32`.
 
-Текущая конфигурация в `esp32/include/device_config.h` управляет выходом LED на GPIO 48 и включает действие `identify`, которое мигает настроенным индикатором. Для платы без такого индикатора установи `DEVICE_HAS_IDENTIFY_INDICATOR` в `0`: действие исчезнет из Schema и не появится в браузере. GPIO остаётся внутренней настройкой прошивки, а Schema сообщает Gateway только о поддерживаемой возможности.
+Текущая конфигурация в `esp32/include/device_config.h` управляет встроенным красным LED через `LED_BUILTIN` (GPIO 13) и включает действие `identify`, которое трижды мигает этим индикатором. В Schema это отражается полями `capabilities.built_in_indicator`, `capabilities.identify` и `actions.identify`; Gateway показывает действие «Найти устройство». Для платы без такого индикатора установи `DEVICE_HAS_IDENTIFY_INDICATOR` в `0`: capability-флаги и действие не попадут в Schema. RGB NeoPixel на Feather ESP32-S3 отдельный и этим действием не управляется. GPIO остаётся внутренней настройкой прошивки.
 
 Для подключения нескольких плат задай каждой уникальный `DEVICE_ID` в этом файле перед прошивкой. `DEVICE_NAME` и `DEVICE_MODEL` можно настроить отдельно; имя и состояние каждой платы Gateway хранит по её ID.
 

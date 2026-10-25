@@ -59,6 +59,8 @@ pending_device_connections = {}
 pending_commands = {}
 automation_tasks = {}
 automation_stop_requests = set()
+automation_waiting_tasks = set()
+automation_restart_tasks = set()
 COMMAND_TIMEOUT_SECONDS = 5
 EVENTS_PAGE_SIZE = 30
 DEVICE_STALE_SECONDS = 45
@@ -163,6 +165,41 @@ def init_db():
                 last_error TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS automation_runs (
+                run_id TEXT PRIMARY KEY,
+                automation_id TEXT NOT NULL,
+                automation_name TEXT NOT NULL,
+                trigger_json TEXT NOT NULL,
+                trigger_reason TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                error TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_history
+            ON automation_runs (automation_id, started_at DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS automation_run_steps (
+                step_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                step_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                UNIQUE (run_id, sequence)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_automation_run_steps_order
+            ON automation_run_steps (run_id, sequence)
+        """)
         automation_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(automations)").fetchall()
         }
@@ -173,9 +210,25 @@ def init_db():
         }.items():
             if column not in automation_columns:
                 conn.execute(f"ALTER TABLE automations ADD COLUMN {column} {column_type}")
-        conn.execute(
-            "UPDATE automations SET run_status = 'idle' WHERE run_status = 'running'"
-        )
+        interrupted_at = current_time()
+        conn.execute("""
+            UPDATE automation_runs
+            SET status = 'interrupted', finished_at = ?,
+                error = COALESCE(error, 'Gateway перезапустился во время выполнения.')
+            WHERE status = 'running'
+        """, (interrupted_at,))
+        conn.execute("""
+            UPDATE automation_run_steps
+            SET status = 'interrupted', finished_at = ?,
+                error = COALESCE(error, 'Gateway перезапустился во время выполнения.')
+            WHERE status = 'running'
+        """, (interrupted_at,))
+        conn.execute("""
+            UPDATE automations
+            SET run_status = 'idle', last_run_status = 'interrupted',
+                last_error = COALESCE(last_error, 'Gateway перезапустился во время выполнения.')
+            WHERE run_status = 'running'
+        """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_command_queue_device_status
             ON command_queue (device_id, status)
@@ -336,6 +389,12 @@ def get_database_stats():
         automation_count = conn.execute(
             "SELECT COUNT(*) FROM automations"
         ).fetchone()[0]
+        automation_run_count = conn.execute(
+            "SELECT COUNT(*) FROM automation_runs"
+        ).fetchone()[0]
+        automation_run_step_count = conn.execute(
+            "SELECT COUNT(*) FROM automation_run_steps"
+        ).fetchone()[0]
         runtime = conn.execute("""
             SELECT total_seconds, checkpoint_at
             FROM gateway_runtime WHERE singleton_id = 1
@@ -370,9 +429,10 @@ def get_database_stats():
         "database_size_bytes": database_size_bytes,
         "record_count": (
             device_count + event_count + schema_snapshot_count + command_record_count
-            + automation_count
+            + automation_count + automation_run_count + automation_run_step_count
         ),
         "automation_count": automation_count,
+        "automation_run_count": automation_run_count,
         "device_count": device_count,
         "ever_connected_device_count": ever_connected_device_count,
         "connected_device_count": len(devices),
@@ -560,13 +620,33 @@ def validate_schema(schema):
     if serialized_size > MAX_SCHEMA_BYTES:
         return False
 
-    if not isinstance(schema, dict) or not isinstance(schema.get("parameters", {}), dict):
+    if not isinstance(schema, dict):
         return False
 
     actions = schema.get("actions", {})
-    if not isinstance(actions, dict) or len(actions) > 32:
-        return False
     parameters = schema.get("parameters", {})
+    if not isinstance(actions, dict) or not isinstance(parameters, dict):
+        return False
+
+    capabilities = schema.get("capabilities", {})
+    if (
+        not isinstance(capabilities, dict)
+        or len(capabilities) > 16
+        or any(
+            not isinstance(key, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", key)
+            or type(enabled) is not bool
+            for key, enabled in capabilities.items()
+        )
+        or (
+            capabilities.get("identify") is True
+            and "identify" not in actions
+        )
+    ):
+        return False
+
+    if len(actions) > 32:
+        return False
     if len(parameters) > 64:
         return False
 
@@ -685,6 +765,8 @@ def validate_schema(schema):
 
     modes = schema.get("modes", {})
     if not isinstance(modes, dict) or len(modes) > 8:
+        return False
+    if not (parameters or actions or modes or capabilities):
         return False
     mode_ids = set(modes)
     for mode_id, mode in modes.items():
@@ -2437,6 +2519,188 @@ def get_automations():
     return result
 
 
+AUTOMATION_RUN_HISTORY_LIMIT = 50
+
+
+def get_automation_run_history(automation_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        runs = conn.execute("""
+            SELECT run_id, automation_name, trigger_json, trigger_reason,
+                   started_at, finished_at, status, error
+            FROM automation_runs
+            WHERE automation_id = ?
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT ?
+        """, (automation_id, AUTOMATION_RUN_HISTORY_LIMIT)).fetchall()
+
+        result = []
+        for run in runs:
+            try:
+                trigger_data = json.loads(run["trigger_json"])
+                if not isinstance(trigger_data, dict):
+                    trigger_data = {}
+            except (TypeError, json.JSONDecodeError):
+                trigger_data = {}
+
+            steps = conn.execute("""
+                SELECT step_type, status, started_at, finished_at,
+                       details_json, error
+                FROM automation_run_steps
+                WHERE run_id = ?
+                ORDER BY sequence
+            """, (run["run_id"],)).fetchall()
+            parsed_steps = []
+            for step in steps:
+                try:
+                    details = json.loads(step["details_json"] or "{}")
+                    if not isinstance(details, dict):
+                        details = {}
+                except (TypeError, json.JSONDecodeError):
+                    details = {}
+                parsed_steps.append({
+                    "type": step["step_type"],
+                    "status": step["status"],
+                    "started_at": step["started_at"],
+                    "finished_at": step["finished_at"],
+                    "details": details,
+                    "error": step["error"]
+                })
+
+            result.append({
+                "run_id": run["run_id"],
+                "name": run["automation_name"],
+                "trigger": trigger_data.get("trigger", {}),
+                "trigger_reason": run["trigger_reason"],
+                "started_at": run["started_at"],
+                "finished_at": run["finished_at"],
+                "status": run["status"],
+                "error": run["error"],
+                "steps": parsed_steps
+            })
+        return result
+
+
+def create_automation_run(automation_id, config, reason):
+    run_id = uuid.uuid4().hex
+    started_at = current_time()
+    program = config.get("program")
+    trigger = (
+        program.get("trigger", {})
+        if isinstance(program, dict)
+        else config.get("trigger", {})
+    )
+    trigger_data = {
+        "trigger": trigger,
+        "reason": reason
+    }
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("""
+            UPDATE automations SET run_status = 'running', last_error = NULL,
+                   last_triggered_at = ? WHERE automation_id = ? AND enabled = 1
+        """, (started_at, automation_id))
+        if cursor.rowcount != 1:
+            return None
+        conn.execute("""
+            INSERT INTO automation_runs (
+                run_id, automation_id, automation_name, trigger_json,
+                trigger_reason, started_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, 'running')
+        """, (
+            run_id, automation_id, config.get("name", automation_id),
+            json.dumps(trigger_data, ensure_ascii=False, allow_nan=False),
+            str(reason), started_at
+        ))
+
+        old_runs = conn.execute("""
+            SELECT run_id FROM automation_runs
+            WHERE automation_id = ?
+            ORDER BY started_at DESC, rowid DESC
+            LIMIT -1 OFFSET ?
+        """, (automation_id, AUTOMATION_RUN_HISTORY_LIMIT)).fetchall()
+        old_run_ids = [row[0] for row in old_runs]
+        if old_run_ids:
+            placeholders = ",".join("?" for _ in old_run_ids)
+            conn.execute(
+                f"DELETE FROM automation_run_steps WHERE run_id IN ({placeholders})",
+                old_run_ids
+            )
+            conn.execute(
+                f"DELETE FROM automation_runs WHERE run_id IN ({placeholders})",
+                old_run_ids
+            )
+    return run_id
+
+
+def start_automation_run_step(run_id, step_type, details=None):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            sequence = conn.execute("""
+                SELECT COALESCE(MAX(sequence), 0) + 1
+                FROM automation_run_steps WHERE run_id = ?
+            """, (run_id,)).fetchone()[0]
+            cursor = conn.execute("""
+                INSERT INTO automation_run_steps (
+                    run_id, sequence, step_type, status, started_at, details_json
+                ) VALUES (?, ?, ?, 'running', ?, ?)
+            """, (
+                run_id, sequence, step_type, current_time(),
+                json.dumps(details or {}, ensure_ascii=False, allow_nan=False)
+            ))
+            return cursor.lastrowid
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        print(f"[АВТОМАТИЗАЦИЯ] Не удалось записать шаг запуска: {error}")
+        return None
+
+
+def finish_automation_run_step(step_id, status, details=None, error=None):
+    if step_id is None:
+        return
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT details_json FROM automation_run_steps WHERE step_id = ?",
+                (step_id,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                saved_details = json.loads(row[0] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                saved_details = {}
+            if not isinstance(saved_details, dict):
+                saved_details = {}
+            if isinstance(details, dict):
+                saved_details.update(details)
+            conn.execute("""
+                UPDATE automation_run_steps
+                SET status = ?, finished_at = ?, details_json = ?, error = ?
+                WHERE step_id = ?
+            """, (
+                status, current_time(),
+                json.dumps(saved_details, ensure_ascii=False, allow_nan=False),
+                error, step_id
+            ))
+    except (sqlite3.Error, TypeError, ValueError) as log_error:
+        print(f"[АВТОМАТИЗАЦИЯ] Не удалось сохранить результат шага: {log_error}")
+
+
+def finish_automation_run(run_id, status, error=None):
+    finished_at = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        if status in {"failed", "stopped", "interrupted"}:
+            conn.execute("""
+                UPDATE automation_run_steps
+                SET status = ?, finished_at = ?, error = COALESCE(error, ?)
+                WHERE run_id = ? AND status = 'running'
+            """, (status, finished_at, error, run_id))
+        conn.execute("""
+            UPDATE automation_runs
+            SET status = ?, finished_at = ?, error = ?
+            WHERE run_id = ?
+        """, (status, finished_at, error, run_id))
+
+
 def automation_device_metadata(device_id):
     if not isinstance(device_id, str) or not 1 <= len(device_id) <= 64:
         return None
@@ -2820,114 +3084,253 @@ def evaluate_automation_expression(expression):
     raise AutomationExecutionError("В программе встретилось неподдерживаемое выражение.")
 
 
-async def execute_automation_statements(automation_id, statements):
+async def execute_automation_statements(automation_id, statements, run_id):
     for statement in statements:
         if automation_id in automation_stop_requests:
             raise AutomationStoppedError("Остановлено пользователем.")
         if statement["type"] == "if":
             branch_taken = False
-            for branch in statement["branches"]:
-                if evaluate_automation_expression(branch["condition"]):
-                    await execute_automation_statements(automation_id, branch["then"])
+            for index, branch in enumerate(statement["branches"], start=1):
+                step_id = start_automation_run_step(
+                    run_id, "condition", {"branch": index}
+                )
+                try:
+                    condition_result = bool(
+                        evaluate_automation_expression(branch["condition"])
+                    )
+                except Exception as error:
+                    finish_automation_run_step(
+                        step_id, "failed", error=str(error)
+                    )
+                    raise
+                finish_automation_run_step(
+                    step_id, "succeeded", {"result": condition_result}
+                )
+                if condition_result:
+                    await execute_automation_statements(
+                        automation_id, branch["then"], run_id
+                    )
                     branch_taken = True
                     break
             if not branch_taken:
-                await execute_automation_statements(automation_id, statement["else"])
+                otherwise = statement["else"]
+                if otherwise:
+                    step_id = start_automation_run_step(run_id, "otherwise")
+                    try:
+                        await execute_automation_statements(
+                            automation_id, otherwise, run_id
+                        )
+                    except AutomationStoppedError as error:
+                        finish_automation_run_step(
+                            step_id, "stopped", error=str(error)
+                        )
+                        raise
+                    except Exception as error:
+                        finish_automation_run_step(
+                            step_id, "failed", error=str(error)
+                        )
+                        raise
+                    finish_automation_run_step(step_id, "succeeded")
             continue
 
         if statement["type"] == "wait":
-            deadline = asyncio.get_running_loop().time() + statement["seconds"]
-            while True:
-                if automation_id in automation_stop_requests:
-                    raise AutomationStoppedError("Остановлено пользователем во время паузы.")
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(remaining, 0.25))
+            seconds = statement["seconds"]
+            step_id = start_automation_run_step(
+                run_id, "wait", {"seconds": seconds}
+            )
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                automation_waiting_tasks.add(current_task)
+            try:
+                deadline = asyncio.get_running_loop().time() + seconds
+                while True:
+                    if automation_id in automation_stop_requests:
+                        raise AutomationStoppedError(
+                            "Остановлено пользователем во время паузы."
+                        )
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(remaining, 0.25))
+            except AutomationStoppedError as error:
+                finish_automation_run_step(
+                    step_id, "stopped", error=str(error)
+                )
+                raise
+            except Exception as error:
+                finish_automation_run_step(
+                    step_id, "failed", error=str(error)
+                )
+                raise
+            finally:
+                if current_task is not None:
+                    automation_waiting_tasks.discard(current_task)
+            finish_automation_run_step(step_id, "succeeded")
             continue
 
         device_id = statement["device"]
-        if not device_is_connected(device_id):
-            raise AutomationExecutionError(f"Целевое устройство {device_id} недоступно.")
         command_id = f"auto-{automation_id[:24]}-{uuid.uuid4().hex[:16]}"
-        if statement["type"] == "set_parameter":
-            value = evaluate_automation_expression(statement["value"])
-            result_future = await dispatch_device_command(
-                device_id, statement["parameter"], value,
-                requested_command_id=command_id,
-                wait_for_result=True,
-                automation_id=automation_id
-            )
-        else:
-            result_future = await dispatch_device_action(
-                device_id, statement["action"], statement["arguments"],
-                requested_command_id=command_id,
-                wait_for_result=True,
-                automation_id=automation_id
-            )
-        if result_future is False:
-            raise AutomationExecutionError(f"Gateway не смог отправить команду устройству {device_id}.")
+        step_type = statement["type"]
+        step_details = {"device": device_id, "command_id": command_id}
+        if step_type == "set_parameter":
+            step_details["parameter"] = statement["parameter"]
+        elif step_type == "invoke_action":
+            step_details["action"] = statement["action"]
+            step_details["arguments"] = statement["arguments"]
+        step_id = start_automation_run_step(run_id, step_type, step_details)
         try:
+            if not device_is_connected(device_id):
+                raise AutomationExecutionError(
+                    f"Целевое устройство {device_id} недоступно."
+                )
+            if step_type == "set_parameter":
+                value = evaluate_automation_expression(statement["value"])
+                step_details["requested_value"] = value
+                result_future = await dispatch_device_command(
+                    device_id, statement["parameter"], value,
+                    requested_command_id=command_id,
+                    wait_for_result=True,
+                    automation_id=automation_id
+                )
+            elif step_type == "invoke_action":
+                result_future = await dispatch_device_action(
+                    device_id, statement["action"], statement["arguments"],
+                    requested_command_id=command_id,
+                    wait_for_result=True,
+                    automation_id=automation_id
+                )
+            else:
+                raise AutomationExecutionError("Неизвестный блок действия.")
+            if result_future is False:
+                raise AutomationExecutionError(
+                    f"Gateway не смог отправить команду устройству {device_id}."
+                )
             result = await asyncio.wait_for(
                 result_future,
                 timeout=COMMAND_TIMEOUT_SECONDS * (COMMAND_RETRY_LIMIT + 2)
             )
+            if isinstance(result, dict) and "value" in result:
+                step_details["result_value"] = result["value"]
+            if result.get("status") != "succeeded":
+                raise AutomationExecutionError(
+                    result.get("error")
+                    or f"Устройство {device_id} не выполнило действие."
+                )
         except asyncio.TimeoutError as error:
-            raise AutomationExecutionError(f"Gateway не дождался результата от {device_id}.") from error
-        if result.get("status") != "succeeded":
-            raise AutomationExecutionError(result.get("error") or f"Устройство {device_id} не выполнило действие.")
+            message = f"Gateway не дождался результата от {device_id}."
+            finish_automation_run_step(
+                step_id, "failed", details=step_details, error=message
+            )
+            raise AutomationExecutionError(message) from error
+        except AutomationStoppedError as error:
+            finish_automation_run_step(
+                step_id, "stopped", details=step_details, error=str(error)
+            )
+            raise
+        except Exception as error:
+            finish_automation_run_step(
+                step_id, "failed", details=step_details, error=str(error)
+            )
+            raise
+        finish_automation_run_step(
+            step_id, "succeeded", details=step_details
+        )
         if automation_id in automation_stop_requests:
             raise AutomationStoppedError("Остановлено пользователем после текущего действия.")
 
 
 async def publish_automation_list():
     await broadcast({"type": "automation_list", "automations": get_automations()})
+    await send_database_stats()
 
 
 def start_automation_run(automation_id, config, reason):
     existing_task = automation_tasks.get(automation_id)
-    if existing_task is not None and not existing_task.done():
+    task_is_active = existing_task is not None and not existing_task.done()
+    if task_is_active and existing_task not in automation_waiting_tasks:
         return False
-    now = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            UPDATE automations SET run_status = 'running', last_error = NULL,
-                   last_triggered_at = ? WHERE automation_id = ? AND enabled = 1
-        """, (now, automation_id))
-        if conn.total_changes == 0:
-            return False
-    automation_tasks[automation_id] = asyncio.create_task(
-        execute_automation_run(automation_id, config, reason)
+    run_id = create_automation_run(automation_id, config, reason)
+    if run_id is None:
+        return False
+
+    if task_is_active:
+        # Повторный триггер во время паузы начинает её отсчёт заново.
+        automation_restart_tasks.add(existing_task)
+        automation_stop_requests.discard(automation_id)
+        existing_task.cancel()
+
+    new_task = asyncio.create_task(
+        execute_automation_run(automation_id, config, reason, run_id)
     )
+    automation_tasks[automation_id] = new_task
     asyncio.create_task(publish_automation_list())
     return True
 
 
-async def execute_automation_run(automation_id, config, reason):
+async def execute_automation_run(automation_id, config, reason, run_id):
     error_text = None
     status = "succeeded"
     try:
         validation_error = validate_automation_config(config)
         if validation_error:
             raise AutomationExecutionError(f"Schema изменилась: {validation_error}")
-        await execute_automation_statements(automation_id, config["program"]["body"])
+        if config.get("version") == 2:
+            statements = config["program"]["body"]
+        else:
+            target = config["target"]
+            if target["kind"] == "parameter":
+                statements = [{
+                    "type": "set_parameter",
+                    "device": target["device"],
+                    "parameter": target["name"],
+                    "value": {"type": "constant", "value": target["value"]}
+                }]
+            else:
+                statements = [{
+                    "type": "invoke_action",
+                    "device": target["device"],
+                    "action": target["name"],
+                    "arguments": target.get("arguments", {})
+                }]
+        await execute_automation_statements(
+            automation_id, statements, run_id
+        )
         print(f"[АВТОМАТИЗАЦИЯ] {config['name']} выполнена ({reason})")
     except AutomationStoppedError as error:
         status = "stopped"
         error_text = str(error)
+    except asyncio.CancelledError:
+        status = "interrupted"
+        current_task = asyncio.current_task()
+        error_text = (
+            "Отсчёт перезапущен новым срабатыванием сценария."
+            if current_task in automation_restart_tasks
+            else "Gateway остановил выполнение сценария."
+        )
+        raise
     except Exception as error:
         status = "failed"
         error_text = str(error)
         print(f"[АВТОМАТИЗАЦИЯ] Ошибка в {config.get('name', automation_id)}: {error_text}")
     finally:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("""
-                UPDATE automations SET run_status = 'idle', last_run_status = ?,
-                       last_error = ? WHERE automation_id = ?
-            """, (status, error_text, automation_id))
-        automation_tasks.pop(automation_id, None)
-        automation_stop_requests.discard(automation_id)
-        await publish_automation_list()
+        current_task = asyncio.current_task()
+        finish_automation_run(run_id, status, error_text)
+        automation_waiting_tasks.discard(current_task)
+        automation_restart_tasks.discard(current_task)
+        # Сценарий могли уже перезапустить. Завершение старого запуска не
+        # должно сбрасывать состояние нового запуска или его запрос остановки.
+        if automation_tasks.get(automation_id) is current_task:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("""
+                    UPDATE automations SET run_status = 'idle', last_run_status = ?,
+                           last_error = ? WHERE automation_id = ?
+                """, (status, error_text, automation_id))
+            automation_tasks.pop(automation_id, None)
+            automation_stop_requests.discard(automation_id)
+        try:
+            await publish_automation_list()
+        except asyncio.CancelledError:
+            pass
 
 
 def fire_automation_event(event_type, device_id=None, parameter=None):
@@ -2997,12 +3400,7 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
                 continue
             if last_triggered and (now - datetime.fromisoformat(last_triggered).astimezone(timezone.utc)).total_seconds() < 30:
                 continue
-            target = config["target"]
-            command_id = f"auto-{automation_id[:24]}-{uuid.uuid4().hex[:16]}"
-            if target["kind"] == "parameter":
-                await dispatch_device_command(target["device"], target["name"], target["value"], requested_command_id=command_id)
-            else:
-                await dispatch_device_action(target["device"], target["name"], target.get("arguments", {}), requested_command_id=command_id)
+            start_automation_run(automation_id, config, "threshold_crossed")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             print(f"[ОШИБКА] Пропуск сценария {automation_id}: {error}")
 
@@ -3015,6 +3413,75 @@ async def handle_browser_message(websocket, message):
         await send_json(websocket, {
             "type": "automation_list", "automations": get_automations()
         })
+        return
+
+    if action == "get_automation_run_history":
+        automation_id = message.get("automation_id")
+        valid_id = (
+            isinstance(automation_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id)
+        )
+        exists = False
+        if valid_id:
+            with sqlite3.connect(DB_PATH) as conn:
+                exists = conn.execute(
+                    "SELECT 1 FROM automations WHERE automation_id = ?",
+                    (automation_id,)
+                ).fetchone() is not None
+        await send_json(websocket, {
+            "type": "automation_run_history",
+            "automation_id": automation_id,
+            "success": exists,
+            "runs": get_automation_run_history(automation_id) if exists else [],
+            "message": None if exists else "Сценарий не найден."
+        })
+        return
+
+    if action == "delete_automation_run":
+        automation_id = message.get("automation_id")
+        run_id = message.get("run_id")
+        valid = (
+            isinstance(automation_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id)
+            and isinstance(run_id, str)
+            and re.fullmatch(r"[A-Fa-f0-9-]{1,64}", run_id)
+        )
+        success = False
+        result_message = "Запуск не найден."
+        if valid:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT status FROM automation_runs WHERE run_id = ? AND automation_id = ?",
+                    (run_id, automation_id)
+                ).fetchone()
+                if row is not None and row[0] == "running":
+                    result_message = "Нельзя удалить выполняющийся запуск."
+                elif row is not None:
+                    conn.execute(
+                        "DELETE FROM automation_run_steps WHERE run_id = ?",
+                        (run_id,)
+                    )
+                    cursor = conn.execute(
+                        "DELETE FROM automation_runs WHERE run_id = ? AND automation_id = ?",
+                        (run_id, automation_id)
+                    )
+                    success = cursor.rowcount == 1
+                    result_message = "Запуск удалён." if success else "Запуск не найден."
+        await send_json(websocket, {
+            "type": "automation_run_delete_result",
+            "success": success,
+            "automation_id": automation_id,
+            "run_id": run_id,
+            "message": result_message
+        })
+        if success:
+            await broadcast({
+                "type": "automation_run_history",
+                "automation_id": automation_id,
+                "success": True,
+                "runs": get_automation_run_history(automation_id)
+            })
+            await send_database_stats()
         return
 
     if action == "save_automation":
@@ -3034,9 +3501,7 @@ async def handle_browser_message(websocket, message):
             "automation_id": automation_id, "message": message_text
         })
         if success:
-            await send_json(websocket, {
-                "type": "automation_list", "automations": get_automations()
-            })
+            await publish_automation_list()
         return
 
     if action == "set_automation_enabled":
@@ -3061,9 +3526,7 @@ async def handle_browser_message(websocket, message):
             "message": "Сценарий обновлён." if success else "Сценарий не найден."
         })
         if success:
-            await send_json(websocket, {
-                "type": "automation_list", "automations": get_automations()
-            })
+            await publish_automation_list()
         return
 
     if action == "stop_automation":
@@ -3096,6 +3559,17 @@ async def handle_browser_message(websocket, message):
                     "DELETE FROM automations WHERE automation_id = ?", (automation_id,)
                 )
                 success = cursor.rowcount == 1
+                if success:
+                    conn.execute("""
+                        DELETE FROM automation_run_steps
+                        WHERE run_id IN (
+                            SELECT run_id FROM automation_runs WHERE automation_id = ?
+                        )
+                    """, (automation_id,))
+                    conn.execute(
+                        "DELETE FROM automation_runs WHERE automation_id = ?",
+                        (automation_id,)
+                    )
         await send_json(websocket, {
             "type": "automation_delete_result", "success": success,
             "automation_id": automation_id,
@@ -3106,9 +3580,7 @@ async def handle_browser_message(websocket, message):
             )
         })
         if success:
-            await send_json(websocket, {
-                "type": "automation_list", "automations": get_automations()
-            })
+            await publish_automation_list()
         return
 
     if action == "device_access_decision":
@@ -3627,7 +4099,8 @@ async def handle_client(websocket):
                         "type": "error",
                         "message": "В сообщении hello отсутствует device."
                     })
-                    continue
+                    await websocket.close(code=4002, reason="Invalid device ID")
+                    break
 
                 wire_device_id = incoming_id
                 device_id = resolve_device_identity(wire_device_id)
@@ -3640,11 +4113,28 @@ async def handle_client(websocket):
                 if is_legacy:
                     schema = default_legacy_schema()
                 elif not validate_schema(schema):
+                    schema_shape = {
+                        "type": type(schema).__name__,
+                        "keys": list(schema) if isinstance(schema, dict) else [],
+                        "parameters": list(schema.get("parameters", {}))
+                        if isinstance(schema, dict)
+                        and isinstance(schema.get("parameters", {}), dict)
+                        else [],
+                        "actions": list(schema.get("actions", {}))
+                        if isinstance(schema, dict)
+                        and isinstance(schema.get("actions", {}), dict)
+                        else []
+                    }
+                    print(
+                        f"[Schema rejected] Некорректная Schema от {wire_device_id}: "
+                        f"{schema_shape}"
+                    )
                     await send_json(websocket, {
                         "type": "error",
                         "message": "Schema устройства имеет неверный формат."
                     })
-                    continue
+                    await websocket.close(code=4002, reason="Invalid device schema")
+                    break
 
                 protocol_version = message.get(
                     "protocol_version", legacy_data.get("protocol")
@@ -3677,7 +4167,8 @@ async def handle_client(websocket):
                         "type": "error",
                         "message": "Некорректные метаданные устройства."
                     })
-                    continue
+                    await websocket.close(code=4002, reason="Invalid device metadata")
+                    break
 
                 metadata = {
                     "name": name,
@@ -3826,6 +4317,11 @@ async def handle_client(websocket):
                     except Exception:
                         pass
 
+                await send_json(websocket, {
+                    "type": "hello_ack",
+                    "device": device_id,
+                    "schema_status": schema_status
+                })
                 await send_device_list()
                 await send_event_history()
                 if schema_status != "pending":
@@ -3992,6 +4488,16 @@ async def handle_client(websocket):
                 if not isinstance(data, dict):
                     continue
                 parameters = data.get("parameters", {})
+                if not isinstance(parameters, dict):
+                    await send_json(websocket, {
+                        "type": "error",
+                        "message": "Device telemetry parameters must be an object."
+                    })
+                    continue
+
+                # A schema mismatch must not be mistaken for a dead WebSocket.
+                # Track valid device traffic separately from accepted state values.
+                last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
 
                 metadata = device_metadata.get(
                     device_id, {"schema": default_legacy_schema()}
@@ -4016,6 +4522,15 @@ async def handle_client(websocket):
                     )
                     accepted_parameters = parameters
                 if not state_is_valid:
+                    accepted_parameter_names = sorted(
+                        schema.get("parameters", {}).keys()
+                    )
+                    offered_parameter_names = sorted(parameters.keys())
+                    print(
+                        f"[STATE REJECTED] {device_id}: offered={offered_parameter_names}, "
+                        f"accepted={accepted_parameter_names}, "
+                        f"schema_review={review_schema is not None}"
+                    )
                     await send_json(websocket, {
                         "type": "error",
                         "message": "Состояние устройства не соответствует Schema."
@@ -4074,10 +4589,9 @@ async def handle_client(websocket):
                         pending.setdefault("deferred_state_events", []).append(
                             state_event
                         )
-                last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
-
                 print(
-                    f"[СОСТОЯНИЕ] {device_id}: {accepted_parameters}"
+                    f"[ТЕЛЕМЕТРИЯ] {device_id}: получено={parameters}; "
+                    f"принято текущей Schema={accepted_parameters}"
                 )
 
                 state_message = {
@@ -4098,7 +4612,25 @@ async def handle_client(websocket):
                     await send_event_history()
                 continue
 
-            print(f"[ПРЕДУПРЕЖДЕНИЕ] Неизвестное сообщение: {message}")
+            if client_type is None:
+                print(
+                    f"[ПРЕДУПРЕЖДЕНИЕ] Сообщение до регистрации hello "
+                    f"от {remote}: {message_type}"
+                )
+                await send_json(websocket, {
+                    "type": "error",
+                    "message": "Сначала устройство должно отправить корректное hello."
+                })
+                await websocket.close(
+                    code=4002,
+                    reason="Device must register with hello first"
+                )
+                break
+
+            print(
+                f"[ПРЕДУПРЕЖДЕНИЕ] Неизвестное сообщение от {client_type}: "
+                f"{message}"
+            )
 
     except ConnectionClosed:
         pass

@@ -13,8 +13,8 @@
 #define DEVICE_MODEL "Adafruit Feather ESP32-S3"
 #endif
 
-// Board-specific hardware mapping for the current test device.
-// Set DEVICE_HAS_IDENTIFY_INDICATOR to 0 when the board has no wired indicator.
+// Pin mapping retained from the working ESP32-S3 test setup.
+// Set DEVICE_HAS_IDENTIFY_INDICATOR to 0 when the board has no indicator.
 #ifndef LED_PIN
 #define LED_PIN 48
 #endif

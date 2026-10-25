@@ -639,7 +639,7 @@ button:disabled {
     padding: 21px;
     border: 1px solid var(--line);
     border-radius: 16px;
-    background: linear-gradient(145deg, rgba(24, 40, 32, .96), rgba(17, 29, 47, .94));
+    background: linear-gradient(145deg, rgba(24, 40, 64, .96), rgba(17, 29, 47, .94));
     box-shadow: 0 14px 34px rgba(0, 0, 0, .16), inset 0 1px rgba(255,255,255,.025);
 }
 
@@ -1032,10 +1032,6 @@ button:disabled {
         font-size: 10px;
     }
 
-    .device-forget-button {
-        padding: 6px 8px;
-    }
-
     .device-identity-button {
         width: 30px;
         min-width: 30px;
@@ -1046,6 +1042,10 @@ button:disabled {
     .device-identity-button::before {
         content: "✎";
         font-size: 15px;
+    }
+
+    .device-forget-button {
+        padding: 6px 8px;
     }
 
     .device-access-form {
@@ -1783,7 +1783,7 @@ body.nav-side .navigation-item {
 }
 
 body.nav-side .navigation-icon {
-    font-size: 32px;
+    font-size: 64px;
     line-height: 1;
 }
 
@@ -1932,6 +1932,154 @@ body.nav-side .page-content main {
     .notification-panel {
         right: -4px;
         width: min(370px, calc(100vw - 22px));
+    }
+}
+
+.automation-run-history {
+    box-sizing: border-box;
+    flex: 1 0 100%;
+    min-width: 0;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #808080;
+    color: #111;
+}
+
+.automation-run-history > summary {
+    color: #000080;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.automation-run-history-list {
+    display: grid;
+    gap: 8px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    margin-top: 8px;
+}
+
+.automation-run-history-list > p {
+    margin: 0;
+    color: #333;
+    font-size: 12px;
+}
+
+.automation-run-entry {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    padding: 9px;
+    border: 2px inset #dfdfdf;
+    background: #fff;
+    color: #111;
+    font-size: 12px;
+}
+
+.automation-run-heading {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 5px 12px;
+    min-width: 0;
+}
+
+.automation-run-heading time {
+    margin-right: auto;
+    overflow-wrap: anywhere;
+}
+
+.automation-run-delete-button {
+    min-height: 25px;
+    padding: 3px 7px;
+    border-color: #fff #404040 #404040 #fff;
+    background: #800000;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.automation-run-delete-button:hover:not(:disabled) {
+    border-color: #fff #404040 #404040 #fff;
+    background: #a00000;
+    color: #fff;
+}
+
+.automation-run-delete-button:disabled {
+    background: #777;
+    color: #fff;
+}
+
+.automation-run-heading time {
+    color: #333;
+    font-variant-numeric: tabular-nums;
+}
+
+.automation-run-entry.is-succeeded .automation-run-heading strong,
+.automation-run-steps li.is-succeeded small {
+    color: #006000;
+}
+
+.automation-run-entry.is-failed .automation-run-heading strong,
+.automation-run-entry.is-interrupted .automation-run-heading strong,
+.automation-run-entry.is-stopped .automation-run-heading strong,
+.automation-run-steps li.is-failed small,
+.automation-run-steps li.is-interrupted small,
+.automation-run-steps li.is-stopped small {
+    color: #800000;
+}
+
+.automation-run-trigger {
+    min-width: 0;
+    margin: 5px 0;
+    color: #222;
+    overflow-wrap: anywhere;
+}
+
+.automation-run-steps {
+    display: grid;
+    gap: 5px;
+    margin: 7px 0 0;
+    padding-left: 22px;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+}
+
+.automation-run-steps li {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding-left: 2px;
+}
+
+.automation-run-steps li > span {
+    display: inline-block;
+    margin-right: 8px;
+    overflow-wrap: anywhere;
+}
+
+.automation-run-steps li small {
+    color: #555;
+    overflow-wrap: anywhere;
+}
+
+.automation-run-error {
+    margin: 5px 0 0;
+    color: #800000;
+    overflow-wrap: anywhere;
+    font-weight: 700;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        scroll-behavior: auto !important;
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
     }
 }
 
@@ -2120,7 +2268,9 @@ body.nav-side .page-content main {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    flex-wrap: wrap;
     gap: 12px;
+    min-width: 0;
     padding: 12px;
     border: 2px solid;
     border-color: #fff #404040 #404040 #fff;
@@ -2130,6 +2280,12 @@ body.nav-side .page-content main {
 
 .automation-card.is-disabled {
     opacity: .72;
+}
+
+.automation-card-copy {
+    flex: 1 1 220px;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .automation-card-copy h3 {
@@ -2157,6 +2313,7 @@ body.nav-side .page-content main {
     flex-wrap: wrap;
     justify-content: flex-end;
     gap: 5px;
+    min-width: 0;
 }
 
 .device-modes {
@@ -3248,5 +3405,159 @@ body.nav-side .main-navigation {
     .main-navigation,
     body.nav-side .main-navigation {
         top: 58px;
+    }
+}
+
+/* Align the vertical menu with the page panel below the sticky header. */
+@media (min-width: 761px) {
+    body.nav-side .main-navigation {
+        top: 67px;
+        margin-top: 13px;
+    }
+}
+
+/* Make the destructive device action read as an active, high contrast button. */
+.device-panel .device-header-actions .device-forget-button {
+    min-height: 30px;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    border-radius: 0;
+    background: #800000;
+    box-shadow: 1px 1px 0 #000;
+    color: #fff;
+    font-weight: 700;
+}
+
+.device-panel .device-header-actions .device-forget-button:hover:not(:disabled) {
+    border-color: #fff #404040 #404040 #fff;
+    background: #a00000;
+    color: #fff;
+}
+
+.device-panel .device-header-actions .device-forget-button:active:not(:disabled) {
+    border-color: #404040 #fff #fff #404040;
+    background: #600000;
+    color: #fff;
+}
+
+/* Keep Blockly's toolbox and flyout beneath the sticky application header. */
+.automation-workspace .blocklyToolbox,
+.automation-workspace .blocklyFlyout,
+.automation-workspace .blocklyToolboxFlyout {
+    z-index: 10;
+}
+
+.schema-review .schema-review-buttons button:not(.secondary-button) {
+    border-color: #b8cfff #404040 #404040 #b8cfff;
+    background: #000080;
+    color: #fff;
+    font-weight: 700;
+}
+
+.schema-review .schema-review-buttons button:not(.secondary-button):hover:not(:disabled) {
+    background: #0000a0;
+    color: #fff;
+}
+
+.schema-review .schema-review-buttons button.secondary-button {
+    border-color: #fff #404040 #404040 #fff;
+    background: #d4d0c8;
+    color: #000080;
+    font-weight: 700;
+}
+
+.schema-review .schema-review-buttons button.secondary-button:hover:not(:disabled) {
+    background: #e4e4e4;
+    color: #000060;
+}
+
+.device-boolean-switch,
+.device-boolean-switch:hover:not(:disabled),
+.device-boolean-switch:active:not(:disabled) {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 88px;
+    min-height: 32px;
+    padding: 0 4px;
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    color: #111;
+    font-weight: 700;
+    transform: none;
+}
+
+.device-boolean-switch-track {
+    position: relative;
+    display: inline-block;
+    flex: 0 0 54px;
+    width: 54px;
+    height: 28px;
+    box-sizing: border-box;
+    border: 2px inset #dfdfdf;
+    background: #777;
+}
+
+.device-boolean-switch.is-on .device-boolean-switch-track {
+    background: #008000;
+}
+
+.device-boolean-switch-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 18px;
+    border: 2px outset #fff;
+    background: #c0c0c0;
+    transition: left .12s ease;
+}
+
+.device-boolean-switch.is-on .device-boolean-switch-thumb {
+    left: 26px;
+}
+
+.device-boolean-switch-label {
+    min-width: 26px;
+    text-align: left;
+}
+
+.device-boolean-switch:disabled {
+    opacity: .62;
+    cursor: default;
+}
+
+.device-access-dialog .device-access-buttons .device-access-deny {
+    min-height: 32px;
+    border: 2px outset #f4f4f4;
+    border-radius: 0;
+    background: #800000;
+    box-shadow: 1px 1px 0 #000;
+    color: #fff;
+    font-weight: 700;
+}
+
+.device-access-dialog .device-access-buttons .device-access-deny:hover:not(:disabled) {
+    border-style: outset;
+    background: #a00000;
+    color: #fff;
+}
+
+.device-access-dialog .device-access-buttons .device-access-deny:active:not(:disabled) {
+    border-style: inset;
+    background: #600000;
+    color: #fff;
+}
+
+.device-access-dialog .device-access-buttons .device-access-deny:disabled {
+    background: #800000;
+    color: #fff;
+    opacity: .65;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .device-boolean-switch-thumb {
+        transition: none;
     }
 }
