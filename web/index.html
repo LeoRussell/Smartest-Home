@@ -83,6 +83,31 @@
                     <p id="action-feedback" class="action-feedback" aria-live="polite" hidden></p>
 
                     <section id="dashboard-overview" class="dashboard-overview" aria-label="Сводка устройств"></section>
+                    <section class="device-tools-window" aria-label="Инструменты списка устройств">
+                        <div class="device-tools-titlebar">
+                            <strong data-ru="Проводник устройств" data-en="Device Explorer">Проводник устройств</strong>
+                            <span class="window-controls" aria-hidden="true">_ □ ×</span>
+                        </div>
+                        <div class="device-tools-controls">
+                            <label class="device-search-control">
+                                <span data-ru="Найти устройство" data-en="Find a device">Найти устройство</span>
+                                <input id="device-search" type="search" maxlength="80" autocomplete="off">
+                            </label>
+                            <label class="device-sort-control">
+                                <span data-ru="Сортировать" data-en="Sort by">Сортировать</span>
+                                <select id="device-sort">
+                                    <option value="recent" data-ru="Недавно активно" data-en="Recently active">Недавно активно</option>
+                                    <option value="name" data-ru="Имя устройства" data-en="Device name">Имя устройства</option>
+                                    <option value="status" data-ru="Сначала на связи" data-en="Online first">Сначала на связи</option>
+                                </select>
+                            </label>
+                            <button id="device-filter-reset" class="device-filter-reset" type="button" data-ru="Сбросить фильтры" data-en="Reset filters">Сбросить фильтры</button>
+                        </div>
+                        <div class="device-tools-status" role="status" aria-live="polite">
+                            <span id="device-result-count"></span>
+                            <span data-ru="Закреплённые устройства будут сверху" data-en="Pinned devices stay at the top">Закреплённые устройства будут сверху</span>
+                        </div>
+                    </section>
                     <section class="device-card" aria-live="polite"></section>
 
                     <details id="blocked-devices" class="blocked-devices" hidden>
@@ -226,6 +251,22 @@
                             <div class="database-stat"><dt data-ru="Всего работы (с начала учёта)" data-en="Total uptime (since tracking began)">Всего работы (с начала учёта)</dt><dd data-db-stat="total_uptime_seconds">—</dd></div>
                         </dl>
                         <p class="database-summary-note" data-ru="Число записей суммирует устройства, события, снимки Schema, команды, сценарии и историю их запусков. Общее время копится с включения учёта в этой версии." data-en="The record total sums devices, events, Schema snapshots, commands, scenarios and their run history. Total uptime accumulates from the first run with tracking enabled in this version.">Число записей суммирует устройства, события, снимки Schema, команды, сценарии и историю их запусков. Общее время копится с включения учёта в этой версии.</p>
+                        <section class="database-backup-panel" aria-labelledby="database-backup-title">
+                            <div class="database-summary-heading">
+                                <span class="settings-group-icon" aria-hidden="true">▣</span>
+                                <div>
+                                    <h2 id="database-backup-title" data-ru="Резервные копии" data-en="Backups">Резервные копии</h2>
+                                    <p data-ru="Создавайте, скачивайте и восстанавливайте снимки базы Gateway" data-en="Create, download and restore Gateway database snapshots">Создавайте, скачивайте и восстанавливайте снимки базы Gateway</p>
+                                </div>
+                            </div>
+                            <div class="database-backup-actions">
+                                <button id="database-backup-create" class="refresh-button" type="button" data-ru="Создать копию" data-en="Create backup">Создать копию</button>
+                                <button id="database-backup-refresh" class="event-tool-button" type="button" data-ru="Обновить список" data-en="Refresh list">Обновить список</button>
+                            </div>
+                            <p id="database-backup-feedback" class="database-backup-feedback" aria-live="polite"></p>
+                            <div id="database-backup-list" class="database-backup-list" aria-live="polite"></div>
+                            <p class="database-backup-note" data-ru="Хранится до 20 копий. Перед восстановлением текущая база сохраняется отдельно; сценарии останавливаются, устройства отключаются и могут подключиться снова." data-en="Up to 20 backups are kept. The current database is saved before restoring; automations stop and devices disconnect, then may reconnect.">Хранится до 20 копий. Перед восстановлением текущая база сохраняется отдельно; сценарии останавливаются, устройства отключаются и могут подключиться снова.</p>
+                        </section>
                     </aside>
                     </div>
                 </section>

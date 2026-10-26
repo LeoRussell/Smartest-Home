@@ -4,6 +4,10 @@ const actionFeedback = document.getElementById("action-feedback");
 const refreshButton = document.getElementById("refresh-button");
 const activityCard = document.querySelector(".activity-card");
 const overview = document.getElementById("dashboard-overview");
+const deviceSearchInput = document.getElementById("device-search");
+const deviceSortSelect = document.getElementById("device-sort");
+const deviceFilterResetButton = document.getElementById("device-filter-reset");
+const deviceResultCount = document.getElementById("device-result-count");
 const blockedDevicesSection = document.getElementById("blocked-devices");
 const blockedDevicesList = document.getElementById("blocked-devices-list");
 const blockedDeviceCount = document.getElementById("blocked-device-count");
@@ -22,6 +26,10 @@ const settingTimezone = document.getElementById("setting-timezone");
 const settingImportantOnly = document.getElementById("setting-important-only");
 const settingsSavedMessage = document.getElementById("settings-saved");
 const databaseStatistics = document.getElementById("database-statistics");
+const databaseBackupCreateButton = document.getElementById("database-backup-create");
+const databaseBackupRefreshButton = document.getElementById("database-backup-refresh");
+const databaseBackupList = document.getElementById("database-backup-list");
+const databaseBackupFeedback = document.getElementById("database-backup-feedback");
 const automationForm = document.getElementById("automation-editor-form");
 const automationList = document.getElementById("automation-list");
 const automationFeedback = document.getElementById("automation-feedback");
@@ -33,6 +41,8 @@ const automationRedoButton = document.getElementById("automation-redo");
 
 const UI_SETTINGS_KEY = "iot-gateway-ui-settings-v1";
 const NOTIFICATION_STATE_KEY = "iot-gateway-notifications-v1";
+const DEVICE_FAVORITES_KEY = "iot-gateway-device-favorites-v1";
+const DEVICE_SORT_KEY = "iot-gateway-device-sort-v1";
 
 function readLocalState(key, fallback) {
     try {
@@ -42,6 +52,19 @@ function readLocalState(key, fallback) {
         return fallback;
     }
 }
+
+const storedFavoriteIds = readLocalState(DEVICE_FAVORITES_KEY, []);
+const favoriteDeviceIds = new Set(
+    Array.isArray(storedFavoriteIds)
+        ? storedFavoriteIds.filter(item => typeof item === "string")
+        : []
+);
+const storedDeviceSort = readLocalState(DEVICE_SORT_KEY, "recent");
+let deviceFilter = "all";
+let deviceSort = ["recent", "name", "status"].includes(storedDeviceSort)
+    ? storedDeviceSort
+    : "recent";
+const deviceDrafts = new Map();
 
 const savedUiSettings = readLocalState(UI_SETTINGS_KEY, {});
 const uiSettings = {
@@ -67,6 +90,7 @@ let observedMaxEventId = lastReadEventId || 0;
 let notificationBackfillSequence = 0;
 let notificationBackfillActive = null;
 let pendingEventFocusId = null;
+let pendingAutomationRunFocus = null;
 let activePage = "devices";
 let lastActivityMessage = "";
 let lastGatewayStatusMessage = "Нет соединения с Gateway";
@@ -74,10 +98,15 @@ let gatewayIsConnectedState = false;
 let databaseStats = null;
 let databaseStatsReceivedAt = 0;
 let databaseStatsFrozenElapsed = null;
+let databaseBackups = [];
+let databaseBackupActionPending = false;
+let databaseBackupRefreshPending = false;
 let automations = [];
 let editingAutomationId = null;
 let pendingAutomationWorkspaceState = null;
 const automationRunHistories = new Map();
+const automationRunHistoryCounts = new Map();
+const automationRunHistoryCompletedCounts = new Map();
 const automationRunHistoryRequests = new Set();
 const automationRunHistoryRefreshRequested = new Set();
 const openAutomationRunHistories = new Set();
@@ -100,7 +129,10 @@ let deviceAccessDialogRequestId = null;
 let deviceIdentityDialog = null;
 let eventFilter = "all";
 let eventDeviceFilter = "all";
+let eventSearchQuery = "";
+let eventSearchTimer = null;
 let eventCursor = null;
+let eventMatchCount = null;
 let eventsHasMore = false;
 let eventsLoading = false;
 let eventRequestSequence = 0;
@@ -203,6 +235,88 @@ function renderDatabaseStats() {
     }
 }
 
+function databaseBackupDownloadUrl(backupId) {
+    const host = window.location.hostname || "localhost";
+    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+    return `${protocol}//${host}:8765/gateway-backups/${encodeURIComponent(backupId)}`;
+}
+
+function renderDatabaseBackups() {
+    if (!databaseBackupList) return;
+    databaseBackupList.replaceChildren();
+    if (databaseBackupCreateButton) {
+        databaseBackupCreateButton.disabled = !isGatewayConnected()
+            || databaseBackupActionPending
+            || databaseBackupRefreshPending;
+    }
+    if (databaseBackupRefreshButton) {
+        databaseBackupRefreshButton.disabled = !isGatewayConnected()
+            || databaseBackupActionPending
+            || databaseBackupRefreshPending;
+    }
+
+    if (databaseBackups.length === 0) {
+        const empty = document.createElement("p");
+        empty.className = "database-backup-empty";
+        empty.textContent = localized("Резервных копий пока нет.", "No backups yet.");
+        databaseBackupList.append(empty);
+        return;
+    }
+
+    for (const backup of databaseBackups) {
+        const entry = document.createElement("article");
+        entry.className = "database-backup-entry";
+
+        const details = document.createElement("div");
+        details.className = "database-backup-details";
+        const date = document.createElement("strong");
+        date.textContent = formatEventTime(backup.created_at);
+        const metadata = document.createElement("small");
+        metadata.textContent = `${formatDatabaseSize(backup.size_bytes)} · ${backup.backup_id}`;
+        details.append(date, metadata);
+
+        const actions = document.createElement("div");
+        actions.className = "database-backup-entry-actions";
+        const download = document.createElement("a");
+        download.className = "database-backup-download";
+        download.href = databaseBackupDownloadUrl(backup.backup_id);
+        download.download = backup.backup_id;
+        download.target = "_blank";
+        download.rel = "noopener";
+        download.textContent = localized("Скачать", "Download");
+
+        const restore = document.createElement("button");
+        restore.type = "button";
+        restore.className = "database-backup-restore";
+        restore.disabled = !isGatewayConnected()
+            || databaseBackupActionPending
+            || databaseBackupRefreshPending;
+        restore.textContent = localized("Восстановить", "Restore");
+        restore.addEventListener("click", () => {
+            const prompt = localized(
+                `Восстановить базу из копии от ${formatEventTime(backup.created_at)}? Текущая база будет сохранена отдельно. Gateway остановит сценарии и отключит устройства; они смогут подключиться снова. Данные, созданные после копии, будут заменены.`,
+                `Restore the database from the backup created ${formatEventTime(backup.created_at)}? The current database will be saved separately. Gateway will stop scenarios and disconnect devices, which can reconnect afterward. Data created after this backup will be replaced.`
+            );
+            if (!window.confirm(prompt)) return;
+            databaseBackupActionPending = true;
+            databaseBackupFeedback.textContent = localized("Восстанавливаю базу…", "Restoring database…");
+            renderDatabaseBackups();
+            if (!sendGatewayAction("restore_database_backup", { backup_id: backup.backup_id })) {
+                databaseBackupActionPending = false;
+                databaseBackupFeedback.textContent = localized(
+                    "Gateway не принял запрос на восстановление.",
+                    "Gateway did not accept the restore request."
+                );
+                renderDatabaseBackups();
+            }
+        });
+
+        actions.append(download, restore);
+        entry.append(details, actions);
+        databaseBackupList.append(entry);
+    }
+}
+
 function localizeActivityMessage(message) {
     if (uiSettings.language !== "en") return message;
     const exact = {
@@ -280,6 +394,12 @@ function applyLanguage() {
     if (automationNameInput) {
         automationNameInput.placeholder = automationNameInput.dataset[`placeholder${uiSettings.language === "en" ? "En" : "Ru"}`] || "";
     }
+    if (deviceSearchInput) {
+        deviceSearchInput.placeholder = localized(
+            "Название, ID или прошивка",
+            "Name, ID or firmware"
+        );
+    }
     if (notificationButton) {
         notificationButton.setAttribute(
             "aria-label",
@@ -297,6 +417,7 @@ function applyLanguage() {
     renderDevices();
     renderEvents();
     renderDatabaseStats();
+    renderDatabaseBackups();
     refreshAutomationEditor();
     renderAutomations();
     updateAutomationEditorMode();
@@ -503,6 +624,9 @@ function markAllNotificationsRead() {
 function openNotificationEvent(event) {
     markNotificationRead(event.id);
     closeNotificationPanel();
+    eventSearchQuery = "";
+    if (eventSearchTimer !== null) window.clearTimeout(eventSearchTimer);
+    eventSearchTimer = null;
     eventDeviceFilter = "all";
     eventFilter = ["led", "parameter"].includes(event.event_type)
         ? "state"
@@ -539,6 +663,7 @@ function focusPendingEvent() {
 function initializeInterface() {
     if (settingNavigation) settingNavigation.value = uiSettings.navigation;
     if (settingLanguage) settingLanguage.value = uiSettings.language;
+    if (deviceSortSelect) deviceSortSelect.value = deviceSort;
     if (settingTimezone) {
         settingTimezone.value = [...settingTimezone.options].some(option => option.value === uiSettings.timezone)
             ? uiSettings.timezone
@@ -562,6 +687,37 @@ function initializeInterface() {
     });
     automationUndoButton?.addEventListener("click", () => window.AutomationBlockly?.undo());
     automationRedoButton?.addEventListener("click", () => window.AutomationBlockly?.redo());
+    deviceSearchInput?.addEventListener("input", renderDevices);
+    deviceSortSelect?.addEventListener("change", () => {
+        deviceSort = ["recent", "name", "status"].includes(deviceSortSelect.value)
+            ? deviceSortSelect.value
+            : "recent";
+        try {
+            localStorage.setItem(DEVICE_SORT_KEY, JSON.stringify(deviceSort));
+        } catch (error) {
+            console.warn("Could not save device sorting preference:", error);
+        }
+        renderDevices();
+    });
+    deviceFilterResetButton?.addEventListener("click", () => {
+        deviceFilter = "all";
+        if (deviceSearchInput) deviceSearchInput.value = "";
+        deviceSort = "recent";
+        if (deviceSortSelect) deviceSortSelect.value = deviceSort;
+        try {
+            localStorage.setItem(DEVICE_SORT_KEY, JSON.stringify(deviceSort));
+        } catch (error) {
+            console.warn("Could not save device sorting preference:", error);
+        }
+        renderDevices();
+    });
+    overview?.addEventListener("click", event => {
+        const metric = event.target.closest("[data-device-filter]");
+        if (metric) {
+            deviceFilter = metric.dataset.deviceFilter;
+            renderDevices();
+        }
+    });
     automationCancelEdit?.addEventListener("click", () => {
         editingAutomationId = null;
         automationForm?.reset();
@@ -667,6 +823,15 @@ function setGatewayConnectionStatus(message, connected) {
     const wasConnected = gatewayIsConnectedState;
     lastGatewayStatusMessage = message;
     gatewayIsConnectedState = connected;
+    if (!connected && wasConnected && databaseBackupRefreshPending) {
+        databaseBackupRefreshPending = false;
+        if (databaseBackupFeedback) {
+            databaseBackupFeedback.textContent = localized(
+                "Не удалось обновить список: соединение с Gateway потеряно.",
+                "Could not refresh the list: Gateway connection was lost."
+            );
+        }
+    }
     if (connected && !wasConnected) {
         const now = performance.now() / 1000;
         if (databaseStats) {
@@ -698,6 +863,7 @@ function setGatewayConnectionStatus(message, connected) {
         gatewayStatusDot.classList.toggle("connected", connected);
         gatewayStatusDot.classList.toggle("disconnected", !connected);
     }
+    renderDatabaseBackups();
 }
 
 function clearPendingCommand(commandId) {
@@ -796,7 +962,24 @@ function automationSummary(config) {
     } else {
         triggerText = localized("При запуске Gateway", "When Gateway starts");
     }
-    return `${triggerText} → ${automationActionCount(program.body)} ${localized("действий", "actions")}`;
+    return `${triggerText}${automationTriggerTimingLabel(trigger)} → ${automationActionCount(program.body)} ${localized("действий", "actions")}`;
+}
+
+function automationTriggerTimingLabel(trigger) {
+    const parts = [];
+    if (Number(trigger?.for_seconds) > 0) {
+        parts.push(localized(
+            `условие ${trigger.for_seconds} сек.`,
+            `stable ${trigger.for_seconds}s`
+        ));
+    }
+    if (Number(trigger?.cooldown_seconds) > 0) {
+        parts.push(localized(
+            `пауза ${trigger.cooldown_seconds} сек.`,
+            `${trigger.cooldown_seconds}s cooldown`
+        ));
+    }
+    return parts.length ? ` · ${parts.join(" · ")}` : "";
 }
 
 function refreshAutomationEditor(config = null) {
@@ -929,6 +1112,45 @@ function requestAutomationRunHistory(automationId) {
     }
 }
 
+function focusPendingAutomationRun() {
+    if (!pendingAutomationRunFocus) return;
+    const { automationId, runId } = pendingAutomationRunFocus;
+    const entry = [...(automationList?.querySelectorAll(".automation-run-entry") || [])]
+        .find(item => item.dataset.runId === runId);
+    if (entry) {
+        entry.scrollIntoView({ behavior: "smooth", block: "center" });
+        entry.classList.add("event-focus");
+        pendingAutomationRunFocus = null;
+        return;
+    }
+    if (automationRunHistories.has(automationId)) {
+        setActivity(localized(
+            "Запуск не найден в загруженной истории сценария.",
+            "Run was not found in the loaded scenario history."
+        ));
+        pendingAutomationRunFocus = null;
+    }
+}
+
+function openAutomationRunFromEvent(automationId, runId) {
+    if (!automationId || !runId) return;
+    if (!isGatewayConnected()) {
+        setActivity(localized("Нет соединения с Gateway.", "Gateway is disconnected."));
+        return;
+    }
+    pendingAutomationRunFocus = { automationId, runId };
+    openAutomationRunHistories.add(automationId);
+    setActivePage("automations");
+    if (!automations.some(item => item.automation_id === automationId)) {
+        sendGatewayAction("get_automations");
+    } else if (!automationRunHistories.has(automationId)) {
+        requestAutomationRunHistory(automationId);
+    } else {
+        renderAutomations();
+        window.setTimeout(focusPendingAutomationRun, 0);
+    }
+}
+
 function createAutomationRunHistory(automation) {
     const details = document.createElement("details");
     details.className = "automation-run-history";
@@ -941,6 +1163,35 @@ function createAutomationRunHistory(automation) {
     const content = document.createElement("div");
     content.className = "automation-run-history-list";
     const runs = automationRunHistories.get(automation.automation_id);
+    const runCount = automationRunHistoryCounts.get(automation.automation_id);
+    const completedCount = automationRunHistoryCompletedCounts.get(automation.automation_id);
+    if (runs) {
+        const toolbar = document.createElement("div");
+        toolbar.className = "automation-run-history-toolbar";
+        const count = document.createElement("span");
+        count.textContent = uiSettings.language === "en"
+            ? `${runCount ?? runs.length} saved runs`
+            : `Записей: ${runCount ?? runs.length}`;
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.className = "automation-run-clear-button";
+        clear.textContent = localized("Очистить историю", "Clear history");
+        clear.disabled = !completedCount || !isGatewayConnected();
+        clear.addEventListener("click", () => {
+            if (!completedCount || !isGatewayConnected()) return;
+            const prompt = localized(
+                `Удалить все записи запусков сценария «${automation.config?.name || automation.automation_id}»? Выполняющиеся запуски останутся в истории.`,
+                `Delete all run records for “${automation.config?.name || automation.automation_id}”? Runs in progress will be kept.`
+            );
+            if (window.confirm(prompt)) {
+                sendGatewayAction("clear_automation_run_history", {
+                    automation_id: automation.automation_id
+                });
+            }
+        });
+        toolbar.append(count, clear);
+        content.append(toolbar);
+    }
     if (!runs) {
         const loading = document.createElement("p");
         loading.textContent = localized("Загружаю историю…", "Loading history…");
@@ -995,8 +1246,8 @@ function automationRunTriggerLabel(run) {
             )
             : "";
         return localized(
-            `Изменение ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}${valueFilter}`,
-            `Change on ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}${valueFilter}`
+            `Изменение ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}${valueFilter}${automationTriggerTimingLabel(trigger)}`,
+            `Change on ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}${valueFilter}${automationTriggerTimingLabel(trigger)}`
         );
     }
     if (trigger.type === "device_connected") {
@@ -1088,6 +1339,7 @@ function automationRunStepLabel(step) {
 function createAutomationRunEntry(run, automationId, automationName) {
     const entry = document.createElement("article");
     entry.className = `automation-run-entry is-${run.status || "unknown"}`;
+    entry.dataset.runId = run.run_id;
 
     const heading = document.createElement("div");
     heading.className = "automation-run-heading";
@@ -1296,6 +1548,16 @@ function handleGatewayMessage(message) {
         case "automation_list": {
             automations = Array.isArray(message.automations) ? message.automations : [];
             const automationIds = new Set(automations.map(item => item.automation_id));
+            if (
+                pendingAutomationRunFocus &&
+                !automationIds.has(pendingAutomationRunFocus.automationId)
+            ) {
+                setActivity(localized(
+                    "Сценарий из события больше не существует.",
+                    "The scenario linked to this event no longer exists."
+                ));
+                pendingAutomationRunFocus = null;
+            }
             for (const automationId of automationRunHistories.keys()) {
                 automationRunHistories.delete(automationId);
                 if (!automationIds.has(automationId)) {
@@ -1339,8 +1601,22 @@ function handleGatewayMessage(message) {
             }
             if (message.success && Array.isArray(message.runs)) {
                 automationRunHistories.set(automationId, message.runs);
+                automationRunHistoryCounts.set(
+                    automationId,
+                    Number.isInteger(message.run_count)
+                        ? message.run_count
+                        : message.runs.length
+                );
+                automationRunHistoryCompletedCounts.set(
+                    automationId,
+                    Number.isInteger(message.completed_count)
+                        ? message.completed_count
+                        : message.runs.filter(run => run.status !== "running").length
+                );
             } else {
                 automationRunHistories.set(automationId, []);
+                automationRunHistoryCounts.set(automationId, 0);
+                automationRunHistoryCompletedCounts.set(automationId, 0);
             }
             if (!refreshAgain) renderAutomations();
             else {
@@ -1348,6 +1624,7 @@ function handleGatewayMessage(message) {
                 renderAutomations();
                 requestAutomationRunHistory(automationId);
             }
+            if (!refreshAgain) focusPendingAutomationRun();
             break;
         }
 
@@ -1355,6 +1632,15 @@ function handleGatewayMessage(message) {
             automationFeedback.textContent = message.success
                 ? localized("Запись запуска удалена.", "Run deleted.")
                 : (message.message || localized("Не удалось удалить запуск.", "Could not delete the run."));
+            break;
+
+        case "automation_run_clear_result":
+            automationFeedback.textContent = message.success
+                ? localized(
+                    `Удалено записей: ${message.deleted_count || 0}.`,
+                    `Deleted runs: ${message.deleted_count || 0}.`
+                )
+                : (message.message || localized("Не удалось очистить историю.", "Could not clear the history."));
             break;
 
         case "automation_save_result":
@@ -1494,6 +1780,49 @@ function handleGatewayMessage(message) {
             break;
         }
 
+        case "database_backups":
+            databaseBackups = Array.isArray(message.backups) ? message.backups : [];
+            if (databaseBackupRefreshPending) {
+                databaseBackupRefreshPending = false;
+                if (databaseBackupFeedback) {
+                    databaseBackupFeedback.textContent = localized(
+                        "Список резервных копий обновлён.",
+                        "Backup list updated."
+                    );
+                }
+            }
+            renderDatabaseBackups();
+            break;
+
+        case "database_backup_result":
+            databaseBackupActionPending = false;
+            if (databaseBackupFeedback) {
+                databaseBackupFeedback.textContent = message.success
+                    ? localized("Резервная копия создана на Gateway.", "Backup created on the Gateway.")
+                    : localized(
+                        `Не удалось создать копию: ${message.message || "ошибка"}`,
+                        `Could not create the backup: ${message.message || "unknown error"}`
+                    );
+            }
+            renderDatabaseBackups();
+            break;
+
+        case "database_backup_restore_result":
+            databaseBackupActionPending = false;
+            if (databaseBackupFeedback) {
+                databaseBackupFeedback.textContent = message.success
+                    ? localized(
+                        "База восстановлена. Устройства отключены и могут подключиться снова.",
+                        "Database restored. Devices are disconnected and can reconnect."
+                    )
+                    : localized(
+                        `Не удалось восстановить базу: ${message.message || "ошибка"}`,
+                        `Could not restore the database: ${message.message || "unknown error"}`
+                    );
+            }
+            renderDatabaseBackups();
+            break;
+
         case "device_list": {
             devices = Array.isArray(message.devices)
                 ? message.devices
@@ -1551,6 +1880,20 @@ function handleGatewayMessage(message) {
             if (message.success) {
                 if (message.device !== message.new_device_id) {
                     window.AutomationBlockly?.replaceDeviceId(message.device, message.new_device_id);
+                    if (favoriteDeviceIds.delete(message.device)) {
+                        favoriteDeviceIds.add(message.new_device_id);
+                        saveFavoriteDeviceIds();
+                    }
+                    for (const [key, value] of [...deviceDrafts]) {
+                        const [draftDeviceId, parameterId] = key.split("\u0000");
+                        if (draftDeviceId === message.device) {
+                            deviceDrafts.delete(key);
+                            deviceDrafts.set(
+                                `${message.new_device_id}\u0000${parameterId}`,
+                                value
+                            );
+                        }
+                    }
                     selectedDeviceModes.delete(message.device);
                     if (eventDeviceFilter === message.device) eventDeviceFilter = message.new_device_id;
                     for (const event of unreadNotifications) {
@@ -1584,12 +1927,16 @@ function handleGatewayMessage(message) {
 
                 device.last_seen = message.last_seen;
                 device.connected = true;
+                if (message.last_telemetry_at) {
+                    device.last_telemetry_at = message.last_telemetry_at;
+                }
             } else {
                 device = {
                     device: message.device,
                     connected: true,
                     parameters: message.parameters || {},
-                    last_seen: message.last_seen
+                    last_seen: message.last_seen,
+                    last_telemetry_at: message.last_telemetry_at || null
                 };
 
                 devices.push(device);
@@ -1623,6 +1970,7 @@ function handleGatewayMessage(message) {
                 const input = [...(panel?.querySelectorAll('[data-role="parameter-input"]') || [])]
                     .find(item => item.dataset.parameterId === pending.parameter);
                 if (input) input.dataset.dirty = "false";
+                deviceDrafts.delete(`${pending.deviceId}\u0000${pending.parameter}`);
             }
 
             clearPendingCommand(message.command_id);
@@ -1704,17 +2052,38 @@ function handleGatewayMessage(message) {
                     eventsLoading = false;
                     break;
                 }
+                if (
+                    activeEventRequest.searchQuery !== eventSearchQuery.trim() ||
+                    (message.search ?? "") !== activeEventRequest.searchQuery
+                ) {
+                    activeEventRequest = null;
+                    eventsLoading = false;
+                    if (eventSearchQuery.trim()) {
+                        setActivity(localized(
+                            "Поиск требует перезапуска Gateway с обновлённым кодом.",
+                            "Search requires restarting Gateway with the updated code."
+                        ));
+                    }
+                    renderEvents();
+                    break;
+                }
 
                 if (activeEventRequest.mode === "reset") {
                     events = incomingEvents;
-                    initializeNotifications = !notificationStateReady;
-                    shouldBackfillNotifications = activeEventRequest.deviceFilter === "all";
+                    initializeNotifications =
+                        !notificationStateReady && !activeEventRequest.searchQuery;
+                    shouldBackfillNotifications =
+                        activeEventRequest.deviceFilter === "all" &&
+                        !activeEventRequest.searchQuery;
                 } else {
                     events = mergeEventPages(events, incomingEvents);
                 }
 
                 eventCursor = message.next_before_id ?? null;
                 eventsHasMore = message.has_more === true;
+                eventMatchCount = Number.isInteger(message.total_count)
+                    ? message.total_count
+                    : incomingEvents.length;
                 activeEventRequest = null;
                 eventsLoading = false;
             } else {
@@ -1723,14 +2092,17 @@ function handleGatewayMessage(message) {
                     return (
                         eventDeviceFilter === "all" ||
                         event.device_id === eventDeviceFilter
-                    );
+                    ) && eventMatchesSearch(event, eventSearchQuery);
                 });
 
                 events = mergeEventPages(events, matchingEvents);
 
-                if (!hadLoadedEvents && eventDeviceFilter === "all") {
+                if (!hadLoadedEvents && eventDeviceFilter === "all" && !eventSearchQuery) {
                     eventCursor = message.next_before_id ?? null;
                     eventsHasMore = message.has_more === true;
+                    if (Number.isInteger(message.total_count)) {
+                        eventMatchCount = message.total_count;
+                    }
                 }
             }
 
@@ -2498,20 +2870,85 @@ function createParameterControlStylePicker(device, parameterId, definition, pref
     return details;
 }
 
+function saveFavoriteDeviceIds() {
+    try {
+        localStorage.setItem(
+            DEVICE_FAVORITES_KEY,
+            JSON.stringify([...favoriteDeviceIds])
+        );
+    } catch (error) {
+        console.warn("Could not save pinned devices:", error);
+    }
+}
+
+function toggleDeviceFavorite(deviceId) {
+    if (favoriteDeviceIds.has(deviceId)) {
+        favoriteDeviceIds.delete(deviceId);
+    } else {
+        favoriteDeviceIds.add(deviceId);
+    }
+    saveFavoriteDeviceIds();
+    renderDevices();
+}
+
+function getVisibleDevices() {
+    const query = deviceSearchInput?.value.trim().toLocaleLowerCase() || "";
+    const filtered = devices.filter(device => {
+        if (deviceFilter === "online" && !device.connected) return false;
+        if (deviceFilter === "offline" && device.connected) return false;
+        if (deviceFilter === "favorites" && !favoriteDeviceIds.has(device.device)) return false;
+        if (!query) return true;
+        const searchable = [
+            device.display_name,
+            device.name,
+            device.device,
+            device.firmware_version
+        ].filter(Boolean).join(" ").toLocaleLowerCase();
+        return searchable.includes(query);
+    });
+
+    const collator = new Intl.Collator(uiSettings.language, {
+        numeric: true,
+        sensitivity: "base"
+    });
+    filtered.sort((left, right) => {
+        const favoriteOrder = Number(favoriteDeviceIds.has(right.device)) -
+            Number(favoriteDeviceIds.has(left.device));
+        if (favoriteOrder !== 0) return favoriteOrder;
+        if (deviceSort === "name") {
+            return collator.compare(
+                left.display_name || left.name || left.device,
+                right.display_name || right.name || right.device
+            );
+        }
+        if (deviceSort === "status") {
+            return Number(right.connected) - Number(left.connected) ||
+                collator.compare(left.device, right.device);
+        }
+        const leftSeen = Date.parse(left.last_seen || "") || 0;
+        const rightSeen = Date.parse(right.last_seen || "") || 0;
+        return rightSeen - leftSeen || collator.compare(left.device, right.device);
+    });
+    return filtered;
+}
+
 function renderDevices() {
     if (!deviceCard) {
         console.error("Не найден элемент .device-card");
         return;
     }
 
-    const drafts = new Map();
     for (const input of deviceCard.querySelectorAll('[data-role="parameter-input"][data-dirty="true"]')) {
-        drafts.set(`${input.dataset.deviceId}\u0000${input.dataset.parameterId}`, input.value);
+        deviceDrafts.set(`${input.dataset.deviceId}\u0000${input.dataset.parameterId}`, input.value);
     }
 
     deviceCard.replaceChildren();
 
     if (devices.length === 0) {
+        if (deviceResultCount) {
+            deviceResultCount.textContent = localized("Устройств пока нет", "No devices yet");
+        }
+        if (deviceFilterResetButton) deviceFilterResetButton.disabled = true;
         const empty = document.createElement("p");
         empty.className = "device-empty";
         empty.textContent = localized("Устройства пока не найдены.", "No devices found yet.");
@@ -2521,7 +2958,44 @@ function renderDevices() {
         return;
     }
 
-    for (const device of devices) {
+    const visibleDevices = getVisibleDevices();
+    if (deviceResultCount) {
+        deviceResultCount.textContent = localized(
+            `Показано ${visibleDevices.length} из ${devices.length}`,
+            `Showing ${visibleDevices.length} of ${devices.length}`
+        );
+    }
+    if (deviceFilterResetButton) {
+        deviceFilterResetButton.disabled =
+            deviceFilter === "all" &&
+            !deviceSearchInput?.value.trim() &&
+            deviceSort === "recent";
+    }
+
+    if (visibleDevices.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "device-filter-empty";
+        const message = document.createElement("p");
+        message.textContent = deviceFilter === "favorites" && favoriteDeviceIds.size === 0
+            ? localized(
+                "Пока нет закреплённых устройств. Нажмите ★ в карточке устройства, чтобы добавить его сюда.",
+                "No pinned devices yet. Select the star on a device card to add it here."
+            )
+            : localized(
+                "По этим условиям устройств не найдено.",
+                "No devices match these filters."
+            );
+        const reset = document.createElement("button");
+        reset.type = "button";
+        reset.textContent = localized("Показать все устройства", "Show all devices");
+        reset.addEventListener("click", () => deviceFilterResetButton?.click());
+        empty.append(message, reset);
+        deviceCard.appendChild(empty);
+        renderOverview();
+        return;
+    }
+
+    for (const device of visibleDevices) {
         const panel = document.createElement("article");
         panel.className = "device-panel";
         panel.dataset.deviceId = device.device;
@@ -2570,6 +3044,20 @@ function renderDevices() {
 
         const headerActions = document.createElement("div");
         headerActions.className = "device-header-actions";
+        const favorite = document.createElement("button");
+        const isFavorite = favoriteDeviceIds.has(device.device);
+        favorite.type = "button";
+        favorite.className = "device-favorite-button";
+        favorite.dataset.role = "device-favorite";
+        favorite.setAttribute("aria-pressed", String(isFavorite));
+        favorite.textContent = isFavorite ? "★" : "☆";
+        favorite.title = isFavorite
+            ? localized("Открепить устройство", "Unpin device")
+            : localized("Закрепить устройство сверху", "Pin device to the top");
+        favorite.setAttribute("aria-label", favorite.title);
+        favorite.addEventListener("click", () => toggleDeviceFavorite(device.device));
+        headerActions.appendChild(favorite);
+
         const editIdentity = document.createElement("button");
         editIdentity.type = "button";
         editIdentity.className = "device-identity-button";
@@ -2719,6 +3207,10 @@ function renderDevices() {
                             isSelect ? "change" : "input",
                             () => {
                                 input.dataset.dirty = "true";
+                                deviceDrafts.set(
+                                    `${device.device}\u0000${parameterId}`,
+                                    input.value
+                                );
                                 if (valuePreview) {
                                     valuePreview.textContent = formatDisplayedParameterValue(
                                         Number(input.value), definition
@@ -2794,7 +3286,9 @@ function renderDevices() {
                             }
                         }
 
-                        const savedDraft = drafts.get(`${device.device}\u0000${parameterId}`);
+                        const savedDraft = deviceDrafts.get(
+                            `${device.device}\u0000${parameterId}`
+                        );
                         if (savedDraft !== undefined) {
                             input.value = savedDraft;
                             input.dataset.dirty = "true";
@@ -2896,6 +3390,47 @@ function renderDevices() {
     }
 
     renderOverview();
+}
+
+function deviceTelemetryFreshness(device) {
+    const timestamp = Date.parse(device.last_telemetry_at || "");
+    if (!Number.isFinite(timestamp)) {
+        return {
+            state: "unknown",
+            label: localized("Телеметрия ещё не поступала", "No telemetry received yet")
+        };
+    }
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+    const staleAfter = Number(device.telemetry_stale_after_seconds) || 45;
+    const age = formatDatabaseDuration(ageSeconds);
+    return ageSeconds > staleAfter
+        ? {
+            state: "stale",
+            label: localized(`Данные устарели · ${age} назад`, `Data is stale · ${age} ago`)
+        }
+        : {
+            state: "fresh",
+            label: localized(`Данные свежие · ${age} назад`, `Data is fresh · ${age} ago`)
+        };
+}
+
+function updateDeviceHint(device, panel = null) {
+    panel ||= [...(deviceCard?.querySelectorAll(".device-panel") || [])]
+        .find(item => item.dataset.deviceId === device.device);
+    const hint = panel?.querySelector('[data-role="device-hint"]');
+    if (!hint) return;
+    const freshness = deviceTelemetryFreshness(device);
+    const lastMessage = device.connected
+        ? localized("Последнее сообщение", "Last message")
+        : localized("Устройство отключено", "Device offline");
+    hint.textContent = `${lastMessage}: ${device.last_seen || "—"} · ${freshness.label}`;
+    hint.classList.toggle("telemetry-fresh", freshness.state === "fresh");
+    hint.classList.toggle("telemetry-stale", freshness.state === "stale");
+    hint.classList.toggle("telemetry-unknown", freshness.state === "unknown");
+}
+
+function updateDeviceFreshnessHints() {
+    for (const device of devices) updateDeviceHint(device);
 }
 
 function updateDevicePanel(device) {
@@ -3061,30 +3596,44 @@ function updateDevicePanel(device) {
         button.disabled = !isGatewayConnected() || Boolean(schemaDecisionPending);
     }
 
-    const hint = panel.querySelector('[data-role="device-hint"]');
-    if (hint) {
-        hint.textContent = device.connected
-            ? localized(
-                `Последнее сообщение: ${device.last_seen || "неизвестно"}`,
-                `Last message: ${device.last_seen || "unknown"}`
-            )
-            : localized("Устройство сейчас не подключено.", "Device is currently offline.");
-    }
+    updateDeviceHint(device, panel);
     renderOverview();
 }
 
 function renderOverview() {
     if (!overview) return;
     const online = devices.filter(device => device.connected).length;
+    const favoriteCount = devices.filter(device => favoriteDeviceIds.has(device.device)).length;
     const metrics = [
-        { value: String(devices.length), label: localized("Устройства", "Devices") },
-        { value: String(online), label: localized("На связи", "Online") },
-        { value: String(Math.max(0, devices.length - online)), label: localized("Не в сети", "Offline") }
+        {
+            value: String(devices.length),
+            label: localized("Все устройства", "All devices"),
+            filter: "all"
+        },
+        {
+            value: String(online),
+            label: localized("На связи", "Online"),
+            filter: "online"
+        },
+        {
+            value: String(Math.max(0, devices.length - online)),
+            label: localized("Не в сети", "Offline"),
+            filter: "offline"
+        },
+        {
+            value: String(favoriteCount),
+            label: localized("Избранное", "Pinned"),
+            filter: "favorites"
+        }
     ];
     overview.replaceChildren();
     for (const metric of metrics) {
-        const item = document.createElement("div");
+        const item = document.createElement("button");
+        item.type = "button";
         item.className = "overview-metric";
+        item.dataset.deviceFilter = metric.filter;
+        item.setAttribute("aria-pressed", String(deviceFilter === metric.filter));
+        item.classList.toggle("is-active", deviceFilter === metric.filter);
         const value = document.createElement("strong");
         value.textContent = metric.value;
         const label = document.createElement("span");
@@ -3214,9 +3763,14 @@ function getEventDescription(event) {
             : "";
         const errorText = command.error ? ` — ${command.error}` : "";
 
-        const sourceLabel = command.command_id?.startsWith("auto-")
-            ? localized("Автоматизация · ", "Automation · ")
-            : "";
+        const scenario = command.automation_id
+            ? automations.find(item => item.automation_id === command.automation_id)
+            : null;
+        const sourceLabel = command.automation_id
+            ? `${localized("Автоматизация", "Automation")}${scenario?.config?.name ? ` «${scenario.config.name}»` : ""} · `
+            : command.command_id?.startsWith("auto-")
+                ? localized("Автоматизация · ", "Automation · ")
+                : "";
         return `${sourceLabel}${operationLabel}: ${requestedValue}, ${status}${actualText}${errorText}`;
     }
 
@@ -3228,7 +3782,13 @@ function getEventDescription(event) {
                 type: typeof change.value
             };
             const label = definition.label || change.parameter;
-            return `${label}: ${formatParameterValue(change.value, definition)}`;
+            const scenario = change.source === "automation"
+                ? automations.find(item => item.automation_id === change.automation_id)
+                : null;
+            const sourceLabel = change.source === "automation"
+                ? `${localized("Автоматизация", "Automation")}${scenario?.config?.name ? ` «${scenario.config.name}»` : ""} · `
+                : "";
+            return `${sourceLabel}${label}: ${formatParameterValue(change.value, definition)}`;
         } catch (error) {
             return localized(`Изменение параметра: ${value}`, `Parameter change: ${value}`);
         }
@@ -3282,6 +3842,21 @@ function getEventDescription(event) {
     return localized(`${event.event_type}: ${value}`, `${event.event_type}: ${value}`);
 }
 
+function getAutomationEventSource(event) {
+    if (!(["parameter", "command"].includes(event.event_type))) return null;
+    try {
+        const data = JSON.parse(event.event_value || "{}");
+        if (event.event_type === "parameter") {
+            return data.source === "automation" ? data : null;
+        }
+        return data.automation_id && data.run_id
+            ? { automation_id: data.automation_id, run_id: data.run_id }
+            : null;
+    } catch (error) {
+        return null;
+    }
+}
+
 function isCommandEchoEvent(event, eventList) {
     let parameter;
     let value;
@@ -3295,6 +3870,7 @@ function isCommandEchoEvent(event, eventList) {
             value = normalized === "true" || normalized === "1";
         } else if (event.event_type === "parameter") {
             const change = JSON.parse(event.event_value || "{}");
+            if (change.source === "automation") return false;
             parameter = change.parameter;
             value = change.value;
         } else {
@@ -3318,6 +3894,7 @@ function isCommandEchoEvent(event, eventList) {
 
         try {
             const command = JSON.parse(commandEvent.event_value || "{}");
+            if (command.command_id?.startsWith("auto-")) return false;
             if (command.status !== "succeeded" || command.parameter !== parameter) {
                 return false;
             }
@@ -3336,11 +3913,68 @@ function isCommandEchoEvent(event, eventList) {
 // ИСТОРИЯ СОБЫТИЙ
 // =========================
 
+function eventMatchesSearch(event, query) {
+    const normalizedQuery = String(query || "").trim().toLocaleLowerCase();
+    if (!normalizedQuery) return true;
+    const device = devices.find(item => item.device === event.device_id);
+    const searchableText = [
+        event.device_id,
+        event.event_type,
+        event.event_value,
+        event.timestamp,
+        device?.name,
+        device?.display_name,
+        JSON.stringify(device?.schema || {}),
+        getEventDescription(event)
+    ].map(value => String(value ?? "")).join(" ").toLocaleLowerCase();
+    return searchableText.includes(normalizedQuery);
+}
+
+function exportEventsCsv(eventList) {
+    const columns = [
+        localized("ID", "ID"),
+        localized("Дата и время", "Date and time"),
+        localized("Устройство", "Device"),
+        localized("Тип", "Type"),
+        localized("Описание", "Description"),
+        localized("Значение", "Value")
+    ];
+    const escapeCell = value => {
+        let text = String(value ?? "");
+        if (/^[=+@\-\t\r]/.test(text)) text = `'${text}`;
+        return `"${text.replaceAll('"', '""')}"`;
+    };
+    const lines = [columns, ...eventList.map(event => [
+        event.id,
+        event.timestamp,
+        event.device_id,
+        event.event_type,
+        getEventDescription(event),
+        event.event_value
+    ])].map(row => row.map(escapeCell).join(","));
+    const blob = new Blob([`\uFEFF${lines.join("\r\n")}`], {
+        type: "text/csv;charset=utf-8"
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `gateway-events-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+}
+
 function renderEvents() {
     if (!activityCard) {
         console.error("Не найден элемент .activity-card");
         return;
     }
+
+    const searchWasFocused = document.activeElement?.classList.contains("event-search-input");
+    const oldSearchInput = document.activeElement;
+    const searchSelectionStart = searchWasFocused ? oldSearchInput.selectionStart : null;
+    const searchSelectionEnd = searchWasFocused ? oldSearchInput.selectionEnd : null;
 
     // История находится в отдельном контейнере,
     // поэтому сообщение #activity-message не удаляется.
@@ -3358,6 +3992,68 @@ function renderEvents() {
     const heading = document.createElement("h2");
     heading.textContent = localized("История событий", "Activity history");
     container.appendChild(heading);
+
+    const controls = document.createElement("div");
+    controls.className = "event-controls";
+
+    const searchLabel = document.createElement("label");
+    searchLabel.className = "event-search-label";
+    const searchCaption = document.createElement("span");
+    searchCaption.textContent = localized("Поиск по истории", "Search history");
+    const searchInput = document.createElement("input");
+    searchInput.type = "search";
+    searchInput.className = "event-search-input";
+    searchInput.maxLength = 120;
+    searchInput.value = eventSearchQuery;
+    searchInput.placeholder = localized(
+        "Устройство, событие или текст…",
+        "Device, event type or text…"
+    );
+    searchInput.setAttribute("aria-label", localized("Поиск по истории событий", "Search event history"));
+    searchInput.addEventListener("input", () => {
+        eventSearchQuery = searchInput.value.slice(0, 120);
+        clearSearch.disabled = !eventSearchQuery.trim();
+        events = [];
+        eventCursor = null;
+        eventMatchCount = null;
+        eventsHasMore = false;
+        if (eventSearchTimer !== null) window.clearTimeout(eventSearchTimer);
+        eventSearchTimer = window.setTimeout(() => {
+            eventSearchTimer = null;
+            requestEvents({ reset: true });
+        }, 350);
+    });
+    searchLabel.append(searchCaption, searchInput);
+
+    const searchActions = document.createElement("div");
+    searchActions.className = "event-search-actions";
+    const clearSearch = document.createElement("button");
+    clearSearch.type = "button";
+    clearSearch.className = "event-tool-button";
+    clearSearch.textContent = localized("Очистить поиск", "Clear search");
+    clearSearch.disabled = !eventSearchQuery.trim();
+    clearSearch.addEventListener("click", () => {
+        eventSearchQuery = "";
+        events = [];
+        eventCursor = null;
+        eventMatchCount = null;
+        eventsHasMore = false;
+        if (eventSearchTimer !== null) window.clearTimeout(eventSearchTimer);
+        eventSearchTimer = null;
+        requestEvents({ reset: true });
+    });
+    const exportButton = document.createElement("button");
+    exportButton.type = "button";
+    exportButton.className = "event-tool-button";
+    exportButton.textContent = localized("Экспорт CSV", "Export CSV");
+    exportButton.disabled = events.length === 0;
+    exportButton.title = localized(
+        "Скачать загруженные записи с учётом выбранного фильтра",
+        "Download loaded records using the selected filters"
+    );
+    searchActions.append(clearSearch, exportButton);
+    controls.append(searchLabel, searchActions);
+    container.appendChild(controls);
 
     const deviceFilterLabel = document.createElement("label");
     deviceFilterLabel.className = "event-device-filter-group";
@@ -3383,9 +4079,9 @@ function renderEvents() {
         eventDeviceFilter = deviceFilter.value;
         events = [];
         eventCursor = null;
+        eventMatchCount = null;
         eventsHasMore = false;
         requestEvents({ reset: true });
-        renderEvents();
     });
 
     deviceFilterLabel.appendChild(deviceFilter);
@@ -3472,11 +4168,25 @@ function renderEvents() {
 
     const summary = document.createElement("p");
     summary.className = "event-summary";
+    const totalMatchedText = eventMatchCount === null
+        ? "—"
+        : new Intl.NumberFormat(uiSettings.language === "en" ? "en-US" : "ru-RU").format(eventMatchCount);
     summary.textContent = uiSettings.language === "en"
-        ? `Showing ${filteredEvents.length} of ${deduplicatedEvents.length} loaded events`
-        : `Показано ${filteredEvents.length} из ${deduplicatedEvents.length} загруженных событий`;
+        ? `Matches in history: ${totalMatchedText} · Loaded: ${deduplicatedEvents.length} · Shown by type: ${filteredEvents.length}`
+        : `Найдено в истории: ${totalMatchedText} · Загружено: ${deduplicatedEvents.length} · Показано по типу: ${filteredEvents.length}`;
 
     container.appendChild(summary);
+
+    exportButton.disabled = filteredEvents.length === 0;
+    exportButton.addEventListener("click", () => exportEventsCsv(filteredEvents));
+
+    const restoreSearchFocus = () => {
+        if (!searchWasFocused) return;
+        searchInput.focus({ preventScroll: true });
+        if (Number.isInteger(searchSelectionStart) && Number.isInteger(searchSelectionEnd)) {
+            searchInput.setSelectionRange(searchSelectionStart, searchSelectionEnd);
+        }
+    };
 
     if (filteredEvents.length === 0) {
         const empty = document.createElement("p");
@@ -3488,6 +4198,7 @@ function renderEvents() {
 
         container.appendChild(empty);
         renderLoadMoreButton(container);
+        restoreSearchFocus();
         return;
     }
 
@@ -3553,6 +4264,27 @@ function renderEvents() {
 
         row.append(top, description, timestamp);
 
+        const automationSource = getAutomationEventSource(event);
+        if (automationSource?.automation_id && automationSource?.run_id) {
+            const scenario = automations.find(
+                item => item.automation_id === automationSource.automation_id
+            );
+            const openRun = document.createElement("button");
+            openRun.type = "button";
+            openRun.className = "event-automation-link";
+            openRun.textContent = scenario?.config?.name
+                ? localized(
+                    `Открыть запуск «${scenario.config.name}»`,
+                    `Open run “${scenario.config.name}”`
+                )
+                : localized("Открыть запуск сценария", "Open scenario run");
+            openRun.addEventListener("click", () => openAutomationRunFromEvent(
+                automationSource.automation_id,
+                automationSource.run_id
+            ));
+            row.appendChild(openRun);
+        }
+
         const isPermanentlyBlocked =
             event.event_type === "connection" &&
             String(event.event_value ?? "").includes("постоянный запрет подключения") &&
@@ -3575,6 +4307,7 @@ function renderEvents() {
 
     container.appendChild(list);
     renderLoadMoreButton(container);
+    restoreSearchFocus();
 }
 
 function renderLoadMoreButton(container) {
@@ -4030,6 +4763,10 @@ function sendSchemaDecision(deviceId, proposalId, decision) {
 }
 
 function requestEvents({ reset = false } = {}) {
+    if (reset && eventSearchTimer !== null) {
+        window.clearTimeout(eventSearchTimer);
+        eventSearchTimer = null;
+    }
     if (!socket || socket.readyState !== WebSocket.OPEN) {
         return;
     }
@@ -4043,11 +4780,14 @@ function requestEvents({ reset = false } = {}) {
     }
 
     const requestId = `events-${Date.now().toString(36)}-${++eventRequestSequence}`;
+    const searchQuery = eventSearchQuery.trim();
     activeEventRequest = {
         requestId,
         mode: reset ? "reset" : "append",
-        deviceFilter: eventDeviceFilter
+        deviceFilter: eventDeviceFilter,
+        searchQuery
     };
+    if (reset) eventMatchCount = null;
     eventsLoading = true;
     renderEvents();
 
@@ -4056,6 +4796,7 @@ function requestEvents({ reset = false } = {}) {
             type: "browser_message",
             action: "get_events",
             device: eventDeviceFilter,
+            search: searchQuery,
             before_id: reset ? null : eventCursor,
             request_id: requestId
         }));
@@ -4088,6 +4829,43 @@ if (refreshButton) {
     console.warn("Кнопка #refresh-button не найдена.");
 }
 
+databaseBackupCreateButton?.addEventListener("click", () => {
+    if (databaseBackupActionPending) return;
+    databaseBackupActionPending = true;
+    if (databaseBackupFeedback) {
+        databaseBackupFeedback.textContent = localized(
+            "Создаю согласованную копию базы…",
+            "Creating a consistent database snapshot…"
+        );
+    }
+    renderDatabaseBackups();
+    if (!sendGatewayAction("create_database_backup")) {
+        databaseBackupActionPending = false;
+        if (databaseBackupFeedback) {
+            databaseBackupFeedback.textContent = localized(
+                "Gateway не принял запрос на создание копии.",
+                "Gateway did not accept the backup request."
+            );
+        }
+        renderDatabaseBackups();
+    }
+});
+
+databaseBackupRefreshButton?.addEventListener("click", () => {
+    if (databaseBackupActionPending || databaseBackupRefreshPending) return;
+    databaseBackupRefreshPending = true;
+    databaseBackupFeedback.textContent = localized("Обновляю список…", "Refreshing backup list…");
+    renderDatabaseBackups();
+    if (!sendGatewayAction("get_database_backups")) {
+        databaseBackupRefreshPending = false;
+        databaseBackupFeedback.textContent = localized(
+            "Gateway не принял запрос на обновление списка.",
+            "Gateway did not accept the refresh request."
+        );
+        renderDatabaseBackups();
+    }
+});
+
 // =========================
 // ЗАПУСК ПРИЛОЖЕНИЯ
 // =========================
@@ -4095,4 +4873,5 @@ if (refreshButton) {
 initializeInterface();
 connectGateway();
 setInterval(renderDatabaseStats, 1000);
+setInterval(updateDeviceFreshnessHints, 1000);
 setInterval(requestDatabaseStats, 30000);

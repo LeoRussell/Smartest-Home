@@ -7,10 +7,13 @@ import re
 import sqlite3
 import sys
 import uuid
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
 import websockets
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 from websockets.exceptions import ConnectionClosed
 
 for stream in (sys.stdin, sys.stdout, sys.stderr):
@@ -37,10 +40,17 @@ DB_PATH_VALUE = os.environ.get("GATEWAY_DB_PATH", str(BASE_DIR / "gateway.db"))
 if not DB_PATH_VALUE.strip():
     raise RuntimeError("GATEWAY_DB_PATH must not be empty.")
 DB_PATH = Path(DB_PATH_VALUE).expanduser()
+DATABASE_BACKUP_DIR = DB_PATH.parent / "backups"
+DATABASE_BACKUP_LIMIT = 20
+DATABASE_BACKUP_DOWNLOAD_LIMIT = 512 * 1024 * 1024
+DATABASE_BACKUP_ID_PATTERN = re.compile(
+    r"gateway-\d{8}-\d{6}-[a-f0-9]{32}\.sqlite3"
+)
 
 # Активные ESP32: device_id -> WebSocket
 devices = {}
 device_wire_ids = {}
+device_handler_tasks = set()
 
 # Подключённые браузеры
 browser_clients = set()
@@ -58,6 +68,9 @@ pending_device_connections = {}
 # Команды, ожидающие результата: command_id -> контекст команды.
 pending_commands = {}
 automation_tasks = {}
+automation_trigger_tasks = {}
+automation_trigger_devices = {}
+database_restore_in_progress = False
 automation_stop_requests = set()
 automation_waiting_tasks = set()
 automation_restart_tasks = set()
@@ -97,6 +110,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS devices (
                 device_id TEXT PRIMARY KEY,
                 last_seen TEXT,
+                last_telemetry_at TEXT,
                 led INTEGER,
                 connected INTEGER DEFAULT 0
             )
@@ -263,6 +277,7 @@ def init_db():
             "schema_version": "INTEGER",
             "schema_json": "TEXT",
             "state_json": "TEXT",
+            "last_telemetry_at": "TEXT",
             "trust_policy": "TEXT DEFAULT 'allow'"
         }
 
@@ -462,6 +477,132 @@ def get_database_stats():
         "total_uptime_seconds": total_uptime_seconds,
         "sampled_at": now.timestamp()
     }
+
+
+def database_backup_metadata(path):
+    stat = path.stat()
+    return {
+        "backup_id": path.name,
+        "created_at": datetime.fromtimestamp(
+            stat.st_mtime, timezone.utc
+        ).astimezone().isoformat(timespec="seconds"),
+        "size_bytes": stat.st_size
+    }
+
+
+def list_database_backups():
+    if not DATABASE_BACKUP_DIR.is_dir():
+        return []
+    backups = [
+        path for path in DATABASE_BACKUP_DIR.iterdir()
+        if path.is_file() and DATABASE_BACKUP_ID_PATTERN.fullmatch(path.name)
+    ]
+    backups.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return [database_backup_metadata(path) for path in backups[:DATABASE_BACKUP_LIMIT]]
+
+
+def create_database_backup(prune=True, preserve_ids=()):
+    if not DB_PATH.is_file():
+        raise FileNotFoundError("Gateway database does not exist.")
+
+    DATABASE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_id = f"gateway-{stamp}-{uuid.uuid4().hex}.sqlite3"
+    backup_path = DATABASE_BACKUP_DIR / backup_id
+    temporary_path = DATABASE_BACKUP_DIR / f".{backup_id}.tmp"
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as source:
+            with closing(sqlite3.connect(temporary_path, timeout=30)) as destination:
+                source.backup(destination, pages=256, sleep=0.01)
+                integrity = destination.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise sqlite3.DatabaseError("Backup integrity check failed.")
+        os.replace(temporary_path, backup_path)
+    except Exception:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    if prune:
+        backups = [
+            path for path in DATABASE_BACKUP_DIR.iterdir()
+            if path.is_file() and DATABASE_BACKUP_ID_PATTERN.fullmatch(path.name)
+        ]
+        backups.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        preserved_ids = set(preserve_ids)
+        remaining_count = len(backups)
+        for old_path in reversed(backups):
+            if remaining_count <= DATABASE_BACKUP_LIMIT:
+                break
+            if old_path.name in preserved_ids:
+                continue
+            try:
+                old_path.unlink()
+                remaining_count -= 1
+            except OSError as error:
+                print(f"[BACKUP] Could not prune {old_path.name}: {error}")
+    return database_backup_metadata(backup_path)
+
+
+def validate_database_backup(path):
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise ValueError("Backup file is missing or empty.")
+    with closing(sqlite3.connect(path, timeout=30)) as connection:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise sqlite3.DatabaseError("Backup integrity check failed.")
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    if not {"devices", "device_events"}.issubset(tables):
+        raise ValueError("The file isn't an IoT Gateway database backup.")
+
+
+def restore_database_file(path):
+    validate_database_backup(path)
+    with closing(sqlite3.connect(path, timeout=30)) as source:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as destination:
+            source.backup(destination, pages=256, sleep=0.01)
+            integrity = destination.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise sqlite3.DatabaseError("Restored database integrity check failed.")
+
+
+def handle_http_request(connection, request):
+    match = re.fullmatch(
+        r"/gateway-backups/(gateway-\d{8}-\d{6}-[a-f0-9]{32}\.sqlite3)",
+        request.path
+    )
+    if match is None:
+        return None
+    if request.method != "GET":
+        status_code, reason, body = 405, "Method Not Allowed", b"Method not allowed"
+    else:
+        backup_path = DATABASE_BACKUP_DIR / match.group(1)
+        try:
+            if not backup_path.is_file():
+                status_code, reason, body = 404, "Not Found", b"Backup not found"
+            elif backup_path.stat().st_size > DATABASE_BACKUP_DOWNLOAD_LIMIT:
+                status_code, reason, body = 413, "Content Too Large", b"Backup is too large to download"
+            else:
+                body = backup_path.read_bytes()
+                status_code, reason = 200, "OK"
+        except OSError:
+            status_code, reason, body = 404, "Not Found", b"Backup not found"
+
+    headers = Headers()
+    headers["Content-Type"] = "application/octet-stream"
+    headers["Content-Length"] = str(len(body))
+    headers["Cache-Control"] = "no-store"
+    headers["X-Content-Type-Options"] = "nosniff"
+    if status_code == 200:
+        headers["Content-Disposition"] = f'attachment; filename="{backup_path.name}"'
+    headers["Connection"] = "close"
+    return Response(status_code, reason, headers, body)
 
 
 async def gateway_runtime_checkpoint_loop():
@@ -1579,7 +1720,9 @@ def load_pending_commands():
             "attempts": attempts,
             "status": "queued",
             "timeout_task": None,
-            "sending": False
+            "sending": False,
+            "automation_id": operation.get("automation_id"),
+            "automation_run_id": operation.get("automation_run_id")
         }
 
 
@@ -1852,7 +1995,8 @@ def save_device_state(
     device_id,
     parameters,
     record_changes=True,
-    defer_parameters=None
+    defer_parameters=None,
+    record_telemetry=False
 ):
     timestamp = current_time()
     has_changes = False
@@ -1861,7 +2005,7 @@ def save_device_state(
 
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("""
-            SELECT led, state_json
+            SELECT led, state_json, last_telemetry_at
             FROM devices
             WHERE device_id = ?
         """, (device_id,)).fetchone()
@@ -1871,18 +2015,24 @@ def save_device_state(
                 INSERT INTO devices (
                     device_id,
                     last_seen,
+                    last_telemetry_at,
                     connected
                 )
-                VALUES (?, ?, 1)
+                VALUES (?, ?, ?, 1)
             """, (
                 device_id,
-                timestamp
+                timestamp,
+                timestamp if record_telemetry else None
             ))
 
             previous_led = None
             saved_parameters = {}
+            last_telemetry_at = timestamp if record_telemetry else None
         else:
             previous_led = row[0]
+            last_telemetry_at = row[2]
+            if record_telemetry:
+                last_telemetry_at = timestamp
             try:
                 saved_parameters = json.loads(row[1]) if row[1] else {}
             except json.JSONDecodeError:
@@ -1901,15 +2051,11 @@ def save_device_state(
             ):
                 continue
 
-            if parameter_id == "led" and type(value) is bool:
-                event_type = "led"
-                event_value = str(value).lower()
-            else:
-                event_type = "parameter"
-                event_value = json.dumps({
-                    "parameter": parameter_id,
-                    "value": value
-                }, ensure_ascii=False)
+            event_type = "parameter"
+            event_value = json.dumps({
+                "parameter": parameter_id,
+                "value": value
+            }, ensure_ascii=False)
 
             if record_changes and parameter_id in defer_parameters:
                 deferred_events.append({
@@ -1959,12 +2105,17 @@ def save_device_state(
                 SET led = ?,
                     last_seen = ?,
                     connected = 1,
-                    state_json = ?
+                    state_json = ?,
+                    last_telemetry_at = CASE
+                        WHEN ? THEN ? ELSE last_telemetry_at
+                    END
                 WHERE device_id = ?
             """, (
                 new_led,
                 timestamp,
                 state_json,
+                int(record_telemetry),
+                timestamp,
                 device_id
             ))
 
@@ -1973,17 +2124,22 @@ def save_device_state(
                 UPDATE devices
                 SET last_seen = ?,
                     state_json = ?,
-                    connected = 1
+                    connected = 1,
+                    last_telemetry_at = CASE
+                        WHEN ? THEN ? ELSE last_telemetry_at
+                    END
                 WHERE device_id = ?
             """, (
                 timestamp,
                 state_json,
+                int(record_telemetry),
+                timestamp,
                 device_id
             ))
 
         conn.commit()
 
-    return timestamp, has_changes, deferred_events
+    return timestamp, has_changes, deferred_events, last_telemetry_at
 
 
 def get_recent_events(limit=30):
@@ -2042,13 +2198,35 @@ def get_recent_events(limit=30):
     return list(reversed(filtered_events[-limit:]))
 
 
-def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None):
+def sqlite_casefold(value):
+    return value.casefold() if isinstance(value, str) else ""
+
+
+def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None, search=""):
     conditions = []
     parameters = []
 
     if device_id is not None:
         conditions.append("device_id = ?")
         parameters.append(device_id)
+
+    if search:
+        escaped_search = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conditions.append("(casefold(device_id) LIKE casefold(?) ESCAPE '\\' OR casefold(event_type) LIKE casefold(?) ESCAPE '\\' OR casefold(event_value) LIKE casefold(?) ESCAPE '\\' OR casefold(timestamp) LIKE casefold(?) ESCAPE '\\' OR EXISTS (SELECT 1 FROM devices AS matching_device WHERE matching_device.device_id = device_events.device_id AND (casefold(COALESCE(matching_device.display_name, '')) LIKE casefold(?) ESCAPE '\\' OR casefold(COALESCE(matching_device.name, '')) LIKE casefold(?) ESCAPE '\\' OR casefold(COALESCE(matching_device.schema_json, '')) LIKE casefold(?) ESCAPE '\\')))")
+        search_pattern = f"%{escaped_search}%"
+        parameters.extend([search_pattern] * 7)
+
+    matching_where = (
+        f"WHERE {' AND '.join(conditions)}"
+        if conditions
+        else ""
+    )
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.create_function("casefold", 1, sqlite_casefold)
+        matching_count = conn.execute(
+            f"SELECT COUNT(*) FROM device_events {matching_where}",
+            tuple(parameters)
+        ).fetchone()[0]
 
     if before_id is not None:
         conditions.append("id < ?")
@@ -2061,6 +2239,7 @@ def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None):
     )
 
     with sqlite3.connect(DB_PATH) as conn:
+        conn.create_function("casefold", 1, sqlite_casefold)
         conn.row_factory = sqlite3.Row
         rows = conn.execute(f"""
             SELECT id, device_id, event_type, event_value, timestamp
@@ -2075,7 +2254,7 @@ def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None):
     events = [dict(row) for row in page]
     next_before_id = page[-1]["id"] if has_more and page else None
 
-    return events, has_more, next_before_id
+    return events, has_more, next_before_id, matching_count
 
 
 def get_all_devices():
@@ -2084,7 +2263,7 @@ def get_all_devices():
 
         rows = conn.execute("""
             SELECT
-                device_id, last_seen, led, connected, name, display_name, state_json,
+                device_id, last_seen, last_telemetry_at, led, connected, name, display_name, state_json,
                 protocol_version, firmware_version, command_dedup,
                 schema_version, schema_json,
                 trust_policy
@@ -2153,6 +2332,8 @@ def get_all_devices():
             "display_name": metadata.get("display_name"),
             "connected": device_id in devices,
             "last_seen": row["last_seen"],
+            "last_telemetry_at": row["last_telemetry_at"],
+            "telemetry_stale_after_seconds": DEVICE_STALE_SECONDS,
             "parameters": parameters,
             "schema": metadata["schema"],
             "protocol_version": metadata.get("protocol_version"),
@@ -2183,6 +2364,8 @@ def get_all_devices():
                 "display_name": metadata.get("display_name"),
                 "connected": True,
                 "last_seen": None,
+                "last_telemetry_at": None,
+                "telemetry_stale_after_seconds": DEVICE_STALE_SECONDS,
                 "parameters": device_states.get(device_id, {}),
                 "schema": metadata["schema"],
                 "protocol_version": metadata.get("protocol_version"),
@@ -2270,15 +2453,29 @@ async def send_database_stats(websocket=None):
         await broadcast(message)
 
 
+async def send_database_backups(websocket=None):
+    message = {
+        "type": "database_backups",
+        "backups": list_database_backups(),
+        "retention_limit": DATABASE_BACKUP_LIMIT
+    }
+    if websocket is not None:
+        await send_json(websocket, message)
+    else:
+        await broadcast(message)
+
+
 async def send_event_history(
     websocket=None,
     device_id=None,
     before_id=None,
-    request_id=None
+    request_id=None,
+    search=""
 ):
-    events, has_more, next_before_id = get_event_page(
+    events, has_more, next_before_id, matching_count = get_event_page(
         device_id=device_id,
-        before_id=before_id
+        before_id=before_id,
+        search=search
     )
 
     message = {
@@ -2286,7 +2483,9 @@ async def send_event_history(
         "events": events,
         "has_more": has_more,
         "next_before_id": next_before_id,
-        "device_filter": device_id or "all"
+        "device_filter": device_id or "all",
+        "search": search,
+        "total_count": matching_count
     }
 
     if request_id is not None:
@@ -2344,6 +2543,23 @@ async def send_pending_command_result(pending, status, value, error):
     result_future = pending.get("result_future")
     if result_future is not None and not result_future.done():
         result_future.set_result({"status": status, "value": value, "error": error})
+    automation_state_change = pending.pop("automation_state_change", None)
+    if (
+        automation_state_change is None
+        and pending.get("automation_id")
+        and status == "succeeded"
+        and operation["kind"] == "parameter"
+        and value is not None
+        and any(
+            state_event["parameter"] == operation["name"]
+            and state_event["value"] == value
+            for state_event in pending.get("deferred_state_events", [])
+        )
+    ):
+        automation_state_change = {
+            "parameter": operation["name"],
+            "value": value
+        }
     deferred_state_events = pending.pop("deferred_state_events", [])
     for state_event in deferred_state_events:
         is_confirmed_command_state = (
@@ -2365,7 +2581,28 @@ async def send_pending_command_result(pending, status, value, error):
         except Exception as log_error:
             print(f"[ОШИБКА] Не удалось сохранить изменение состояния: {log_error}")
 
-    event_value = json.dumps({
+    if status == "succeeded" and automation_state_change is not None:
+        parameter = automation_state_change["parameter"]
+        state_value = automation_state_change["value"]
+        state_event_type = "parameter"
+        state_event_value = json.dumps({
+            "parameter": parameter,
+            "value": state_value,
+            "source": "automation",
+            "command_id": pending["command_id"],
+            "automation_id": pending.get("automation_id"),
+            "run_id": pending.get("automation_run_id")
+        }, ensure_ascii=False)
+        try:
+            save_device_event(
+                pending["device"],
+                state_event_type,
+                state_event_value
+            )
+        except Exception as log_error:
+            print(f"[ОШИБКА] Не удалось записать изменение состояния сценария: {log_error}")
+
+    command_event = {
         "command_id": pending["command_id"],
         operation["kind"]: operation["name"],
         "requested_value": operation.get("value"),
@@ -2373,7 +2610,11 @@ async def send_pending_command_result(pending, status, value, error):
         "result_value": value if status in ("succeeded", "failed") else None,
         "status": status,
         "error": error
-    }, ensure_ascii=False)
+    }
+    if pending.get("automation_id"):
+        command_event["automation_id"] = pending["automation_id"]
+        command_event["run_id"] = pending.get("automation_run_id")
+    event_value = json.dumps(command_event, ensure_ascii=False)
     try:
         save_device_event(pending["device"], "command", event_value)
         await send_event_history()
@@ -2491,7 +2732,8 @@ async def dispatch_device_command(
     browser=None,
     requested_command_id=None,
     wait_for_result=False,
-    automation_id=None
+    automation_id=None,
+    automation_run_id=None
 ):
     async def reject(message, command_id=requested_command_id):
         if browser is None:
@@ -2572,13 +2814,20 @@ async def dispatch_device_command(
         "command_id": command_id,
         "device": device_id,
         "browser": browser,
-        "operation": {"kind": "parameter", "name": parameter, "value": value},
+        "operation": {
+            "kind": "parameter",
+            "name": parameter,
+            "value": value,
+            "automation_id": automation_id,
+            "automation_run_id": automation_run_id
+        },
         "payload": payload,
         "attempts": 0,
         "status": "queued",
         "timeout_task": None,
         "sending": False,
         "automation_id": automation_id,
+        "automation_run_id": automation_run_id,
         "result_future": asyncio.get_running_loop().create_future() if wait_for_result else None
     }
     try:
@@ -2600,7 +2849,8 @@ async def dispatch_device_action(
     browser=None,
     requested_command_id=None,
     wait_for_result=False,
-    automation_id=None
+    automation_id=None,
+    automation_run_id=None
 ):
     async def reject(message, command_id=requested_command_id):
         if browser is None:
@@ -2672,7 +2922,9 @@ async def dispatch_device_action(
         "operation": {
             "kind": "action",
             "name": action,
-            "arguments": arguments
+            "arguments": arguments,
+            "automation_id": automation_id,
+            "automation_run_id": automation_run_id
         },
         "payload": payload,
         "attempts": 0,
@@ -2680,6 +2932,7 @@ async def dispatch_device_action(
         "timeout_task": None,
         "sending": False,
         "automation_id": automation_id,
+        "automation_run_id": automation_run_id,
         "result_future": asyncio.get_running_loop().create_future() if wait_for_result else None
     }
     try:
@@ -2723,6 +2976,18 @@ def get_automations():
 
 
 AUTOMATION_RUN_HISTORY_LIMIT = 50
+
+
+def get_automation_run_count(automation_id, completed_only=False):
+    where_clause = "automation_id = ?"
+    if completed_only:
+        where_clause += " AND status != 'running'"
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM automation_runs WHERE {where_clause}",
+            (automation_id,)
+        ).fetchone()
+    return row[0] if row else 0
 
 
 def get_automation_run_history(automation_id):
@@ -2922,11 +3187,16 @@ def validate_automation_program(program):
         return "Неизвестный тип триггера сценария."
     if trigger_type == "parameter_changed":
         trigger_fields = set(trigger)
-        if trigger_fields not in (
-            {"type", "device", "parameter"},
-            {"type", "device", "parameter", "value"}
-        ):
+        required_fields = {"type", "device", "parameter"}
+        optional_fields = {"value", "for_seconds", "cooldown_seconds"}
+        if not required_fields.issubset(trigger_fields) or trigger_fields - required_fields - optional_fields:
             return "Некорректный триггер изменения параметра."
+        for field, maximum in (("for_seconds", 3600), ("cooldown_seconds", 86400)):
+            if field in trigger and (
+                type(trigger[field]) is not int
+                or not 0 <= trigger[field] <= maximum
+            ):
+                return "Время устойчивости и пауза запуска должны быть целыми секундами в допустимых пределах."
         device_id = trigger.get("device")
         parameter_id = trigger.get("parameter")
         if not isinstance(device_id, str) or not isinstance(parameter_id, str):
@@ -3402,14 +3672,16 @@ async def execute_automation_statements(automation_id, statements, run_id):
                     device_id, statement["parameter"], value,
                     requested_command_id=command_id,
                     wait_for_result=True,
-                    automation_id=automation_id
+                    automation_id=automation_id,
+                    automation_run_id=run_id
                 )
             elif step_type == "invoke_action":
                 result_future = await dispatch_device_action(
                     device_id, statement["action"], statement["arguments"],
                     requested_command_id=command_id,
                     wait_for_result=True,
-                    automation_id=automation_id
+                    automation_id=automation_id,
+                    automation_run_id=run_id
                 )
             else:
                 raise AutomationExecutionError("Неизвестный блок действия.")
@@ -3457,6 +3729,8 @@ async def publish_automation_list():
 
 
 def start_automation_run(automation_id, config, reason):
+    if database_restore_in_progress:
+        return False
     existing_task = automation_tasks.get(automation_id)
     task_is_active = existing_task is not None and not existing_task.done()
     if task_is_active and existing_task not in automation_waiting_tasks:
@@ -3546,6 +3820,8 @@ async def execute_automation_run(automation_id, config, reason, run_id):
 
 
 def fire_automation_event(event_type, device_id=None, parameter=None, value=None):
+    if database_restore_in_progress:
+        return
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("""
             SELECT automation_id, config_json FROM automations WHERE enabled = 1
@@ -3575,6 +3851,8 @@ def fire_automation_event(event_type, device_id=None, parameter=None, value=None
 
 
 async def evaluate_automations(device_id, previous_parameters, current_parameters):
+    if database_restore_in_progress:
+        return
     changed_parameters = {
         key for key, value in current_parameters.items()
         if key not in previous_parameters or previous_parameters[key] != value
@@ -3590,19 +3868,22 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
             config = json.loads(config_json)
             if config.get("version") == 2:
                 trigger = config["program"]["trigger"]
+                parameter = trigger.get("parameter")
                 if (
                     trigger.get("type") == "parameter_changed"
                     and trigger.get("device") == device_id
-                    and trigger.get("parameter") in changed_parameters
-                    and (
-                        "value" not in trigger
-                        or automation_trigger_value_matches(
-                            current_parameters.get(trigger.get("parameter")),
-                            trigger.get("value")
-                        )
-                    )
+                    and parameter in changed_parameters
                 ):
-                    start_automation_run(automation_id, config, "parameter_changed")
+                    value = current_parameters.get(parameter)
+                    if (
+                        "value" not in trigger
+                        or automation_trigger_value_matches(value, trigger["value"])
+                    ):
+                        schedule_parameter_automation_trigger(
+                            automation_id, config, device_id, parameter, value
+                        )
+                    else:
+                        cancel_pending_automation_trigger(automation_id)
                 continue
             invalid_reason = validate_automation_config(config)
             if invalid_reason:
@@ -3628,6 +3909,249 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
             print(f"[ОШИБКА] Пропуск сценария {automation_id}: {error}")
 
 
+def cancel_pending_automation_trigger(automation_id):
+    task = automation_trigger_tasks.pop(automation_id, None)
+    automation_trigger_devices.pop(automation_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def cancel_pending_automation_triggers_for_device(device_id):
+    for automation_id, trigger_device in list(automation_trigger_devices.items()):
+        if trigger_device == device_id:
+            cancel_pending_automation_trigger(automation_id)
+
+
+def automation_cooldown_remaining(automation_id, cooldown_seconds):
+    if cooldown_seconds <= 0:
+        return 0
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT enabled, last_triggered_at FROM automations WHERE automation_id = ?",
+            (automation_id,)
+        ).fetchone()
+    if row is None or not row[0]:
+        return None
+    if not row[1]:
+        return 0
+    try:
+        last_triggered = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+        if last_triggered.tzinfo is None:
+            last_triggered = last_triggered.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_triggered.astimezone(timezone.utc)).total_seconds()
+    except (TypeError, ValueError):
+        return 0
+    return max(0, cooldown_seconds - elapsed)
+
+
+def schedule_parameter_automation_trigger(
+    automation_id, config, device_id, parameter, value
+):
+    cancel_pending_automation_trigger(automation_id)
+    task = asyncio.create_task(
+        wait_for_stable_automation_trigger(
+            automation_id, config, device_id, parameter, value
+        )
+    )
+    automation_trigger_tasks[automation_id] = task
+    automation_trigger_devices[automation_id] = device_id
+
+
+async def wait_for_stable_automation_trigger(
+    automation_id, config, device_id, parameter, value
+):
+    task = asyncio.current_task()
+    trigger = config["program"]["trigger"]
+    try:
+        stable_seconds = trigger.get("for_seconds", 0)
+        if stable_seconds:
+            await asyncio.sleep(stable_seconds)
+
+        while automation_trigger_tasks.get(automation_id) is task:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT enabled, config_json FROM automations WHERE automation_id = ?",
+                    (automation_id,)
+                ).fetchone()
+            if row is None or not row[0]:
+                return
+            try:
+                saved_config = json.loads(row[1])
+                current_trigger = saved_config["program"]["trigger"]
+            except (TypeError, KeyError, json.JSONDecodeError):
+                return
+            if current_trigger != trigger or not device_is_connected(device_id):
+                return
+
+            current_parameters = device_states.get(device_id, {})
+            if parameter not in current_parameters:
+                return
+            current_value = current_parameters[parameter]
+            if not automation_trigger_value_matches(current_value, value):
+                return
+            if (
+                "value" in trigger
+                and not automation_trigger_value_matches(current_value, trigger["value"])
+            ):
+                return
+
+            remaining = automation_cooldown_remaining(
+                automation_id, trigger.get("cooldown_seconds", 0)
+            )
+            if remaining is None:
+                return
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+
+            start_automation_run(automation_id, config, "parameter_changed")
+            return
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(f"[АВТОМАТИЗАЦИЯ] Не удалось проверить триггер {automation_id}: {error}")
+    finally:
+        if automation_trigger_tasks.get(automation_id) is task:
+            automation_trigger_tasks.pop(automation_id, None)
+            automation_trigger_devices.pop(automation_id, None)
+
+
+def finalize_restored_database():
+    init_db()
+    timestamp = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE devices SET connected = 0")
+        conn.execute("""
+            UPDATE command_queue
+            SET status = 'unavailable', updated_at = ?,
+                error = 'Command queue cleared during database restore.'
+            WHERE status IN ('queued', 'sent')
+        """, (timestamp,))
+        conn.commit()
+
+
+async def restore_database_backup(backup_id):
+    global database_restore_in_progress
+
+    if database_restore_in_progress:
+        return False, "A database restore is already in progress."
+    if (
+        not isinstance(backup_id, str)
+        or not DATABASE_BACKUP_ID_PATTERN.fullmatch(backup_id)
+    ):
+        return False, "Invalid backup identifier."
+
+    backup_path = DATABASE_BACKUP_DIR / backup_id
+    try:
+        validate_database_backup(backup_path)
+        safety_backup = create_database_backup(preserve_ids={backup_id})
+    except (OSError, sqlite3.Error, ValueError) as error:
+        return False, f"Could not prepare the restore: {error}"
+
+    safety_path = DATABASE_BACKUP_DIR / safety_backup["backup_id"]
+    database_restore_in_progress = True
+    restored = False
+    restore_started = False
+    try:
+        trigger_tasks = list(automation_trigger_tasks.values())
+        for automation_id in list(automation_trigger_tasks):
+            cancel_pending_automation_trigger(automation_id)
+        if trigger_tasks:
+            await asyncio.gather(*trigger_tasks, return_exceptions=True)
+        automation_trigger_tasks.clear()
+        automation_trigger_devices.clear()
+
+        running_automations = list(automation_tasks.values())
+        automation_stop_requests.update(automation_tasks)
+        for task in running_automations:
+            task.cancel()
+        if running_automations:
+            await asyncio.gather(*running_automations, return_exceptions=True)
+        automation_tasks.clear()
+        automation_stop_requests.clear()
+        automation_waiting_tasks.clear()
+        automation_restart_tasks.clear()
+
+        for request in list(pending_device_connections.values()):
+            request["decision"] = "deny"
+            request["remember"] = False
+            decision_event = request.get("decision_event")
+            if decision_event is not None:
+                decision_event.set()
+
+        for pending in list(pending_commands.values()):
+            timeout_task = pending.get("timeout_task")
+            if timeout_task is not None:
+                timeout_task.cancel()
+            result_future = pending.get("result_future")
+            if result_future is not None and not result_future.done():
+                result_future.set_result({
+                    "status": "unavailable",
+                    "error": "Gateway database was restored."
+                })
+        pending_commands.clear()
+
+        device_sockets = list(devices.values())
+        active_device_tasks = list(device_handler_tasks)
+        devices.clear()
+        device_wire_ids.clear()
+        last_device_heartbeat.clear()
+        fresh_device_parameters.clear()
+        device_states.clear()
+        device_metadata.clear()
+        pending_device_schemas.clear()
+        deferred_device_schemas.clear()
+        deferred_connection_automations.clear()
+
+        async def close_device(websocket):
+            try:
+                await asyncio.wait_for(
+                    websocket.close(code=1012, reason="Gateway database restored"),
+                    timeout=3
+                )
+            except Exception:
+                pass
+
+        if device_sockets:
+            await asyncio.gather(
+                *(close_device(websocket) for websocket in device_sockets),
+                return_exceptions=True
+            )
+        if active_device_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*active_device_tasks, return_exceptions=True),
+                timeout=10
+            )
+
+        restore_started = True
+        restore_database_file(backup_path)
+        finalize_restored_database()
+        restored = True
+    except Exception as error:
+        if restore_started:
+            try:
+                restore_database_file(safety_path)
+                finalize_restored_database()
+            except Exception as recovery_error:
+                print(f"[BACKUP] Safety restore failed: {recovery_error}")
+                return False, f"Restore failed and safety recovery also failed: {recovery_error}"
+            return False, f"Restore failed; the previous database was recovered: {error}"
+        return False, f"Restore could not start: {error}"
+    finally:
+        database_restore_in_progress = False
+
+    if restored:
+        await send_device_list()
+        await send_parameter_ui_preferences()
+        await send_device_access_state()
+        await send_command_queue_state()
+        await send_event_history()
+        await publish_automation_list()
+        await send_database_backups()
+        return True, "Database restored. Devices have been disconnected and can reconnect now."
+    return False, "Database restore failed."
+
+
 def automation_trigger_value_matches(actual, expected):
     if (
         type(actual) in (int, float)
@@ -3640,6 +4164,12 @@ def automation_trigger_value_matches(actual, expected):
 async def handle_browser_message(websocket, message):
 
     action = message.get("action")
+    if database_restore_in_progress:
+        await send_json(websocket, {
+            "type": "error",
+            "message": "Gateway database is being restored. Try again shortly."
+        })
+        return
 
     if action == "get_automations":
         await send_json(websocket, {
@@ -3665,6 +4195,8 @@ async def handle_browser_message(websocket, message):
             "automation_id": automation_id,
             "success": exists,
             "runs": get_automation_run_history(automation_id) if exists else [],
+            "run_count": get_automation_run_count(automation_id) if exists else 0,
+            "completed_count": get_automation_run_count(automation_id, completed_only=True) if exists else 0,
             "message": None if exists else "Сценарий не найден."
         })
         return
@@ -3711,7 +4243,64 @@ async def handle_browser_message(websocket, message):
                 "type": "automation_run_history",
                 "automation_id": automation_id,
                 "success": True,
-                "runs": get_automation_run_history(automation_id)
+                "runs": get_automation_run_history(automation_id),
+                "run_count": get_automation_run_count(automation_id),
+                "completed_count": get_automation_run_count(automation_id, completed_only=True)
+            })
+            await send_database_stats()
+        return
+
+    if action == "clear_automation_run_history":
+        automation_id = message.get("automation_id")
+        valid = (
+            isinstance(automation_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id)
+        )
+        success = False
+        deleted_count = 0
+        result_message = "Сценарий не найден."
+        if valid:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                exists = conn.execute(
+                    "SELECT 1 FROM automations WHERE automation_id = ?",
+                    (automation_id,)
+                ).fetchone() is not None
+                if exists:
+                    conn.execute(
+                        "DELETE FROM automation_run_steps WHERE run_id IN ("
+                        "SELECT run_id FROM automation_runs "
+                        "WHERE automation_id = ? AND status != 'running')",
+                        (automation_id,)
+                    )
+                    cursor = conn.execute(
+                        "DELETE FROM automation_runs "
+                        "WHERE automation_id = ? AND status != 'running'",
+                        (automation_id,)
+                    )
+                    deleted_count = cursor.rowcount
+                    success = True
+                    result_message = (
+                        f"Удалено записей запусков: {deleted_count}."
+                        if deleted_count
+                        else "Завершённых записей для удаления нет."
+                    )
+                conn.commit()
+        await send_json(websocket, {
+            "type": "automation_run_clear_result",
+            "success": success,
+            "automation_id": automation_id,
+            "deleted_count": deleted_count,
+            "message": result_message
+        })
+        if success:
+            await broadcast({
+                "type": "automation_run_history",
+                "automation_id": automation_id,
+                "success": True,
+                "runs": get_automation_run_history(automation_id),
+                "run_count": get_automation_run_count(automation_id),
+                "completed_count": get_automation_run_count(automation_id, completed_only=True)
             })
             await send_database_stats()
         return
@@ -3733,6 +4322,7 @@ async def handle_browser_message(websocket, message):
             "automation_id": automation_id, "message": message_text
         })
         if success:
+            cancel_pending_automation_trigger(automation_id)
             await publish_automation_list()
         return
 
@@ -3758,6 +4348,8 @@ async def handle_browser_message(websocket, message):
             "message": "Сценарий обновлён." if success else "Сценарий не найден."
         })
         if success:
+            if not enabled:
+                cancel_pending_automation_trigger(automation_id)
             await publish_automation_list()
         return
 
@@ -3812,6 +4404,7 @@ async def handle_browser_message(websocket, message):
             )
         })
         if success:
+            cancel_pending_automation_trigger(automation_id)
             await publish_automation_list()
         return
 
@@ -3847,6 +4440,7 @@ async def handle_browser_message(websocket, message):
             set_device_trust_policy(
                 device_id, "deny", request["metadata"].get("name")
             )
+            cancel_pending_automation_triggers_for_device(device_id)
             active_socket = devices.pop(device_id, None)
             device_wire_ids.pop(device_id, None)
             last_device_heartbeat.pop(device_id, None)
@@ -3926,6 +4520,7 @@ async def handle_browser_message(websocket, message):
             return
 
         set_device_trust_policy(device_id, "forgotten")
+        cancel_pending_automation_triggers_for_device(device_id)
         active_socket = devices.pop(device_id, None)
         device_wire_ids.pop(device_id, None)
         last_device_heartbeat.pop(device_id, None)
@@ -4126,10 +4721,55 @@ async def handle_browser_message(websocket, message):
         await send_database_stats(websocket)
         return
 
+    if action == "get_database_backups":
+        await send_database_backups(websocket)
+        return
+
+    if action == "create_database_backup":
+        try:
+            backup = create_database_backup()
+            await send_json(websocket, {
+                "type": "database_backup_result",
+                "success": True,
+                "backup": backup,
+                "message": "Backup created."
+            })
+            await send_database_backups()
+        except Exception as error:
+            print(f"[BACKUP] Could not create a database backup: {error}")
+            await send_json(websocket, {
+                "type": "database_backup_result",
+                "success": False,
+                "message": f"Could not create a backup: {error}"
+            })
+        return
+
+    if action == "restore_database_backup":
+        success, message_text = await restore_database_backup(
+            message.get("backup_id")
+        )
+        await send_json(websocket, {
+            "type": "database_backup_restore_result",
+            "success": success,
+            "backup_id": message.get("backup_id"),
+            "message": message_text
+        })
+        return
+
     if action == "get_events":
         device_id = message.get("device", "all")
         before_id = message.get("before_id")
         request_id = message.get("request_id")
+        search = message.get("search", "")
+
+        if not isinstance(search, str) or len(search) > 120:
+            await send_json(websocket, {
+                "type": "error",
+                "request_id": request_id,
+                "message": "Поисковый запрос должен содержать не более 120 символов."
+            })
+            return
+        search = search.strip()
 
         if device_id == "all":
             device_id = None
@@ -4163,7 +4803,8 @@ async def handle_browser_message(websocket, message):
             websocket,
             device_id=device_id,
             before_id=before_id,
-            request_id=request_id
+            request_id=request_id,
+            search=search
         )
         return
 
@@ -4305,6 +4946,13 @@ async def handle_client(websocket):
 
             message_type = message.get("type")
 
+            if database_restore_in_progress and client_type != "browser":
+                await websocket.close(
+                    code=1012,
+                    reason="Gateway database is being restored"
+                )
+                break
+
             # -------------------------
             # Регистрация браузера
             # -------------------------
@@ -4327,6 +4975,7 @@ async def handle_client(websocket):
                 await send_device_access_state(websocket)
                 await send_command_queue_state(websocket)
                 await send_database_stats(websocket)
+                await send_database_backups(websocket)
                 continue
 
             if client_type == "browser":
@@ -4521,7 +5170,17 @@ async def handle_client(websocket):
                 else:
                     metadata["trust_policy"] = "allow"
 
+                if database_restore_in_progress:
+                    await websocket.close(
+                        code=1012,
+                        reason="Gateway database is being restored"
+                    )
+                    break
+
                 client_type = "device"
+                current_device_task = asyncio.current_task()
+                if current_device_task is not None:
+                    device_handler_tasks.add(current_device_task)
 
                 old_connection = devices.get(device_id)
 
@@ -4716,7 +5375,7 @@ async def handle_client(websocket):
                         parameter: value
                     }
                     fresh_device_parameters.setdefault(device_id, set()).add(parameter)
-                    last_seen, _, _ = save_device_state(
+                    last_seen, _, _, _ = save_device_state(
                         device_id,
                         {parameter: value},
                         record_changes=False
@@ -4735,6 +5394,11 @@ async def handle_client(websocket):
                             previous_parameters,
                             dict(device_states[device_id])
                         )
+                        if pending.get("automation_id") and status == "succeeded":
+                            pending["automation_state_change"] = {
+                                "parameter": parameter,
+                                "value": value
+                            }
 
                 pending = remove_pending_command(command_id)
                 await send_pending_command_result(
@@ -4849,10 +5513,11 @@ async def handle_client(websocket):
                     ):
                         pending_state_echoes[operation["name"]] = pending
 
-                last_seen, state_changed, deferred_events = save_device_state(
+                last_seen, state_changed, deferred_events, last_telemetry_at = save_device_state(
                     device_id,
                     accepted_parameters,
-                    defer_parameters=set(pending_state_echoes)
+                    defer_parameters=set(pending_state_echoes),
+                    record_telemetry=bool(accepted_parameters)
                 )
                 for state_event in deferred_events:
                     pending = pending_state_echoes.get(state_event["parameter"])
@@ -4869,7 +5534,8 @@ async def handle_client(websocket):
                     "type": "device_state",
                     "device": device_id,
                     "parameters": device_states[device_id],
-                    "last_seen": last_seen
+                    "last_seen": last_seen,
+                    "last_telemetry_at": last_telemetry_at
                 }
 
                 await broadcast(state_message)
@@ -4928,6 +5594,7 @@ async def handle_client(websocket):
             device_id
             and devices.get(device_id) is websocket
         ):
+            cancel_pending_automation_triggers_for_device(device_id)
             del devices[device_id]
             device_wire_ids.pop(device_id, None)
             last_device_heartbeat.pop(device_id, None)
@@ -4965,6 +5632,10 @@ async def handle_client(websocket):
         elif client_type == "browser":
             detach_pending_commands_for_browser(websocket)
             print("[БРАУЗЕР] Отключён")
+
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            device_handler_tasks.discard(current_task)
 
 
 # =========================
@@ -5181,6 +5852,7 @@ async def main():
         handle_client,
         HOST,
         PORT,
+        process_request=handle_http_request,
         max_size=MAX_WEBSOCKET_MESSAGE_BYTES,
         max_queue=16,
         ping_interval=20,

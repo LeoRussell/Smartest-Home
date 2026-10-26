@@ -12,7 +12,7 @@
     const words = {
         ru: {
             events: "События", conditions: "Условия", logic: "Логика", actions: "Действия", values: "Значения",
-            parameterChanged: "Когда изменилось значение", triggerFilter: "Фильтр", anyChange: "любое изменение", changedTo: "стало равно", invalidTriggerValue: "Задайте корректное значение фильтра запуска.", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
+            parameterChanged: "Когда изменилось значение", triggerFilter: "Фильтр", anyChange: "любое изменение", changedTo: "стало равно", invalidTriggerValue: "Задайте корректное значение фильтра запуска.", stableFor: "Без новых изменений", cooldown: "Пауза после запуска", seconds: "сек.", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
             readParameter: "текущее значение параметра", readParameterHelp: "Подключите к сравнению или вычислению; сам по себе блок не запускает сценарий.", parameterValue: "значение параметра", equals: "равно", notEquals: "не равно", lessThan: "меньше", atMost: "не больше", greaterThan: "больше", atLeast: "не меньше",
             isConnected: "устройство подключено", setParameter: "установить параметр", invokeAction: "запустить действие / режим",
             choose: "выберите устройство", parameter: "параметр", action: "действие", mode: "режим", operation: "операция", selectMode: "выполнить режим", enableMode: "включить режим", disableMode: "выключить режим", and: "И", or: "ИЛИ", noParameters: "нет доступных параметров", noActions: "нет объявленных действий", noModes: "нет зарегистрированных режимов",
@@ -23,7 +23,7 @@
         },
         en: {
             events: "Events", conditions: "Conditions", logic: "Logic", actions: "Actions", values: "Values",
-            parameterChanged: "When a parameter changes", triggerFilter: "Filter", anyChange: "any change", changedTo: "changed to", invalidTriggerValue: "Enter a valid trigger filter value.", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
+            parameterChanged: "When a parameter changes", triggerFilter: "Filter", anyChange: "any change", changedTo: "changed to", invalidTriggerValue: "Enter a valid trigger filter value.", stableFor: "No further changes for", cooldown: "Cooldown", seconds: "sec.", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
             readParameter: "current parameter value", readParameterHelp: "Connect this to a comparison or calculation; it does not start a scenario by itself.", parameterValue: "parameter value", equals: "equals", notEquals: "does not equal", lessThan: "is less than", atMost: "is at most", greaterThan: "is greater than", atLeast: "is at least",
             isConnected: "device is connected", setParameter: "set parameter", invokeAction: "run device action / mode",
             choose: "select a device", parameter: "parameter", action: "action", mode: "mode", operation: "operation", selectMode: "run mode", enableMode: "enable mode", disableMode: "disable mode", and: "AND", or: "OR", noParameters: "no writable parameters", noActions: "no declared actions", noModes: "no registered modes",
@@ -291,6 +291,14 @@
                     ]), "MATCH");
                 this.appendDummyInput("FILTER_VALUE")
                     .appendField(triggerValueField(selectedParameter(this)), "VALUE");
+                this.appendDummyInput("STABILITY")
+                    .appendField(text("stableFor"))
+                    .appendField(new Blockly.FieldNumber(0, 0, 3600, 1), "FOR_SECONDS")
+                    .appendField(text("seconds"));
+                this.appendDummyInput("COOLDOWN")
+                    .appendField(text("cooldown"))
+                    .appendField(new Blockly.FieldNumber(0, 0, 86400, 1), "COOLDOWN_SECONDS")
+                    .appendField(text("seconds"));
                 this.triggerValueType_ = selectedParameter(this)?.type || "string";
                 this.setNextStatement(true);
                 this.setColour(210);
@@ -743,6 +751,10 @@
                     event.getFieldValue("VALUE"), selectedParameter(event)
                 );
             }
+            const stableFor = Number(event.getFieldValue("FOR_SECONDS") || 0);
+            const cooldown = Number(event.getFieldValue("COOLDOWN_SECONDS") || 0);
+            if (stableFor > 0) trigger.for_seconds = stableFor;
+            if (cooldown > 0) trigger.cooldown_seconds = cooldown;
         } else if (event.type === "iot_when_device_connects") {
             trigger = { type: "device_connected", device: event.getFieldValue("DEVICE") };
         } else if (event.type === "iot_when_device_disconnects") {

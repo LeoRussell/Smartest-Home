@@ -7,3 +7,4 @@ esp32/include/secrets.h
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+gateway/backups/
