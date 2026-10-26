@@ -1,11 +1,14 @@
 
 #include <Arduino.h>
+#include "device_config.h"
+#if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
+#include <Adafruit_NeoPixel.h>
+#endif
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include "secrets.h"
-#include "device_config.h"
 
 const uint16_t gateway_port = 8765;
 
@@ -19,6 +22,46 @@ bool commandCacheReady = false;
 unsigned long lastStateSentAt = 0;
 unsigned long lastWifiReconnectAt = 0;
 uint32_t stateSequence = 0;
+bool ledState = false;
+
+#if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
+Adafruit_NeoPixel onboardLed(1, LED_PIN, NEO_GRB + NEO_KHZ800);
+#endif
+
+void setLedOutput(bool enabled) {
+#if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
+    onboardLed.setPixelColor(
+        0,
+        enabled ? onboardLed.Color(255, 255, 255) : 0
+    );
+    onboardLed.show();
+#else
+    // The GPIO profile drives a plain LED connected to LED_PIN directly.
+    // Keep the logical state separately; reading the output pin is not a
+    // reliable way to determine whether the LED is on.
+    const int inactiveLevel = LED_ACTIVE_LEVEL == HIGH ? LOW : HIGH;
+    digitalWrite(LED_PIN, enabled ? LED_ACTIVE_LEVEL : inactiveLevel);
+#endif
+    ledState = enabled;
+}
+
+void initializeLedOutput() {
+#if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
+    onboardLed.begin();
+    onboardLed.setBrightness(LED_BRIGHTNESS);
+    Serial.printf("[LED] driver=NeoPixel data_gpio=%d\n", LED_PIN);
+#else
+    const int inactiveLevel = LED_ACTIVE_LEVEL == HIGH ? LOW : HIGH;
+    digitalWrite(LED_PIN, inactiveLevel);
+    pinMode(LED_PIN, OUTPUT);
+    Serial.printf(
+        "[LED] driver=GPIO pin=%d active=%s\n",
+        LED_PIN,
+        LED_ACTIVE_LEVEL == HIGH ? "HIGH" : "LOW"
+    );
+#endif
+    setLedOutput(false);
+}
 
 bool replayCachedCommandResult(const char* commandId) {
     if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
@@ -38,6 +81,21 @@ bool replayCachedCommandResult(const char* commandId) {
         if (cachedResult.length() == 0) {
             return false;
         }
+
+        JsonDocument cachedDocument;
+        if (!deserializeJson(cachedDocument, cachedResult)) {
+            const char* parameter = cachedDocument["data"]["parameter"] | "";
+            JsonVariantConst cachedValue = cachedDocument["data"]["value"];
+            if (
+                strcmp(parameter, "led") == 0 &&
+                cachedValue.is<bool>()
+            ) {
+                // A command retry can arrive after an ESP32 reboot. Reapply
+                // the cached logical output before acknowledging the retry.
+                setLedOutput(cachedValue.as<bool>());
+            }
+        }
+
         webSocket.sendTXT(cachedResult);
         Serial.println("Replayed cached result for duplicate command");
         return true;
@@ -70,25 +128,26 @@ void sendHello() {
     doc["name"] = DEVICE_NAME;
     doc["protocol_version"] = 2;
     doc["command_dedup"] = commandCacheReady;
-    doc["firmware_version"] = "1.3.1";
-    doc["schema_version"] = 5;
+    doc["firmware_version"] = "1.4.0";
+    doc["schema_version"] = 6;
 
     JsonObject led = doc["schema"]["parameters"]["led"].to<JsonObject>();
     led["label"] = "Светодиод";
     led["type"] = "boolean";
     led["access"] = "read_write";
+    led["control"] = "toggle";
 
 #if DEVICE_HAS_IDENTIFY_INDICATOR
     doc["schema"]["capabilities"]["built_in_indicator"] = true;
     doc["schema"]["capabilities"]["identify"] = true;
     JsonObject identify = doc["schema"]["actions"]["identify"].to<JsonObject>();
     identify["label"] = "Найти устройство";
-    identify["description"] = "Трижды мигает индикатором устройства.";
+    identify["description"] = "Пять раз мигает встроенным индикатором.";
 #endif
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
-    doc["data"]["firmware"] = "1.3.1";
+    doc["data"]["firmware"] = "1.4.0";
     doc["data"]["protocol"] = 2;
 
     String message;
@@ -140,8 +199,13 @@ void sendCommandResult(
     rememberCommandResult(commandId, message);
     webSocket.sendTXT(message);
 
-    Serial.print("Command result sent: ");
-    Serial.println(message);
+    Serial.printf(
+        "[COMMAND] result id=%s parameter=%s success=%s value=%s\n",
+        commandId,
+        parameter,
+        success ? "true" : "false",
+        value ? "true" : "false"
+    );
 }
 
 void sendActionResult(const char* commandId, const char* action, bool success) {
@@ -160,8 +224,12 @@ void sendActionResult(const char* commandId, const char* action, bool success) {
     serializeJson(doc, message);
     rememberCommandResult(commandId, message);
     webSocket.sendTXT(message);
-    Serial.print("Action result sent: ");
-    Serial.println(message);
+    Serial.printf(
+        "[COMMAND] result id=%s action=%s success=%s\n",
+        commandId,
+        action,
+        success ? "true" : "false"
+    );
 }
 
 void onWebSocketEvent(
@@ -173,13 +241,11 @@ void onWebSocketEvent(
         case WStype_CONNECTED:
             Serial.println("WebSocket connected!");
             sendHello();
-            sendState(digitalRead(LED_PIN) == HIGH);
+            sendState(ledState);
             lastStateSentAt = millis();
             break;
 
         case WStype_TEXT: {
-            Serial.printf("Received: %.*s\n", (int)length, (char*)payload);
-
             JsonDocument doc;
             DeserializationError error =
                 deserializeJson(doc, payload, length);
@@ -195,6 +261,11 @@ void onWebSocketEvent(
                 const char* commandName = doc["data"]["command"] | "set";
                 const char* commandId =
                     doc["data"]["command_id"] | "";
+                Serial.printf(
+                    "[COMMAND] received id=%s type=%s\n",
+                    commandId,
+                    commandName
+                );
 
                 if (commandId[0] == '\0') {
                     Serial.println("Command has no command_id");
@@ -210,15 +281,26 @@ void onWebSocketEvent(
                         DEVICE_HAS_IDENTIFY_INDICATOR &&
                         strcmp(action, "identify") == 0
                     ) {
-                        const bool indicatorWasOn = digitalRead(IDENTIFY_PIN) == HIGH;
-                        const bool ledWasOn = digitalRead(LED_PIN) == HIGH;
-                        for (int i = 0; i < 3; i++) {
-                            digitalWrite(IDENTIFY_PIN, HIGH);
-                            delay(150);
-                            digitalWrite(IDENTIFY_PIN, LOW);
-                            delay(150);
+                        const bool ledWasOn = ledState;
+                        Serial.printf(
+                            "[IDENTIFY] start driver=%s pin=%d pulses=%u duration=%lu ms\n",
+#if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
+                            "NeoPixel",
+#else
+                            "GPIO",
+#endif
+                            LED_PIN,
+                            static_cast<unsigned int>(IDENTIFY_PULSE_COUNT),
+                            static_cast<unsigned long>(IDENTIFY_PULSE_DURATION_MS)
+                        );
+                        for (unsigned int i = 0; i < IDENTIFY_PULSE_COUNT; i++) {
+                            setLedOutput(true);
+                            delay(IDENTIFY_PULSE_DURATION_MS);
+                            setLedOutput(false);
+                            delay(IDENTIFY_PULSE_DURATION_MS);
                         }
-                        digitalWrite(IDENTIFY_PIN, indicatorWasOn ? HIGH : LOW);
+                        setLedOutput(ledWasOn);
+                        Serial.println("[IDENTIFY] complete");
                         sendState(ledWasOn, false);
                         lastStateSentAt = millis();
                         sendActionResult(commandId, action, true);
@@ -234,30 +316,24 @@ void onWebSocketEvent(
                     strcmp(commandName, "set") == 0 &&
                     strcmp(parameter, "led") == 0
                 ) {
-                    digitalWrite(
-                        LED_PIN,
-                        value ? HIGH : LOW
-                    );
-
-                    bool actualValue = digitalRead(LED_PIN) == HIGH;
+                    setLedOutput(value);
+                    const bool appliedValue = ledState;
 
                     Serial.printf(
                         "%s %s\n",
                         parameter,
-                        actualValue ? "ON" : "OFF"
+                        appliedValue ? "ON" : "OFF"
                     );
 
-                    // The command result reports the actual value to the
-                    // Gateway, which updates the dashboard state directly.
-                    // Periodic state messages remain for telemetry and
-                    // out-of-band changes.
+                    // Report the logical output state. For addressable RGB
+                    // LEDs, digitalRead() cannot report the LED's light state.
                     lastStateSentAt = millis();
                     sendCommandResult(
                         commandId,
                         parameter,
-                        actualValue == value,
-                        actualValue,
-                        actualValue == value
+                        appliedValue == value,
+                        appliedValue,
+                        appliedValue == value
                             ? nullptr
                             : "LED output did not reach requested value"
                     );
@@ -289,14 +365,10 @@ void onWebSocketEvent(
 }
 
 void setup() {
-    Serial.begin(9600);
-    commandCacheReady = commandCache.begin("command_ack", false);
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
-#if DEVICE_HAS_IDENTIFY_INDICATOR && IDENTIFY_PIN != LED_PIN
-    pinMode(IDENTIFY_PIN, OUTPUT);
-    digitalWrite(IDENTIFY_PIN, LOW);
-#endif
+    Serial.begin(115200);
+    // Keep acknowledgements from older firmware behavior out of this cache.
+    commandCacheReady = commandCache.begin("command_ack_v2", false);
+    initializeLedOutput();
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
@@ -338,7 +410,7 @@ void loop() {
         webSocket.isConnected() &&
         now - lastStateSentAt >= STATE_INTERVAL_MS
     ) {
-        sendState(digitalRead(LED_PIN) == HIGH, false);
+        sendState(ledState, false);
         lastStateSentAt = now;
     }
 }

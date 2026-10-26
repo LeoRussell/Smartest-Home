@@ -90,6 +90,7 @@ let socket = null;
 let reconnectTimer = null;
 
 let devices = [];
+let parameterUiPreferences = {};
 const selectedDeviceModes = new Map();
 let events = [];
 let blockedDevices = [];
@@ -778,9 +779,15 @@ function automationSummary(config) {
     if (trigger.type === "parameter_changed") {
         const source = devices.find(item => item.device === trigger.device);
         const definition = source?.schema?.parameters?.[trigger.parameter];
+        const valueFilter = Object.prototype.hasOwnProperty.call(trigger, "value")
+            ? localized(
+                ` → значение стало ${formatAutomationRunValue(trigger.value, definition)}`,
+                ` → value became ${formatAutomationRunValue(trigger.value, definition)}`
+            )
+            : "";
         triggerText = localized(
-            `При изменении ${source?.name || trigger.device} · ${definition?.label || trigger.parameter}`,
-            `When ${source?.name || trigger.device} · ${definition?.label || trigger.parameter} changes`
+            `При изменении ${source?.display_name || source?.name || trigger.device} · ${definition?.label || trigger.parameter}${valueFilter}`,
+            `When ${source?.display_name || source?.name || trigger.device} · ${definition?.label || trigger.parameter} changes${valueFilter}`
         );
     } else if (trigger.type === "device_connected") {
         triggerText = localized(`При подключении ${trigger.device}`, `When ${trigger.device} connects`);
@@ -981,9 +988,15 @@ function automationRunTriggerLabel(run) {
     if (trigger.type === "parameter_changed") {
         const device = devices.find(item => item.device === trigger.device);
         const parameter = device?.schema?.parameters?.[trigger.parameter];
+        const valueFilter = Object.prototype.hasOwnProperty.call(trigger, "value")
+            ? localized(
+                ` → стало ${formatAutomationRunValue(trigger.value, parameter)}`,
+                ` → changed to ${formatAutomationRunValue(trigger.value, parameter)}`
+            )
+            : "";
         return localized(
-            `Изменение ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}`,
-            `Change on ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}`
+            `Изменение ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}${valueFilter}`,
+            `Change on ${device?.display_name || device?.name || trigger.device} · ${parameter?.label || trigger.parameter}${valueFilter}`
         );
     }
     if (trigger.type === "device_connected") {
@@ -1423,6 +1436,9 @@ function handleGatewayMessage(message) {
             const incoming = Array.isArray(message.commands)
                 ? message.commands
                 : [];
+            const affectedDevices = new Set(
+                [...pendingCommands.values()].map(item => item.deviceId)
+            );
             const activeIds = new Set(incoming.map(item => item.command_id));
             for (const commandId of pendingCommands.keys()) {
                 if (!activeIds.has(commandId)) pendingCommands.delete(commandId);
@@ -1439,8 +1455,12 @@ function handleGatewayMessage(message) {
                     status: item.status,
                     attempts: item.attempts || 0
                 });
+                affectedDevices.add(item.device);
             }
-            renderDevices();
+            for (const deviceId of affectedDevices) {
+                const device = devices.find(item => item.device === deviceId);
+                if (device) updateDevicePanel(device);
+            }
             break;
         }
 
@@ -1494,6 +1514,24 @@ function handleGatewayMessage(message) {
                 );
             }
 
+            break;
+        }
+
+        case "parameter_ui_preferences": {
+            parameterUiPreferences = message.preferences && typeof message.preferences === "object"
+                ? message.preferences
+                : {};
+            renderDevices();
+            break;
+        }
+
+        case "parameter_ui_preference_result": {
+            if (message.success) {
+                setActivity(message.message || localized("Вид элемента сохранён.", "Control style saved."));
+            } else {
+                setActivity(message.message || localized("Не удалось сохранить вид элемента.", "Could not save the control style."));
+                renderDevices();
+            }
             break;
         }
 
@@ -1825,6 +1863,25 @@ function describeSchemaChanges(previousSchema, nextSchema) {
             } else if (canonicalJson(previous[id]) !== canonicalJson(next[id])) {
                 const oldLabel = previous[id].label || id;
                 const newLabel = next[id].label || id;
+                if (
+                    group === "parameters" &&
+                    previous[id].control !== next[id].control
+                ) {
+                    const controlNames = {
+                        toggle: localized("переключатель", "toggle"),
+                        slider: localized("ползунок", "slider"),
+                        select: localized("список", "select list"),
+                        input: localized("поле ввода", "input field")
+                    };
+                    const oldControl = controlNames[previous[id].control] ||
+                        localized("авто по типу", "automatic by type");
+                    const newControl = controlNames[next[id].control] ||
+                        localized("авто по типу", "automatic by type");
+                    changes.push(localized(
+                        `Интерфейс параметра «${newLabel}»: ${oldControl} → ${newControl}`,
+                        `Control for “${newLabel}”: ${oldControl} → ${newControl}`
+                    ));
+                }
                 changes.push(oldLabel === newLabel
                     ? `${label} «${newLabel}» изменён`
                     : `${label} «${oldLabel}» переименован в «${newLabel}»`);
@@ -2302,6 +2359,145 @@ function createSchemaHistory(device) {
     return details;
 }
 
+function parameterHasZeroOneValues(definition) {
+    if (definition.type === "boolean") return true;
+    if (definition.type === "integer" || definition.type === "number") {
+        return definition.min === 0 && definition.max === 1 &&
+            (definition.type === "integer"
+                ? definition.step === undefined || definition.step === 1
+                : definition.step === 1);
+    }
+    if (definition.type === "enum" && definition.options?.length === 2) {
+        const values = definition.options.map(option => option.value);
+        const numeric = values.every(value => typeof value === "number");
+        const strings = values.every(value => typeof value === "string");
+        return numeric
+            ? values.includes(0) && values.includes(1)
+            : strings && values.includes("0") && values.includes("1");
+    }
+    return false;
+}
+
+function parameterSelectOptions(definition) {
+    if (definition.type === "enum") {
+        const optionValues = (definition.options || []).map(option => option.value);
+        const numericZeroOne = optionValues.length === 2 &&
+            optionValues.every(value => typeof value === "number") &&
+            optionValues.includes(0) && optionValues.includes(1);
+        const stringZeroOne = optionValues.length === 2 &&
+            optionValues.every(value => typeof value === "string") &&
+            optionValues.includes("0") && optionValues.includes("1");
+        return (definition.options || []).map(option => ({
+            value: option.value,
+            label: numericZeroOne || stringZeroOne
+                ? String(option.value)
+                : option.label
+        }));
+    }
+    if (parameterHasZeroOneValues(definition) && definition.type !== "boolean") {
+        return [
+            { value: 0, label: "0" },
+            { value: 1, label: "1" }
+        ];
+    }
+    return [];
+}
+
+function parameterControlType(definition, preference = null) {
+    if (preference === "toggle" && definition.type === "boolean") return "toggle";
+    if (preference === "list" && definition.type === "boolean") return "boolean-list";
+    if (preference === "list" && parameterHasZeroOneValues(definition)) return "select";
+    if (preference === "input" && ["integer", "number"].includes(definition.type)) return "input";
+    if (
+        preference === "slider" && ["integer", "number"].includes(definition.type) &&
+        Number.isFinite(definition.min) && Number.isFinite(definition.max) &&
+        definition.min < definition.max
+    ) return "slider";
+    if (definition.control) return definition.control;
+    if (definition.type === "boolean") return "toggle";
+    if (definition.type === "enum") return "select";
+    if (
+        ["integer", "number"].includes(definition.type) &&
+        Number.isFinite(definition.min) && Number.isFinite(definition.max) &&
+        definition.min < definition.max
+    ) return "slider";
+    return "input";
+}
+
+function parameterControlStyleOptions(definition) {
+    if (definition.access !== "read_write") return [];
+    if (definition.type === "boolean") {
+        return [
+            ["schema", localized("По Schema", "From Schema")],
+            ["toggle", localized("Переключатель", "Switch")],
+            ["list", localized("Список", "List")]
+        ];
+    }
+    if (["integer", "number"].includes(definition.type)) {
+        const choices = [["schema", localized("По Schema", "From Schema")]];
+        if (
+            Number.isFinite(definition.min) && Number.isFinite(definition.max) &&
+            definition.min < definition.max
+        ) choices.push(["slider", localized("Ползунок", "Slider")]);
+        if (parameterHasZeroOneValues(definition)) {
+            choices.splice(1, 0, ["list", localized("Список", "List")]);
+        }
+        choices.push(["input", localized("Ввод числа", "Number input")]);
+        return choices;
+    }
+    return [];
+}
+
+function createParameterControlStylePicker(device, parameterId, definition, preference) {
+    const styleOptions = parameterControlStyleOptions(definition);
+    if (styleOptions.length === 0) return null;
+
+    const details = document.createElement("details");
+    details.className = "device-control-style-picker";
+
+    const summary = document.createElement("summary");
+    summary.className = "device-control-style-button";
+    summary.title = localized("Настроить вид элемента", "Choose control style");
+    summary.setAttribute("aria-label", summary.title);
+
+    const menu = document.createElement("div");
+    menu.className = "device-control-style-menu";
+    const label = document.createElement("label");
+    label.className = "device-control-style-label";
+    label.textContent = localized("Вид элемента", "Control style");
+
+    const select = document.createElement("select");
+    select.className = "device-parameter-input device-control-style-select";
+    select.dataset.role = "parameter-control-style";
+    select.dataset.deviceId = device.device;
+    select.dataset.parameterId = parameterId;
+    select.setAttribute("aria-label", label.textContent);
+    for (const [styleValue, styleName] of styleOptions) {
+        const option = document.createElement("option");
+        option.value = styleValue;
+        option.textContent = styleName;
+        option.selected = styleValue === preference;
+        select.appendChild(option);
+    }
+    select.disabled = !isGatewayConnected() || Boolean(device.pending_schema);
+    select.addEventListener("change", () => {
+        const saved = sendGatewayAction("set_parameter_ui_preference", {
+            device: device.device,
+            parameter: parameterId,
+            control: select.value
+        });
+        if (saved) {
+            select.disabled = true;
+            details.open = false;
+        }
+    });
+
+    label.appendChild(select);
+    menu.appendChild(label);
+    details.append(summary, menu);
+    return details;
+}
+
 function renderDevices() {
     if (!deviceCard) {
         console.error("Не найден элемент .device-card");
@@ -2338,9 +2534,22 @@ function renderDevices() {
         icon.textContent = "IoT";
 
         const titleBlock = document.createElement("div");
+        titleBlock.className = "device-title-block";
+
+        const titleLine = document.createElement("div");
+        titleLine.className = "device-title-line";
 
         const title = document.createElement("h3");
         title.textContent = device.display_name || device.name || device.device;
+
+        const badge = document.createElement("span");
+        badge.className = "badge device-status";
+        badge.textContent = device.connected
+            ? localized("Подключено", "Online")
+            : localized("Отключено", "Offline");
+        badge.classList.toggle("is-online", device.connected);
+        badge.classList.toggle("is-offline", !device.connected);
+        titleLine.append(title, badge);
 
         const subtitle = document.createElement("p");
         subtitle.className = "device-id";
@@ -2357,13 +2566,7 @@ function renderDevices() {
             schemaNote
         ].filter(Boolean).join(" · ");
 
-        titleBlock.append(title, subtitle);
-
-        const badge = document.createElement("span");
-        badge.className = "badge device-status";
-        badge.textContent = device.connected
-            ? localized("Подключено", "Online")
-            : localized("Отключено", "Offline");
+        titleBlock.append(titleLine, subtitle);
 
         const headerActions = document.createElement("div");
         headerActions.className = "device-header-actions";
@@ -2374,6 +2577,34 @@ function renderDevices() {
         editIdentity.setAttribute("aria-label", localized("Изменить имя и ID", "Edit name and ID"));
         editIdentity.title = localized("Изменить отображаемое имя и ID Gateway", "Edit the display name and Gateway ID");
         editIdentity.addEventListener("click", () => openDeviceIdentityDialog(device));
+
+        const identify = device.schema?.actions?.identify
+            ? document.createElement("button")
+            : null;
+        if (identify) {
+            identify.type = "button";
+            identify.className = "device-identify-button";
+            identify.dataset.role = "device-identify";
+            identify.dataset.actionId = "identify";
+            identify.title = device.schema.actions.identify.label ||
+                localized("Найти устройство", "Find device");
+            identify.setAttribute("aria-label", identify.title);
+            const pin = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            pin.setAttribute("viewBox", "0 0 24 24");
+            pin.setAttribute("aria-hidden", "true");
+            const pinOutline = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            pinOutline.setAttribute("d", "M20 10c0 5-8 12-8 12S4 15 4 10a8 8 0 1 1 16 0Z");
+            const pinCenter = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            pinCenter.setAttribute("cx", "12");
+            pinCenter.setAttribute("cy", "10");
+            pinCenter.setAttribute("r", "2.5");
+            pin.append(pinOutline, pinCenter);
+            identify.appendChild(pin);
+            identify.addEventListener("click", () => {
+                sendDeviceAction(device.device, "identify");
+            });
+        }
+
         const forget = document.createElement("button");
         forget.type = "button";
         forget.className = "device-forget-button";
@@ -2392,7 +2623,9 @@ function renderDevices() {
             )) return;
             sendGatewayAction("forget_device", { device: device.device });
         });
-        headerActions.append(editIdentity, badge, forget);
+        headerActions.append(editIdentity);
+        if (identify) headerActions.appendChild(identify);
+        headerActions.appendChild(forget);
 
         heading.append(icon, titleBlock, headerActions);
         panel.appendChild(heading);
@@ -2404,8 +2637,6 @@ function renderDevices() {
         if (device.pending_schema) {
             panel.appendChild(createSchemaReview(device));
         }
-
-        panel.appendChild(createSchemaHistory(device));
 
         const parameters = device.schema?.parameters || {};
 
@@ -2427,104 +2658,181 @@ function renderDevices() {
 
             parameter.append(label, currentValue);
 
-            if (definition.access === "read_write" && device.connected) {
+            if (definition.access === "read_write") {
                 const control = document.createElement("div");
                 control.className = "device-parameter-control";
+                const preference = parameterUiPreferences?.[device.device]?.[parameterId] || "schema";
+                const stylePicker = createParameterControlStylePicker(
+                    device, parameterId, definition, preference
+                );
 
-                if (definition.type === "boolean") {
-                    const button = document.createElement("button");
-                    button.type = "button";
-                    button.className = "device-boolean-switch";
-                    button.setAttribute("role", "switch");
-                    button.dataset.role = "parameter-command";
-                    button.dataset.parameterId = parameterId;
-                    const track = document.createElement("span");
-                    track.className = "device-boolean-switch-track";
-                    track.setAttribute("aria-hidden", "true");
-                    const thumb = document.createElement("span");
-                    thumb.className = "device-boolean-switch-thumb";
-                    track.appendChild(thumb);
-                    const stateLabel = document.createElement("span");
-                    stateLabel.className = "device-boolean-switch-label";
-                    button.append(track, stateLabel);
-                    button.addEventListener("click", () => {
-                        const currentDevice = devices.find(
-                            item => item.device === device.device
-                        );
-                        const currentValue = currentDevice?.parameters?.[parameterId];
-                        if (typeof currentValue === "boolean") {
-                            sendParameterCommand(
-                                device.device,
-                                parameterId,
-                                !currentValue
+                if (device.connected) {
+                    const commandControl = document.createElement("div");
+                    commandControl.className = "device-parameter-command-control";
+                    const controlType = parameterControlType(definition, preference);
+
+                    if (controlType === "toggle") {
+                        const button = document.createElement("button");
+                        button.type = "button";
+                        button.className = "device-boolean-switch";
+                        button.setAttribute("role", "switch");
+                        button.dataset.role = "parameter-command";
+                        button.dataset.parameterId = parameterId;
+                        const track = document.createElement("span");
+                        track.className = "device-boolean-switch-track";
+                        track.setAttribute("aria-hidden", "true");
+                        const thumb = document.createElement("span");
+                        thumb.className = "device-boolean-switch-thumb";
+                        track.appendChild(thumb);
+                        const stateLabel = document.createElement("span");
+                        stateLabel.className = "device-boolean-switch-label";
+                        button.append(track, stateLabel);
+                        button.addEventListener("click", () => {
+                            const currentDevice = devices.find(
+                                item => item.device === device.device
                             );
-                        }
-                    });
-                    control.appendChild(button);
-                } else {
-                    const input = document.createElement(
-                        definition.type === "enum" ? "select" : "input"
-                    );
-                    input.className = "device-parameter-input";
-                    input.dataset.role = "parameter-input";
-                    input.dataset.deviceId = device.device;
-                    input.dataset.parameterId = parameterId;
-                    input.addEventListener(
-                        definition.type === "enum" ? "change" : "input",
-                        () => { input.dataset.dirty = "true"; }
-                    );
-
-                    if (definition.type === "enum") {
-                        for (const option of definition.options || []) {
-                            const item = document.createElement("option");
-                            item.value = JSON.stringify(option.value);
-                            item.textContent = option.label;
-                            item.selected = option.value === value;
-                            input.appendChild(item);
-                        }
+                            const currentValue = currentDevice?.parameters?.[parameterId];
+                            if (typeof currentValue === "boolean") {
+                                sendParameterCommand(
+                                    device.device,
+                                    parameterId,
+                                    !currentValue
+                                );
+                            }
+                        });
+                        commandControl.appendChild(button);
                     } else {
-                        input.type = definition.type === "string" ? "text" : "number";
-                        input.value = value ?? "";
-                        if (definition.type === "integer" || definition.type === "number") {
-                            input.required = true;
+                        const isBooleanList = controlType === "boolean-list";
+                        const isSelect = controlType === "select" || isBooleanList;
+                        const input = document.createElement(
+                            isSelect ? "select" : "input"
+                        );
+                        input.className = "device-parameter-input";
+                        input.dataset.role = "parameter-input";
+                        input.dataset.deviceId = device.device;
+                        input.dataset.parameterId = parameterId;
+                        input.dataset.controlType = controlType;
+                        input.setAttribute("aria-label", definition.label || parameterId);
+                        let valuePreview = null;
+                        let sliderBounds = null;
+                        input.addEventListener(
+                            isSelect ? "change" : "input",
+                            () => {
+                                input.dataset.dirty = "true";
+                                if (valuePreview) {
+                                    valuePreview.textContent = formatDisplayedParameterValue(
+                                        Number(input.value), definition
+                                    );
+                                }
+                            }
+                        );
+
+                        if (isBooleanList) {
+                            const options = [
+                                ["true", localized("Включено", "On")],
+                                ["false", localized("Выключено", "Off")]
+                            ];
+                            if (typeof value !== "boolean") {
+                                const placeholder = document.createElement("option");
+                                placeholder.value = "";
+                                placeholder.textContent = localized("Выберите значение", "Choose a value");
+                                placeholder.selected = true;
+                                input.required = true;
+                                input.appendChild(placeholder);
+                            }
+                            for (const [optionValue, optionLabel] of options) {
+                                const item = document.createElement("option");
+                                item.value = optionValue;
+                                item.textContent = optionLabel;
+                                item.selected = String(value) === optionValue;
+                                input.appendChild(item);
+                            }
+                        } else if (controlType === "select") {
+                            for (const option of parameterSelectOptions(definition)) {
+                                const item = document.createElement("option");
+                                item.value = JSON.stringify(option.value);
+                                item.textContent = option.label;
+                                item.selected = option.value === value;
+                                input.appendChild(item);
+                            }
+                        } else {
+                            const isSlider = controlType === "slider";
+                            input.type = isSlider
+                                ? "range"
+                                : definition.type === "string" ? "text" : "number";
+                            input.value = value ?? (isSlider ? definition.min : "");
+                            if (definition.type === "integer" || definition.type === "number") {
+                                input.required = !isSlider;
+                            }
+                            if (definition.type === "integer") {
+                                input.step = String(definition.step || 1);
+                            } else if (definition.type === "number") {
+                                input.step = String(definition.step ?? (
+                                    isSlider && definition.precision != null
+                                        ? 10 ** -definition.precision
+                                        : "any"
+                                ));
+                            }
+                            if (definition.min !== undefined) input.min = definition.min;
+                            if (definition.max !== undefined) input.max = definition.max;
+
+                            if (isSlider) {
+                                const minimum = document.createElement("span");
+                                minimum.className = "device-parameter-slider-bound";
+                                minimum.textContent = String(definition.min);
+                                minimum.setAttribute("aria-hidden", "true");
+                                const maximum = document.createElement("span");
+                                maximum.className = "device-parameter-slider-bound";
+                                maximum.textContent = String(definition.max);
+                                maximum.setAttribute("aria-hidden", "true");
+                                sliderBounds = { minimum, maximum };
+                                valuePreview = document.createElement("output");
+                                valuePreview.className = "device-parameter-slider-preview";
+                                valuePreview.dataset.role = "parameter-input-preview";
+                                valuePreview.dataset.parameterId = parameterId;
+                                valuePreview.textContent = formatDisplayedParameterValue(value, definition);
+                            }
                         }
-                        if (definition.type === "integer") {
-                            input.step = String(definition.step || 1);
-                        } else if (definition.type === "number") {
-                            input.step = String(definition.step || "any");
+
+                        const savedDraft = drafts.get(`${device.device}\u0000${parameterId}`);
+                        if (savedDraft !== undefined) {
+                            input.value = savedDraft;
+                            input.dataset.dirty = "true";
                         }
-                        if (definition.min !== undefined) input.min = definition.min;
-                        if (definition.max !== undefined) input.max = definition.max;
+
+                        const apply = document.createElement("button");
+                        apply.type = "button";
+                        apply.dataset.role = "parameter-apply";
+                        apply.dataset.parameterId = parameterId;
+                        apply.textContent = localized("Применить", "Apply");
+                        apply.addEventListener("click", () => {
+                            if (!input.checkValidity()) {
+                                input.reportValidity();
+                                return;
+                            }
+
+                            let nextValue = input.value;
+                            if (definition.type === "enum") {
+                                nextValue = JSON.parse(input.value);
+                            } else if (definition.type === "boolean") {
+                                nextValue = input.value === "true" || input.value === "1";
+                            } else if (definition.type === "integer") {
+                                nextValue = Number.parseInt(input.value, 10);
+                            } else if (definition.type === "number") {
+                                nextValue = Number(input.value);
+                            }
+                            sendParameterCommand(device.device, parameterId, nextValue);
+                        });
+                        if (sliderBounds) commandControl.append(sliderBounds.minimum);
+                        commandControl.append(input);
+                        if (sliderBounds) commandControl.append(sliderBounds.maximum);
+                        if (valuePreview) commandControl.append(valuePreview);
+                        commandControl.append(apply);
                     }
-
-                    const savedDraft = drafts.get(`${device.device}\u0000${parameterId}`);
-                    if (savedDraft !== undefined) {
-                        input.value = savedDraft;
-                        input.dataset.dirty = "true";
-                    }
-
-                    const apply = document.createElement("button");
-                    apply.type = "button";
-                    apply.dataset.role = "parameter-apply";
-                    apply.dataset.parameterId = parameterId;
-                    apply.textContent = localized("Применить", "Apply");
-                    apply.addEventListener("click", () => {
-                        if (!input.checkValidity()) {
-                            input.reportValidity();
-                            return;
-                        }
-
-                        let nextValue = input.value;
-                        if (definition.type === "enum") {
-                            nextValue = JSON.parse(input.value);
-                        } else if (definition.type === "integer") {
-                            nextValue = Number.parseInt(input.value, 10);
-                        } else if (definition.type === "number") {
-                            nextValue = Number(input.value);
-                        }
-                        sendParameterCommand(device.device, parameterId, nextValue);
-                    });
-                    control.append(input, apply);
+                    if (stylePicker) commandControl.appendChild(stylePicker);
+                    control.appendChild(commandControl);
+                } else if (stylePicker) {
+                    control.appendChild(stylePicker);
                 }
 
                 parameter.appendChild(control);
@@ -2537,7 +2845,9 @@ function renderDevices() {
 
         const actions = device.schema?.actions || {};
         const modeActions = modeActionIds(device);
-        const availableActions = Object.entries(actions).filter(([actionId]) => !modeActions.has(actionId));
+        const availableActions = Object.entries(actions).filter(([actionId]) =>
+            !modeActions.has(actionId) && actionId !== "identify"
+        );
         if (availableActions.length > 0) {
             const actionList = document.createElement("div");
             actionList.className = "device-actions";
@@ -2563,6 +2873,8 @@ function renderDevices() {
             }
             panel.appendChild(actionList);
         }
+
+        panel.appendChild(createSchemaHistory(device));
 
         // Время последнего сообщения.
 
@@ -2610,15 +2922,44 @@ function updateDevicePanel(device) {
     }
 
     for (const input of panel.querySelectorAll('[data-role="parameter-input"]')) {
-        input.disabled = !device.connected || Boolean(device.pending_schema);
+        const parameterId = input.dataset.parameterId;
+        const definition = device.schema?.parameters?.[parameterId];
+        const value = device.parameters?.[parameterId];
+        input.disabled = !device.connected || Boolean(device.pending_schema) ||
+            (input.type === "range" && typeof value !== "number");
         if (input.dataset.dirty === "true" || document.activeElement === input) {
+            const preview = input.parentElement?.querySelector(
+                '[data-role="parameter-input-preview"]'
+            );
+            if (preview && input.type === "range") {
+                preview.textContent = formatDisplayedParameterValue(
+                    Number(input.value), definition
+                );
+            }
             continue;
         }
-        const parameterId = input.dataset.parameterId;
-        const value = device.parameters?.[parameterId];
-        input.value = input.tagName === "SELECT"
-            ? (value === undefined ? "" : JSON.stringify(value))
-            : (value ?? "");
+        if (input.tagName === "SELECT" && input.dataset.controlType === "boolean-list") {
+            input.value = value === undefined ? "" : String(value);
+        } else {
+            input.value = input.tagName === "SELECT"
+                ? (value === undefined ? "" : JSON.stringify(value))
+                : (value ?? (input.type === "range" ? definition?.min ?? "" : ""));
+        }
+        const preview = input.parentElement?.querySelector(
+            '[data-role="parameter-input-preview"]'
+        );
+        if (preview) {
+            preview.textContent = formatDisplayedParameterValue(value, definition);
+        }
+    }
+
+    for (const select of panel.querySelectorAll('[data-role="parameter-control-style"]')) {
+        const parameterId = select.dataset.parameterId;
+        const preference = parameterUiPreferences?.[device.device]?.[parameterId] || "schema";
+        select.value = [...select.options].some(option => option.value === preference)
+            ? preference
+            : "schema";
+        select.disabled = !isGatewayConnected() || Boolean(device.pending_schema);
     }
 
     for (const button of panel.querySelectorAll('[data-role="parameter-command"]')) {
@@ -2659,8 +3000,11 @@ function updateDevicePanel(device) {
     }
 
     for (const button of panel.querySelectorAll('[data-role="parameter-apply"]')) {
+        const input = button.parentElement?.querySelector('[data-role="parameter-input"]');
+        const parameterValue = device.parameters?.[button.dataset.parameterId];
         button.disabled = !device.connected || !isGatewayConnected() ||
             Boolean(device.pending_schema) ||
+            (input?.type === "range" && typeof parameterValue !== "number") ||
             hasPendingParameterCommand(device.device, button.dataset.parameterId);
     }
 
@@ -2679,6 +3023,24 @@ function updateDevicePanel(device) {
         button.disabled = !device.connected || !isGatewayConnected() ||
             Boolean(device.pending_schema) ||
             hasPendingAction(device.device, button.dataset.actionId);
+    }
+
+    const identifyButton = panel.querySelector('[data-role="device-identify"]');
+    if (identifyButton) {
+        const pending = hasPendingAction(device.device, "identify");
+        const pendingCommand = [...pendingCommands.values()].find(command =>
+            command.deviceId === device.device && command.actionId === "identify"
+        );
+        const label = device.schema?.actions?.identify?.label ||
+            localized("Найти устройство", "Find device");
+        identifyButton.disabled = !device.connected || !isGatewayConnected() ||
+            Boolean(device.pending_schema) || pending;
+        identifyButton.title = pending
+            ? pendingCommand?.status === "queued"
+                ? localized("Команда поиска в очереди", "Find command queued")
+                : localized("Ищем устройство…", "Finding device…")
+            : label;
+        identifyButton.setAttribute("aria-label", identifyButton.title);
     }
 
     updateDeviceModePanel(device);

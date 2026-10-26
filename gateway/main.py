@@ -103,6 +103,21 @@ def init_db():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS parameter_ui_preferences (
+                device_id TEXT NOT NULL,
+                parameter_id TEXT NOT NULL,
+                control TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (device_id, parameter_id)
+            )
+        """)
+        conn.execute("""
+            UPDATE parameter_ui_preferences
+            SET control = 'list'
+            WHERE control IN ('boolean_words', 'boolean_binary')
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS device_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 device_id TEXT NOT NULL,
@@ -386,6 +401,9 @@ def get_database_stats():
         command_record_count = conn.execute(
             "SELECT COUNT(*) FROM command_queue"
         ).fetchone()[0]
+        parameter_ui_preference_count = conn.execute(
+            "SELECT COUNT(*) FROM parameter_ui_preferences"
+        ).fetchone()[0]
         automation_count = conn.execute(
             "SELECT COUNT(*) FROM automations"
         ).fetchone()[0]
@@ -429,7 +447,8 @@ def get_database_stats():
         "database_size_bytes": database_size_bytes,
         "record_count": (
             device_count + event_count + schema_snapshot_count + command_record_count
-            + automation_count + automation_run_count + automation_run_step_count
+            + parameter_ui_preference_count + automation_count
+            + automation_run_count + automation_run_step_count
         ),
         "automation_count": automation_count,
         "automation_run_count": automation_run_count,
@@ -679,7 +698,7 @@ def validate_schema(schema):
     supported_types = {"boolean", "integer", "number", "string", "enum", "json"}
     allowed_parameter_fields = {
         "label", "type", "access", "unit", "precision", "min", "max",
-        "step", "options"
+        "step", "options", "control"
     }
     for key, definition in parameters.items():
         parameter_type = definition.get("type") if isinstance(definition, dict) else None
@@ -698,6 +717,36 @@ def validate_schema(schema):
 
         if parameter_type == "json" and access != "read_only":
             return False
+
+        if "control" in definition:
+            control = definition["control"]
+            if not isinstance(control, str):
+                return False
+            if control == "toggle":
+                if parameter_type != "boolean" or access != "read_write":
+                    return False
+            elif control == "slider":
+                if (
+                    parameter_type not in {"integer", "number"}
+                    or access != "read_write"
+                    or "min" not in definition
+                    or "max" not in definition
+                    or type(definition["min"]) not in (int, float)
+                    or type(definition["max"]) not in (int, float)
+                    or definition["min"] >= definition["max"]
+                ):
+                    return False
+            elif control == "select":
+                if parameter_type != "enum" or access != "read_write":
+                    return False
+            elif control == "input":
+                if (
+                    parameter_type not in {"integer", "number", "string"}
+                    or access != "read_write"
+                ):
+                    return False
+            else:
+                return False
 
         label = definition.get("label", key)
         if not isinstance(label, str) or not 1 <= len(label) <= 80:
@@ -919,6 +968,138 @@ def accepted_parameters_during_schema_review(
     }
 
 
+def parameter_has_zero_one_values(definition):
+    if not isinstance(definition, dict):
+        return False
+    parameter_type = definition.get("type")
+    if parameter_type == "boolean":
+        return True
+    if parameter_type in {"integer", "number"}:
+        return (
+            definition.get("min") == 0
+            and definition.get("max") == 1
+            and (
+                (parameter_type == "integer" and definition.get("step", 1) == 1)
+                or (parameter_type == "number" and definition.get("step") == 1)
+            )
+        )
+    if parameter_type == "enum":
+        values = [option.get("value") for option in definition.get("options", [])]
+        numeric_values = len(values) == 2 and all(type(value) is int for value in values)
+        string_values = len(values) == 2 and all(isinstance(value, str) for value in values)
+        return (
+            numeric_values and 0 in values and 1 in values
+        ) or (
+            string_values and "0" in values and "1" in values
+        )
+    return False
+
+
+def is_parameter_ui_preference_supported(control, definition):
+    if not isinstance(definition, dict) or definition.get("access") != "read_write":
+        return False
+
+    parameter_type = definition.get("type")
+    if control == "toggle":
+        return parameter_type == "boolean"
+    if control == "list":
+        return parameter_has_zero_one_values(definition)
+    if control == "input":
+        return parameter_type in {"integer", "number"}
+    if control == "slider":
+        return (
+            parameter_type in {"integer", "number"}
+            and type(definition.get("min")) in (int, float)
+            and type(definition.get("max")) in (int, float)
+            and definition["min"] < definition["max"]
+        )
+    return False
+
+
+def prune_parameter_ui_preferences(conn, device_id, schema):
+    parameters = schema.get("parameters", {}) if isinstance(schema, dict) else {}
+    if not isinstance(parameters, dict):
+        parameters = {}
+    rows = conn.execute(
+        "SELECT parameter_id, control FROM parameter_ui_preferences WHERE device_id = ?",
+        (device_id,)
+    ).fetchall()
+    stale = [
+        parameter_id
+        for parameter_id, control in rows
+        if not is_parameter_ui_preference_supported(
+            control, parameters.get(parameter_id)
+        )
+    ]
+    if stale:
+        conn.executemany(
+            "DELETE FROM parameter_ui_preferences WHERE device_id = ? AND parameter_id = ?",
+            [(device_id, parameter_id) for parameter_id in stale]
+        )
+
+
+def get_parameter_ui_preferences():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT device_id, parameter_id, control FROM parameter_ui_preferences"
+        ).fetchall()
+
+    preferences = {}
+    for device_id, parameter_id, control in rows:
+        preferences.setdefault(device_id, {})[parameter_id] = control
+    return preferences
+
+
+def save_parameter_ui_preference(device_id, parameter_id, control):
+    if (
+        not isinstance(device_id, str)
+        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", device_id)
+        or not isinstance(parameter_id, str)
+        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", parameter_id)
+        or not isinstance(control, str)
+    ):
+        return False, "Некорректный идентификатор устройства, параметра или вид элемента."
+
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT schema_version, schema_json FROM devices WHERE device_id = ?",
+            (device_id,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            return False, "Для устройства ещё нет принятой Schema."
+        try:
+            schema = json.loads(row[1] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False, "Не удалось прочитать Schema устройства."
+        if not isinstance(schema, dict) or not isinstance(schema.get("parameters"), dict):
+            return False, "Schema устройства имеет неверный формат."
+
+        definition = schema.get("parameters", {}).get(parameter_id)
+        if not isinstance(definition, dict) or definition.get("access") != "read_write":
+            return False, "Параметр не найден в принятой Schema или доступен только для чтения."
+
+        if control == "schema":
+            conn.execute(
+                "DELETE FROM parameter_ui_preferences WHERE device_id = ? AND parameter_id = ?",
+                (device_id, parameter_id)
+            )
+            conn.commit()
+            return True, "Используется вид элемента из Schema."
+
+        if not is_parameter_ui_preference_supported(control, definition):
+            return False, "Этот вид элемента несовместим с параметром в текущей Schema."
+
+        conn.execute("""
+            INSERT INTO parameter_ui_preferences (device_id, parameter_id, control, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(device_id, parameter_id) DO UPDATE SET
+                control = excluded.control,
+                updated_at = excluded.updated_at
+        """, (device_id, parameter_id, control, current_time()))
+        conn.commit()
+    return True, "Вид элемента сохранён."
+
+
 def save_device_metadata(device_id, metadata):
     schema_json = json.dumps(metadata["schema"], ensure_ascii=False)
     timestamp = current_time()
@@ -983,6 +1164,7 @@ def save_device_metadata(device_id, metadata):
             record_schema_snapshot_in_connection(
                 conn, device_id, metadata, timestamp, "accepted"
             )
+        prune_parameter_ui_preferences(conn, device_id, metadata["schema"])
         conn.commit()
 
     device_metadata[device_id] = metadata
@@ -1132,7 +1314,10 @@ def update_device_identity(device_id, new_device_id, display_name):
                 "UPDATE devices SET device_id = ?, display_name = ? WHERE device_id = ?",
                 (new_device_id, display_name, device_id)
             )
-            for table in ("device_events", "device_schema_history", "command_queue"):
+            for table in (
+                "device_events", "device_schema_history", "command_queue",
+                "parameter_ui_preferences"
+            ):
                 conn.execute(
                     f"UPDATE {table} SET device_id = ? WHERE device_id = ?",
                     (new_device_id, device_id)
@@ -1278,6 +1463,9 @@ def restore_device_schema(device_id, history_id):
             history.get("schema_version"), history.get("firmware_version"),
             json.dumps(history["schema"], ensure_ascii=False), device_id
         ))
+        if cursor.rowcount == 0:
+            return False, "Устройство не найдено."
+        prune_parameter_ui_preferences(conn, device_id, history["schema"])
         conn.commit()
         if cursor.rowcount == 0:
             return False, "Устройство не найдено."
@@ -2060,6 +2248,17 @@ async def send_device_list(websocket=None):
         await broadcast(message)
 
 
+async def send_parameter_ui_preferences(websocket=None):
+    message = {
+        "type": "parameter_ui_preferences",
+        "preferences": get_parameter_ui_preferences()
+    }
+    if websocket is not None:
+        await send_json(websocket, message)
+    else:
+        await broadcast(message)
+
+
 async def send_database_stats(websocket=None):
     message = {
         "type": "database_stats",
@@ -2120,6 +2319,27 @@ async def send_pending_command_result(pending, status, value, error):
     operation = pending["operation"]
     result_record = {"status": status, "value": value, "error": error}
     pending["status"] = status
+
+    # Notify the browser as soon as the device result is known. History and
+    # queue bookkeeping can require several SQLite operations and broadcasts.
+    browser = pending.get("browser")
+    if browser is not None:
+        message = {
+            "type": "command_result",
+            "command_id": pending["command_id"],
+            "device": pending["device"],
+            "success": status == "succeeded",
+            "status": status,
+            **{operation["kind"]: operation["name"]},
+            "value": value
+        }
+        if error:
+            message["error"] = error
+        try:
+            await send_json(browser, message)
+        except Exception:
+            pending["browser"] = None
+
     update_command_queue_record(pending, status, result_record, error)
     result_future = pending.get("result_future")
     if result_future is not None and not result_future.done():
@@ -2168,23 +2388,6 @@ async def send_pending_command_result(pending, status, value, error):
         )
         return
 
-    message = {
-        "type": "command_result",
-        "command_id": pending["command_id"],
-        "device": pending["device"],
-        "success": status == "succeeded",
-        "status": status,
-        **{operation["kind"]: operation["name"]},
-        "value": value
-    }
-
-    if error:
-        message["error"] = error
-
-    try:
-        await send_json(pending["browser"], message)
-    except Exception:
-        pass
     await send_command_queue_state()
 
 
@@ -2718,7 +2921,11 @@ def validate_automation_program(program):
     if not isinstance(trigger_type, str):
         return "Неизвестный тип триггера сценария."
     if trigger_type == "parameter_changed":
-        if set(trigger) != {"type", "device", "parameter"}:
+        trigger_fields = set(trigger)
+        if trigger_fields not in (
+            {"type", "device", "parameter"},
+            {"type", "device", "parameter", "value"}
+        ):
             return "Некорректный триггер изменения параметра."
         device_id = trigger.get("device")
         parameter_id = trigger.get("parameter")
@@ -2728,6 +2935,11 @@ def validate_automation_program(program):
         parameter = metadata.get("schema", {}).get("parameters", {}).get(parameter_id) if metadata else None
         if parameter is None or parameter.get("access") not in {"read_only", "read_write"} or parameter.get("type") == "json":
             return "Триггер ссылается на неизвестный параметр устройства."
+        if "value" in trigger and (
+            not is_schema_value(trigger["value"], parameter)
+            or not value_within_schema_limits(trigger["value"], parameter)
+        ):
+            return "Значение фильтра запуска не соответствует Schema параметра."
     elif trigger_type in {"device_connected", "device_disconnected"}:
         if set(trigger) != {"type", "device"} or automation_device_metadata(trigger.get("device")) is None:
             return "Триггер ссылается на неизвестное устройство."
@@ -3333,7 +3545,7 @@ async def execute_automation_run(automation_id, config, reason, run_id):
             pass
 
 
-def fire_automation_event(event_type, device_id=None, parameter=None):
+def fire_automation_event(event_type, device_id=None, parameter=None, value=None):
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("""
             SELECT automation_id, config_json FROM automations WHERE enabled = 1
@@ -3349,6 +3561,10 @@ def fire_automation_event(event_type, device_id=None, parameter=None):
                 matches = (
                     matches and trigger.get("device") == device_id
                     and trigger.get("parameter") == parameter
+                    and (
+                        "value" not in trigger
+                        or automation_trigger_value_matches(value, trigger.get("value"))
+                    )
                 )
             elif event_type in {"device_connected", "device_disconnected"}:
                 matches = matches and trigger.get("device") == device_id
@@ -3378,6 +3594,13 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
                     trigger.get("type") == "parameter_changed"
                     and trigger.get("device") == device_id
                     and trigger.get("parameter") in changed_parameters
+                    and (
+                        "value" not in trigger
+                        or automation_trigger_value_matches(
+                            current_parameters.get(trigger.get("parameter")),
+                            trigger.get("value")
+                        )
+                    )
                 ):
                     start_automation_run(automation_id, config, "parameter_changed")
                 continue
@@ -3403,6 +3626,15 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
             start_automation_run(automation_id, config, "threshold_crossed")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             print(f"[ОШИБКА] Пропуск сценария {automation_id}: {error}")
+
+
+def automation_trigger_value_matches(actual, expected):
+    if (
+        type(actual) in (int, float)
+        and type(expected) in (int, float)
+    ):
+        return actual == expected
+    return type(actual) is type(expected) and actual == expected
 
 
 async def handle_browser_message(websocket, message):
@@ -3750,6 +3982,8 @@ async def handle_browser_message(websocket, message):
             await send_device_list()
             await send_event_history()
             await send_command_queue_state()
+            await send_parameter_ui_preferences()
+            await send_database_stats()
             await send_json(websocket, {
                 "type": "automation_list",
                 "automations": get_automations()
@@ -3821,6 +4055,8 @@ async def handle_browser_message(websocket, message):
         if success:
             await send_device_list()
             await send_event_history()
+            await send_parameter_ui_preferences()
+            await send_database_stats()
         return
 
     if action == "delete_schema_history":
@@ -3856,6 +4092,30 @@ async def handle_browser_message(websocket, message):
         })
         if success:
             await send_event_history()
+        return
+
+    if action == "set_parameter_ui_preference":
+        device_id = message.get("device")
+        parameter_id = message.get("parameter")
+        control = message.get("control")
+        success, message_text = save_parameter_ui_preference(
+            device_id, parameter_id, control
+        )
+        await send_json(websocket, {
+            "type": "parameter_ui_preference_result",
+            "success": success,
+            "device": device_id,
+            "parameter": parameter_id,
+            "control": control,
+            "message": message_text
+        })
+        if success:
+            await send_parameter_ui_preferences()
+            await send_database_stats()
+        return
+
+    if action == "get_parameter_ui_preferences":
+        await send_parameter_ui_preferences(websocket)
         return
 
     if action == "get_devices":
@@ -3968,6 +4228,8 @@ async def handle_browser_message(websocket, message):
             "message": message_text
         })
         await send_device_list()
+        await send_parameter_ui_preferences()
+        await send_database_stats()
         await send_event_history()
         await send_command_queue_state()
         should_fire_connected = device_id in deferred_connection_automations
@@ -4061,6 +4323,7 @@ async def handle_client(websocket):
                 print("[БРАУЗЕР] Подключён")
 
                 await send_device_list(websocket)
+                await send_parameter_ui_preferences(websocket)
                 await send_device_access_state(websocket)
                 await send_command_queue_state(websocket)
                 await send_database_stats(websocket)
@@ -4445,6 +4708,7 @@ async def handle_client(websocket):
                 # A parameter command result includes the device's actual value.
                 # Persist and broadcast it here so the state update does not
                 # create a second, duplicate history entry for the same action.
+                automation_state_change = None
                 if operation["kind"] == "parameter" and value is not None:
                     previous_parameters = dict(device_states.get(device_id, {}))
                     device_states[device_id] = {
@@ -4467,8 +4731,9 @@ async def handle_client(websocket):
                         "last_seen": last_seen
                     })
                     if parameter not in previous_parameters or previous_parameters[parameter] != value:
-                        await evaluate_automations(
-                            device_id, previous_parameters, device_states[device_id]
+                        automation_state_change = (
+                            previous_parameters,
+                            dict(device_states[device_id])
                         )
 
                 pending = remove_pending_command(command_id)
@@ -4478,6 +4743,12 @@ async def handle_client(websocket):
                     value,
                     result_error
                 )
+                if automation_state_change is not None:
+                    await evaluate_automations(
+                        device_id,
+                        automation_state_change[0],
+                        automation_state_change[1]
+                    )
                 continue
 
             if client_type == "device" and message_type == "state":

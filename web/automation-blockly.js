@@ -12,7 +12,7 @@
     const words = {
         ru: {
             events: "События", conditions: "Условия", logic: "Логика", actions: "Действия", values: "Значения",
-            parameterChanged: "Когда изменилось значение", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
+            parameterChanged: "Когда изменилось значение", triggerFilter: "Фильтр", anyChange: "любое изменение", changedTo: "стало равно", invalidTriggerValue: "Задайте корректное значение фильтра запуска.", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
             readParameter: "текущее значение параметра", readParameterHelp: "Подключите к сравнению или вычислению; сам по себе блок не запускает сценарий.", parameterValue: "значение параметра", equals: "равно", notEquals: "не равно", lessThan: "меньше", atMost: "не больше", greaterThan: "больше", atLeast: "не меньше",
             isConnected: "устройство подключено", setParameter: "установить параметр", invokeAction: "запустить действие / режим",
             choose: "выберите устройство", parameter: "параметр", action: "действие", mode: "режим", operation: "операция", selectMode: "выполнить режим", enableMode: "включить режим", disableMode: "выключить режим", and: "И", or: "ИЛИ", noParameters: "нет доступных параметров", noActions: "нет объявленных действий", noModes: "нет зарегистрированных режимов",
@@ -23,7 +23,7 @@
         },
         en: {
             events: "Events", conditions: "Conditions", logic: "Logic", actions: "Actions", values: "Values",
-            parameterChanged: "When a parameter changes", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
+            parameterChanged: "When a parameter changes", triggerFilter: "Filter", anyChange: "any change", changedTo: "changed to", invalidTriggerValue: "Enter a valid trigger filter value.", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
             readParameter: "current parameter value", readParameterHelp: "Connect this to a comparison or calculation; it does not start a scenario by itself.", parameterValue: "parameter value", equals: "equals", notEquals: "does not equal", lessThan: "is less than", atMost: "is at most", greaterThan: "is greater than", atLeast: "is at least",
             isConnected: "device is connected", setParameter: "set parameter", invokeAction: "run device action / mode",
             choose: "select a device", parameter: "parameter", action: "action", mode: "mode", operation: "operation", selectMode: "run mode", enableMode: "enable mode", disableMode: "disable mode", and: "AND", or: "OR", noParameters: "no writable parameters", noActions: "no declared actions", noModes: "no registered modes",
@@ -134,6 +134,80 @@
         return device?.schema?.parameters?.[block.getFieldValue(fieldName)] || null;
     }
 
+    function triggerValueField(definition) {
+        if (definition?.type === "boolean") {
+            return new Blockly.FieldDropdown([
+                [text("on"), "true"], [text("off"), "false"]
+            ]);
+        }
+        if (definition?.type === "enum") {
+            const options = (definition.options || []).map(option => [
+                option.label, JSON.stringify(option.value)
+            ]);
+            if (options.length) return new Blockly.FieldDropdown(options);
+        }
+        if (definition?.type === "integer" || definition?.type === "number") {
+            const initial = definition.min ?? 0;
+            const precision = definition.type === "integer"
+                ? 1
+                : definition.step ?? (definition.precision != null
+                    ? 10 ** -definition.precision : 0.01);
+            return new Blockly.FieldNumber(
+                initial,
+                definition.min ?? -Infinity,
+                definition.max ?? Infinity,
+                precision
+            );
+        }
+        return new Blockly.FieldTextInput("");
+    }
+
+    function updateParameterTriggerFilter(block) {
+        const valueInput = block.getInput("FILTER_VALUE");
+        if (!valueInput) return;
+        const definition = selectedParameter(block);
+        const nextType = definition?.type || "string";
+        const schemaKey = `${block.getFieldValue("DEVICE")}:${block.getFieldValue("PARAMETER")}:${nextType}`;
+        if (block.triggerValueSchemaKey_ !== schemaKey) {
+            const oldType = block.triggerValueType_;
+            const oldValue = block.getFieldValue("VALUE");
+            valueInput.removeField("VALUE", true);
+            valueInput.appendField(triggerValueField(definition), "VALUE");
+            block.triggerValueType_ = nextType;
+            block.triggerValueSchemaKey_ = schemaKey;
+
+            // Keep the selected value across devices exposing the same type.
+            if (oldType === nextType && oldValue !== null && oldValue !== undefined) {
+                const field = block.getField("VALUE");
+                const options = field.getOptions ? field.getOptions(false) : null;
+                if (!options || options.some(option => option[1] === oldValue)) {
+                    try { block.setFieldValue(oldValue, "VALUE"); } catch (error) { /* use the field default */ }
+                }
+            }
+        }
+        valueInput.setVisible(block.getFieldValue("MATCH") === "equals");
+    }
+
+    function parseTriggerValue(raw, definition) {
+        if (!definition) throw new Error(text("missingBlock"));
+        if (definition.type === "boolean") return raw === "true";
+        if (definition.type === "enum") {
+            try { return JSON.parse(raw); } catch (error) { throw new Error(text("invalidTriggerValue")); }
+        }
+        if (definition.type === "integer") {
+            const value = Number(raw);
+            if (!Number.isSafeInteger(value)) throw new Error(text("invalidTriggerValue"));
+            return value;
+        }
+        if (definition.type === "number") {
+            const value = Number(raw);
+            if (!Number.isFinite(value)) throw new Error(text("invalidTriggerValue"));
+            return value;
+        }
+        if (definition.type === "string") return raw;
+        throw new Error(text("invalidTriggerValue"));
+    }
+
     function parameterComparisonOptions() {
         const definition = selectedParameter(this.getSourceBlock());
         const options = [[text("equals"), "eq"], [text("notEquals"), "ne"]];
@@ -210,16 +284,29 @@
                     .appendField(text("parameterChanged"))
                     .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
                     .appendField(new Blockly.FieldDropdown(parameterOptions), "PARAMETER");
+                this.appendDummyInput("FILTER")
+                    .appendField(text("triggerFilter"))
+                    .appendField(new Blockly.FieldDropdown([
+                        [text("anyChange"), "any"], [text("changedTo"), "equals"]
+                    ]), "MATCH");
+                this.appendDummyInput("FILTER_VALUE")
+                    .appendField(triggerValueField(selectedParameter(this)), "VALUE");
+                this.triggerValueType_ = selectedParameter(this)?.type || "string";
                 this.setNextStatement(true);
                 this.setColour(210);
                 this.setTooltip(text("parameterChanged"));
+                updateParameterTriggerFilter(this);
             },
             onchange(event) {
-                if (event.type === Blockly.Events.BLOCK_CHANGE && event.blockId === this.id && event.name === "DEVICE") {
+                if (event.type !== Blockly.Events.BLOCK_CHANGE || event.blockId !== this.id) return;
+                if (event.name === "DEVICE") {
                     const options = parameterOptions.call(this.getField("PARAMETER"));
                     if (!options.some(item => item[1] === this.getFieldValue("PARAMETER"))) {
                         this.setFieldValue(options[0][1], "PARAMETER");
                     }
+                }
+                if (["DEVICE", "PARAMETER", "MATCH"].includes(event.name)) {
+                    updateParameterTriggerFilter(this);
                 }
             }
         };
@@ -434,6 +521,7 @@
                         block.setFieldValue(options[0][1], "PARAMETER");
                     }
                     if (block.type === "iot_device_parameter") updateValueConnection(block);
+                    else updateParameterTriggerFilter(block);
                 } else if (block.type === "iot_parameter_compare") {
                     updateParameterComparison(block);
                 }
@@ -650,6 +738,11 @@
         let trigger;
         if (event.type === "iot_when_parameter_changes") {
             trigger = { type: "parameter_changed", device: event.getFieldValue("DEVICE"), parameter: event.getFieldValue("PARAMETER") };
+            if (event.getFieldValue("MATCH") === "equals") {
+                trigger.value = parseTriggerValue(
+                    event.getFieldValue("VALUE"), selectedParameter(event)
+                );
+            }
         } else if (event.type === "iot_when_device_connects") {
             trigger = { type: "device_connected", device: event.getFieldValue("DEVICE") };
         } else if (event.type === "iot_when_device_disconnects") {
