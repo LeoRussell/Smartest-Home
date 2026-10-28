@@ -2800,6 +2800,34 @@ body.nav-side .navigation-icon {
     border-color: #a0a0a0;
 }
 
+.device-component-group {
+    min-width: 0;
+    padding: 8px 10px 2px;
+    border: 1px solid #808080;
+    background: #c8c8c8;
+}
+
+.device-component-heading {
+    display: block;
+    margin-bottom: 4px;
+    color: #000080;
+    font-size: 12px;
+}
+
+.device-component-description,
+.device-parameter-description {
+    margin: 0;
+    color: #333;
+    font-size: 10px;
+    line-height: 1.35;
+}
+
+.device-parameter-name {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+
 .device-parameter-input,
 .event-device-filter,
 .action-argument select,
@@ -4100,16 +4128,26 @@ body.nav-side .main-navigation {
 }
 
 .event-automation-link {
-    align-self: flex-start;
-    min-height: 26px;
-    padding: 4px 8px;
+    align-self: flex-end;
+    min-width: 30px;
+    min-height: 21px;
+    padding: 1px 5px;
     border: 2px solid;
     border-color: #fff #404040 #404040 #fff;
     border-radius: 0;
     background: #c0c0c0;
     color: #000080;
-    font: 700 11px Tahoma, "MS Sans Serif", Arial, sans-serif;
+    font: 700 12px Tahoma, "MS Sans Serif", Arial, sans-serif;
     cursor: pointer;
+}
+
+.event-entry-side {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 3px;
+    margin-left: auto;
 }
 
 .event-automation-link:hover {
@@ -4226,5 +4264,192 @@ body.nav-side .main-navigation {
     .database-backup-entry {
         align-items: flex-start;
         flex-direction: column;
+    }
+}
+
+.device-config-dialog {
+    width: min(860px, calc(100vw - 28px));
+    max-height: min(88vh, 900px);
+    overflow: auto;
+    padding: 0;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    border-radius: 0;
+    background: #c0c0c0;
+    color: #111;
+    box-shadow: 5px 5px 0 #000;
+}
+
+.device-config-form {
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+}
+
+.device-config-form h3 {
+    margin: -10px -10px 0;
+    padding: 8px 10px;
+    background: #000080;
+    color: #fff;
+    font-size: 14px;
+}
+
+.device-config-form p {
+    margin: 0;
+    color: #202020;
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.device-config-status {
+    padding: 7px;
+    border: 2px inset #dfdfdf;
+    background: #ffffe1;
+    color: #000080;
+    font-weight: 700;
+}
+
+.device-config-form > .device-config-status {
+    color: #000080;
+}
+
+.device-config-components {
+    display: grid;
+    gap: 8px;
+}
+
+.device-config-component {
+    min-width: 0;
+    margin: 0;
+    padding: 9px;
+    border: 2px groove #fff;
+    background: #d4d0c8;
+}
+
+.device-config-component legend {
+    padding: 2px 6px;
+    background: #000080;
+    color: #fff;
+    font-weight: 700;
+}
+
+.device-config-fields {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.device-config-field {
+    display: grid;
+    align-content: start;
+    gap: 4px;
+    min-width: 0;
+    color: #111;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.device-config-field input,
+.device-config-field select {
+    width: 100%;
+    min-width: 0;
+    min-height: 28px;
+    padding: 4px 6px;
+    border: 2px inset #dfdfdf;
+    border-radius: 0;
+    background: #fff;
+    color: #111;
+    font: 12px Tahoma, "MS Sans Serif", Arial, sans-serif;
+}
+
+.device-config-toolbar,
+.device-config-import,
+.device-config-feedback {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 7px;
+}
+
+.device-config-import {
+    position: relative;
+    overflow: hidden;
+}
+
+.device-config-import input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    opacity: 0;
+    cursor: pointer;
+}
+
+.device-config-empty,
+.device-config-feedback {
+    margin: 0;
+    color: #000080;
+    font-size: 11px;
+}
+
+.device-config-form > .device-config-feedback {
+    color: #000080;
+}
+
+.device-config-firmware-help {
+    color: #202020;
+    font-size: 11px;
+    line-height: 1.45;
+}
+
+.device-config-component .schema-delete-button {
+    margin-top: 8px;
+    border-color: #fff #404040 #404040 #fff;
+    border-radius: 0;
+    background: #c0c0c0;
+    color: #800000;
+    font-weight: 700;
+}
+
+.device-config-save {
+    border-color: #fff #404040 #404040 #fff;
+    border-radius: 0;
+    background: #000080;
+    color: #fff;
+    font-weight: 700;
+}
+
+.device-config-form .secondary-button {
+    color: #fff;
+}
+
+.device-config-button {
+    min-width: 62px;
+    padding: 4px 8px;
+    border: 2px solid;
+    border-color: #fff #404040 #404040 #fff;
+    border-radius: 0;
+    background: #c0c0c0;
+    color: #000080;
+    font: 700 11px Tahoma, "MS Sans Serif", Arial, sans-serif;
+}
+
+.device-config-button:hover {
+    background: #d4d0c8;
+    color: #000;
+}
+
+.device-config-save:disabled {
+    color: #c0c0c0;
+}
+
+@media (max-width: 680px) {
+    .device-config-fields {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 460px) {
+    .device-config-fields {
+        grid-template-columns: minmax(0, 1fr);
     }
 }

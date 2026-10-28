@@ -4,23 +4,22 @@
 #if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
 #include <Adafruit_NeoPixel.h>
 #endif
-#include <WiFi.h>
-#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include "secrets.h"
+#include <GatewayClient.h>
+#include "DeviceModes.h"
+#include "DeviceSchema.h"
 
-const uint16_t gateway_port = 8765;
+const uint16_t GATEWAY_PORT = 8765;
 
 const unsigned long STATE_INTERVAL_MS = 10000;
-const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 const uint8_t COMMAND_CACHE_SLOTS = 16;
 
-WebSocketsClient webSocket;
+GatewayClient gateway;
 Preferences commandCache;
 bool commandCacheReady = false;
 unsigned long lastStateSentAt = 0;
-unsigned long lastWifiReconnectAt = 0;
 uint32_t stateSequence = 0;
 bool ledState = false;
 
@@ -96,7 +95,7 @@ bool replayCachedCommandResult(const char* commandId) {
             }
         }
 
-        webSocket.sendTXT(cachedResult);
+        gateway.sendText(cachedResult);
         Serial.println("Replayed cached result for duplicate command");
         return true;
     }
@@ -128,31 +127,17 @@ void sendHello() {
     doc["name"] = DEVICE_NAME;
     doc["protocol_version"] = 2;
     doc["command_dedup"] = commandCacheReady;
-    doc["firmware_version"] = "1.4.0";
-    doc["schema_version"] = 6;
+    doc["firmware_version"] = "1.5.0";
+    doc["schema_version"] = 7;
 
-    JsonObject led = doc["schema"]["parameters"]["led"].to<JsonObject>();
-    led["label"] = "Светодиод";
-    led["type"] = "boolean";
-    led["access"] = "read_write";
-    led["control"] = "toggle";
-
-#if DEVICE_HAS_IDENTIFY_INDICATOR
-    doc["schema"]["capabilities"]["built_in_indicator"] = true;
-    doc["schema"]["capabilities"]["identify"] = true;
-    JsonObject identify = doc["schema"]["actions"]["identify"].to<JsonObject>();
-    identify["label"] = "Найти устройство";
-    identify["description"] = "Пять раз мигает встроенным индикатором.";
-#endif
+    buildDeviceSchema(doc["schema"].to<JsonObject>());
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
-    doc["data"]["firmware"] = "1.4.0";
+    doc["data"]["firmware"] = "1.5.0";
     doc["data"]["protocol"] = 2;
 
-    String message;
-    serializeJson(doc, message);
-    webSocket.sendTXT(message);
+    gateway.sendJson(doc);
 }
 
 void sendState(bool ledOn, bool logMessage = true) {
@@ -161,11 +146,13 @@ void sendState(bool ledOn, bool logMessage = true) {
     doc["type"] = "state";
     doc["id"] = ++stateSequence;
     doc["device"] = DEVICE_ID;
-    doc["data"]["parameters"]["led"] = ledOn;
+    JsonObject parameters = doc["data"]["parameters"].to<JsonObject>();
+    parameters["led"] = ledOn;
+    appendRegisteredDeviceModeStates(parameters);
 
     String message;
     serializeJson(doc, message);
-    webSocket.sendTXT(message);
+    gateway.sendText(message);
 
     if (logMessage) {
         Serial.print("State sent: ");
@@ -197,7 +184,7 @@ void sendCommandResult(
     String message;
     serializeJson(doc, message);
     rememberCommandResult(commandId, message);
-    webSocket.sendTXT(message);
+    gateway.sendText(message);
 
     Serial.printf(
         "[COMMAND] result id=%s parameter=%s success=%s value=%s\n",
@@ -208,7 +195,12 @@ void sendCommandResult(
     );
 }
 
-void sendActionResult(const char* commandId, const char* action, bool success) {
+void sendActionResult(
+    const char* commandId,
+    const char* action,
+    bool success,
+    const char* errorMessage = nullptr
+) {
     JsonDocument doc;
     doc["type"] = "command_result";
     doc["id"] = commandId;
@@ -217,13 +209,14 @@ void sendActionResult(const char* commandId, const char* action, bool success) {
     doc["success"] = success;
     doc["data"]["action"] = action;
     if (!success) {
-        doc["data"]["error"] = "Unsupported action";
+        doc["data"]["error"] = errorMessage != nullptr
+            ? errorMessage : "Unsupported action";
     }
 
     String message;
     serializeJson(doc, message);
     rememberCommandResult(commandId, message);
-    webSocket.sendTXT(message);
+    gateway.sendText(message);
     Serial.printf(
         "[COMMAND] result id=%s action=%s success=%s\n",
         commandId,
@@ -305,7 +298,20 @@ void onWebSocketEvent(
                         lastStateSentAt = millis();
                         sendActionResult(commandId, action, true);
                     } else {
-                        sendActionResult(commandId, action, false);
+                        String modeError;
+                        const bool success = runRegisteredDeviceModeAction(
+                            action, modeError
+                        );
+                        if (success) {
+                            sendState(ledState, false);
+                            lastStateSentAt = millis();
+                        }
+                        sendActionResult(
+                            commandId,
+                            action,
+                            success,
+                            success ? nullptr : modeError.c_str()
+                        );
                     }
                     break;
                 }
@@ -370,44 +376,20 @@ void setup() {
     commandCacheReady = commandCache.begin("command_ack_v2", false);
     initializeLedOutput();
 
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    lastWifiReconnectAt = millis();
-
-    Serial.println("Connecting to Wi-Fi...");
-
-    webSocket.begin(
+    gateway.begin(
         GATEWAY_IP,
-        gateway_port,
-        "/"
+        GATEWAY_PORT,
+        WIFI_SSID,
+        WIFI_PASSWORD,
+        onWebSocketEvent
     );
-
-    webSocket.onEvent(onWebSocketEvent);
-    webSocket.setReconnectInterval(5000);
 }
 
 void loop() {
-    webSocket.loop();
-
+    gateway.loop();
     const unsigned long now = millis();
     if (
-        WiFi.status() != WL_CONNECTED &&
-        now - lastWifiReconnectAt >= WIFI_RETRY_INTERVAL_MS
-    ) {
-        Serial.println("Wi-Fi disconnected; reconnecting...");
-        WiFi.reconnect();
-        lastWifiReconnectAt = now;
-    }
-
-    if (WiFi.status() == WL_CONNECTED && lastWifiReconnectAt != 0) {
-        Serial.print("Wi-Fi connected: ");
-        Serial.println(WiFi.localIP());
-        lastWifiReconnectAt = 0;
-    }
-
-    if (
-        webSocket.isConnected() &&
+        gateway.isConnected() &&
         now - lastStateSentAt >= STATE_INTERVAL_MS
     ) {
         sendState(ledState, false);

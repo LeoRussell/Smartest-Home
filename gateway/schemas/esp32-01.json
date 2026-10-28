@@ -1,0 +1,46 @@
+{
+  "export_format": "smartest-home-device",
+  "export_version": 1,
+  "exported_at": "2026-10-28T19:28:13+03:00",
+  "device_id": "esp32-01",
+  "schema_version": 7,
+  "firmware_version": "1.5.0",
+  "schema": {
+    "format_version": 1,
+    "components": {
+      "status_led": {
+        "label": "Встроенный светодиод",
+        "category": "actuator",
+        "description": "Индикатор платы, управляемый прошивкой."
+      }
+    },
+    "parameters": {
+      "led": {
+        "label": "Светодиод",
+        "component": "status_led",
+        "type": "boolean",
+        "access": "read_write",
+        "control": "toggle"
+      }
+    },
+    "actions": {
+      "identify": {
+        "label": "Найти устройство",
+        "description": "Пять раз мигает встроенным индикатором."
+      }
+    },
+    "capabilities": {
+      "built_in_indicator": true,
+      "identify": true
+    }
+  },
+  "device_profile": null,
+  "board_profile": null,
+  "hardware_configuration": null,
+  "ui_preferences": {
+    "led": "toggle"
+  },
+  "configuration_version": null,
+  "configuration_hash": null,
+  "configuration_status": null
+}

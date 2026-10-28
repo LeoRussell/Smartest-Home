@@ -49,26 +49,37 @@ Gateway запоминает связь изменённого ID с исход�
 
 ## Действия и прошивочные режимы
 
-Прошивка объявляет готовые режимы отдельным реестром `deviceModes` в `esp32/src/main.cpp`. Каждый режим получает стабильный ID и название, а флаги `MODE_CAN_SELECT`, `MODE_CAN_ENABLE` и `MODE_CAN_DISABLE` разрешают только те операции, для которых задан обработчик. Обработчик возвращает `true`, если выполнил операцию. Gateway включает режимы в `schema.modes`, добавляет соответствующие действия в `schema.actions` и показывает их в карточке устройства и в блоках автоматизации. Устройство без записей в реестре отправляет Schema без режимов; для него список в интерфейсе пуст.
+Прошивка объявляет готовые режимы в отдельном реестре `deviceModes` в `esp32/src/DeviceModes.cpp`. Каждый режим получает стабильный ID и название, а флаги `MODE_CAN_SELECT`, `MODE_CAN_ENABLE` и `MODE_CAN_DISABLE` разрешают только операции с обработчиками. Обработчик возвращает `true`, если выполнил операцию. `DeviceSchema.cpp` публикует режимы в `schema.modes` и формирует соответствующие действия в `schema.actions`; `main.cpp` передаёт команду зарегистрированному обработчику. Устройство без записей в реестре отправляет Schema без режимов; список в интерфейсе остаётся пустым.
 
 Пример регистрации (замените функции на уже реализованные алгоритмы своего устройства):
 
 ```cpp
-bool runNightMode();
-bool enableNightMode();
-bool disableNightMode();
+bool runNightMode(String& error);
+bool enableNightMode(String& error);
+bool disableNightMode(String& error);
 bool isNightModeActive();
+const char* nightConflicts[] = {"day", nullptr};
 
 const DeviceModeRegistration deviceModes[] = {
     {
         "night", "Ночной режим", "Приглушённая яркость и обновление экрана",
         MODE_CAN_SELECT | MODE_CAN_ENABLE | MODE_CAN_DISABLE,
-        runNightMode, enableNightMode, disableNightMode, isNightModeActive
+        runNightMode, enableNightMode, disableNightMode,
+        nightConflicts, "night_active", true, isNightModeActive
     },
-    {nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr}
+    {nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr,
+     nullptr, false, nullptr}
 };
 ```
 
-Операции без флага и обработчика не попадают в Schema. `isNightModeActive` — необязательный источник статуса: при его наличии устройство отправляет boolean-параметр режима вместе с телеметрией. Алгоритм режима остаётся в прошивке; Gateway только вызывает объявленную операцию и отображает доступный статус. Если действие требует аргументов, объявите его обычным способом в `schema.actions`, где типы и границы аргументов проверяются Gateway.
+Шаблонный реестр пуст. Замените пустую завершающую запись своим режимом и
+реализуйте функции рядом с аппаратной логикой. Операции без флага и обработчика
+не попадают в Schema. `isNightModeActive` — необязательный источник статуса:
+устройство объявляет его как read-only boolean и передаёт в телеметрии.
+Алгоритм режима остаётся в прошивке; Gateway вызывает только объявленные
+операции. Для операции с аргументами добавьте описание действия в
+`DeviceSchema.cpp`, а обработку — в `main.cpp`. В примере `nightConflicts`
+ссылается на режим `day`, который должен быть зарегистрирован отдельно;
+несуществующие ссылки прошивка пропускает.
 
 Редактор также поддерживает вложенные условия и последовательности действий. Циклов и фоновых периодических правил нет; пауза ограничена одним часом, а программа — по числу блоков и глубине вложенности.

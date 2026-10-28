@@ -127,6 +127,7 @@ let pendingDeviceAccessRequests = [];
 let deviceAccessDialog = null;
 let deviceAccessDialogRequestId = null;
 let deviceIdentityDialog = null;
+let deviceConfigurationDialog = null;
 let eventFilter = "all";
 let eventDeviceFilter = "all";
 let eventSearchQuery = "";
@@ -239,6 +240,12 @@ function databaseBackupDownloadUrl(backupId) {
     const host = window.location.hostname || "localhost";
     const protocol = window.location.protocol === "https:" ? "https:" : "http:";
     return `${protocol}//${host}:8765/gateway-backups/${encodeURIComponent(backupId)}`;
+}
+
+function deviceConfigurationExportUrl(deviceId) {
+    const host = window.location.hostname || "localhost";
+    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+    return `${protocol}//${host}:8765/gateway-schemas/${encodeURIComponent(deviceId)}.json`;
 }
 
 function renderDatabaseBackups() {
@@ -444,7 +451,7 @@ function setActivePage(page) {
 }
 
 function isImportantNotification(event) {
-    if (event.event_type === "connection" || event.event_type === "schema") return true;
+    if (["connection", "schema", "configuration"].includes(event.event_type)) return true;
     if (event.event_type !== "command") return false;
     try {
         return ["failed", "timeout", "unavailable"].includes(
@@ -533,6 +540,7 @@ function eventKindLabel(event) {
         connection: localized("Подключение", "Connection"),
         schema: localized("Schema", "Schema"),
         command: localized("Команда", "Command"),
+        configuration: localized("Конфигурация", "Configuration"),
         led: localized("Изменение состояния", "State change"),
         parameter: localized("Изменение состояния", "State change")
     };
@@ -630,7 +638,7 @@ function openNotificationEvent(event) {
     eventDeviceFilter = "all";
     eventFilter = ["led", "parameter"].includes(event.event_type)
         ? "state"
-        : ["connection", "schema", "command"].includes(event.event_type)
+        : ["connection", "schema", "command", "configuration"].includes(event.event_type)
             ? event.event_type
             : "all";
     pendingEventFocusId = String(event.id);
@@ -1759,6 +1767,8 @@ function handleGatewayMessage(message) {
                 "connected_device_count",
                 "event_count",
                 "schema_snapshot_count",
+                "device_configuration_count",
+                "device_configuration_history_count",
                 "command_record_count",
                 "automation_count",
                 "automation_run_count",
@@ -1843,6 +1853,49 @@ function handleGatewayMessage(message) {
                 );
             }
 
+            break;
+        }
+
+        case "device_configuration_save_result": {
+            const dialog = deviceConfigurationDialog;
+            if (dialog && dialog.dataset.deviceId === message.device) {
+                const saveButton = dialog.querySelector(".device-config-save");
+                const feedback = dialog.querySelector(".device-config-feedback");
+                const status = dialog.querySelector(".device-config-status");
+                if (saveButton) saveButton.disabled = false;
+                if (feedback) feedback.textContent = message.message || localized(
+                    "Не удалось сохранить конфигурацию.",
+                    "Could not save the configuration."
+                );
+                if (status && message.success) {
+                    status.textContent = message.status === "pending"
+                        ? localized("Сохранено в Gateway; будет отправлено при подключении.", "Saved on Gateway; it will be sent when the device connects.")
+                        : localized("Gateway отправил конфигурацию и ожидает подтверждение ESP32.", "Gateway sent the configuration and is waiting for ESP32 confirmation.");
+                } else if (status) {
+                    status.textContent = message.message || localized(
+                        "Gateway отклонил конфигурацию.",
+                        "Gateway rejected the configuration."
+                    );
+                }
+            }
+            requestDevices();
+            break;
+        }
+
+        case "device_configuration_apply_result": {
+            const dialog = deviceConfigurationDialog;
+            if (dialog && dialog.dataset.deviceId === message.device) {
+                const saveButton = dialog.querySelector(".device-config-save");
+                const feedback = dialog.querySelector(".device-config-feedback");
+                const status = dialog.querySelector(".device-config-status");
+                if (saveButton) saveButton.disabled = false;
+                if (feedback) feedback.textContent = message.message || "";
+                if (status) status.textContent = message.success
+                    ? localized(`Применена версия ${message.config_version}.`, `Version ${message.config_version} applied.`)
+                    : localized(`Ошибка применения: ${message.message || "неизвестная ошибка"}`, `Apply failed: ${message.message || "unknown error"}`);
+            }
+            if (message.message) setActivity(message.message);
+            requestDevices();
             break;
         }
 
@@ -2217,6 +2270,7 @@ function canonicalJson(value) {
 function describeSchemaChanges(previousSchema, nextSchema) {
     const changes = [];
     const groups = [
+        ["components", localized("Компонент", "Component")],
         ["parameters", "Параметр"],
         ["actions", "Действие"],
         ["modes", "Режим"]
@@ -2620,6 +2674,32 @@ function renderBlockedDevices() {
     }
 }
 
+function downloadDeviceSchema(device) {
+    if (!device?.schema || typeof device.schema !== "object") return;
+    const exportDocument = {
+        export_format: "smartest-home-schema",
+        export_version: 1,
+        exported_at: new Date().toISOString(),
+        source_device_id: device.device,
+        schema_version: device.schema_version ?? null,
+        firmware_version: device.firmware_version ?? null,
+        schema: device.schema
+    };
+    const blob = new Blob(
+        [JSON.stringify(exportDocument, null, 2)],
+        { type: "application/json;charset=utf-8" }
+    );
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${String(device.device || "device").replace(/[^A-Za-z0-9_-]/g, "_")}-schema.json`;
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 function createSchemaHistory(device) {
     const details = document.createElement("details");
     details.className = "schema-history";
@@ -2630,6 +2710,13 @@ function createSchemaHistory(device) {
     const content = document.createElement("div");
     content.className = "schema-history-content";
     const history = schemaHistoryByDevice.get(device.device);
+
+    const exportButton = document.createElement("button");
+    exportButton.type = "button";
+    exportButton.className = "event-tool-button";
+    exportButton.textContent = localized("Скачать текущую Schema", "Download current Schema");
+    exportButton.disabled = !device.schema || typeof device.schema !== "object";
+    exportButton.addEventListener("click", () => downloadDeviceSchema(device));
 
     if (!history) {
         const load = document.createElement("button");
@@ -2704,7 +2791,7 @@ function createSchemaHistory(device) {
         });
         const actions = document.createElement("div");
         actions.className = "schema-history-actions";
-        actions.append(restore, remove);
+        actions.append(restore, exportButton, remove);
         const note = document.createElement("p");
         note.className = "schema-history-note";
         note.textContent = device.connected
@@ -2714,6 +2801,13 @@ function createSchemaHistory(device) {
                 "Only Gateway's accepted Schema is restored; the device is not reflashed. Deleting a snapshot only changes history."
             );
         content.append(select, actions, note);
+    }
+
+    if (!history || history.length === 0) {
+        const exportActions = document.createElement("div");
+        exportActions.className = "schema-history-actions";
+        exportActions.appendChild(exportButton);
+        content.appendChild(exportActions);
     }
 
     details.addEventListener("toggle", () => {
@@ -3032,11 +3126,21 @@ function renderDevices() {
             : device.schema_source === "missing"
                 ? localized("Schema ещё не получена", "Schema not received yet")
                 : null;
+        const configurationNotes = {
+            not_configured: localized("Требует настройки", "Needs configuration"),
+            pending: localized("Конфигурация ожидает подключения", "Configuration queued"),
+            applying: localized("Применение конфигурации…", "Applying configuration…"),
+            failed: localized("Ошибка конфигурации", "Configuration failed")
+        };
+        const configurationNote = device.device_profile === "universal"
+            ? configurationNotes[device.configuration_status] || null
+            : null;
         subtitle.textContent = [
             device.device,
             device.firmware_version
                 ? localized(`Прошивка ${device.firmware_version}`, `Firmware ${device.firmware_version}`)
                 : null,
+            configurationNote,
             schemaNote
         ].filter(Boolean).join(" · ");
 
@@ -3065,6 +3169,20 @@ function renderDevices() {
         editIdentity.setAttribute("aria-label", localized("Изменить имя и ID", "Edit name and ID"));
         editIdentity.title = localized("Изменить отображаемое имя и ID Gateway", "Edit the display name and Gateway ID");
         editIdentity.addEventListener("click", () => openDeviceIdentityDialog(device));
+
+        const configureDevice = device.device_profile === "universal"
+            ? document.createElement("button")
+            : null;
+        if (configureDevice) {
+            configureDevice.type = "button";
+            configureDevice.className = "device-config-button";
+            configureDevice.textContent = localized("Настроить", "Configure");
+            configureDevice.title = localized(
+                "Настроить поддерживаемые компоненты ESP32",
+                "Configure supported ESP32 components"
+            );
+            configureDevice.addEventListener("click", () => openDeviceConfigurationDialog(device));
+        }
 
         const identify = device.schema?.actions?.identify
             ? document.createElement("button")
@@ -3111,6 +3229,7 @@ function renderDevices() {
             )) return;
             sendGatewayAction("forget_device", { device: device.device });
         });
+        if (configureDevice) headerActions.append(configureDevice);
         headerActions.append(editIdentity);
         if (identify) headerActions.appendChild(identify);
         headerActions.appendChild(forget);
@@ -3127,15 +3246,50 @@ function renderDevices() {
         }
 
         const parameters = device.schema?.parameters || {};
+        const schemaComponents = device.schema?.components || {};
+        const componentGroups = new Map();
 
         for (const [parameterId, definition] of Object.entries(parameters)) {
             const parameter = document.createElement("div");
             parameter.className = "device-parameter";
             parameter.dataset.parameterId = parameterId;
 
+            let parameterContainer = panel;
+            const componentId = definition.component;
+            const componentDefinition = schemaComponents[componentId];
+            if (componentDefinition) {
+                if (!componentGroups.has(componentId)) {
+                    const group = document.createElement("section");
+                    group.className = "device-component-group";
+                    const groupHeading = document.createElement("strong");
+                    groupHeading.className = "device-component-heading";
+                    groupHeading.textContent = componentDefinition.label || componentId;
+                    group.appendChild(groupHeading);
+                    if (componentDefinition.description) {
+                        const groupDescription = document.createElement("p");
+                        groupDescription.className = "device-component-description";
+                        groupDescription.textContent = componentDefinition.description;
+                        group.appendChild(groupDescription);
+                    }
+                    panel.appendChild(group);
+                    componentGroups.set(componentId, group);
+                }
+                parameterContainer = componentGroups.get(componentId);
+            }
+
+            const labelBlock = document.createElement("div");
+            labelBlock.className = "device-parameter-name";
             const label = document.createElement("strong");
             label.className = "device-parameter-label";
             label.textContent = definition.label || parameterId;
+            if (definition.description) label.title = definition.description;
+            labelBlock.appendChild(label);
+            if (definition.description) {
+                const description = document.createElement("small");
+                description.className = "device-parameter-description";
+                description.textContent = definition.description;
+                labelBlock.appendChild(description);
+            }
 
             const value = device.parameters?.[parameterId];
             const currentValue = document.createElement("span");
@@ -3144,7 +3298,7 @@ function renderDevices() {
             currentValue.dataset.parameterId = parameterId;
             currentValue.textContent = formatDisplayedParameterValue(value, definition);
 
-            parameter.append(label, currentValue);
+            parameter.append(labelBlock, currentValue);
 
             if (definition.access === "read_write") {
                 const control = document.createElement("div");
@@ -3332,7 +3486,7 @@ function renderDevices() {
                 parameter.appendChild(control);
             }
 
-            panel.appendChild(parameter);
+            parameterContainer.appendChild(parameter);
         }
 
         panel.appendChild(createDeviceModeControls(device));
@@ -3815,6 +3969,39 @@ function getEventDescription(event) {
         return localized(`Обновление Schema: ${value}`, `Schema update: ${value}`);
     }
 
+    if (event.event_type === "configuration") {
+        const restored = value.match(/Gateway восстановил аппаратную конфигурацию версии (\d+) из ESP32\.?/i);
+        if (restored) {
+            return localized(
+                `Gateway восстановил аппаратную конфигурацию версии ${restored[1]} из ESP32`,
+                `Gateway restored hardware configuration version ${restored[1]} from ESP32`
+            );
+        }
+        const applied = value.match(/(?:Аппаратная конфигурация версии|Конфигурация версии) (\d+) (?:применена устройством|восстановлена из устройства)\.?/i);
+        if (applied) {
+            return localized(`Конфигурация версии ${applied[1]} применена`, `Configuration version ${applied[1]} applied`);
+        }
+        const saved = value.match(/Сохранена аппаратная конфигурация версии (\d+); статус: ([^.]+)\.?/i);
+        if (saved) {
+            const statuses = {
+                pending: localized("ожидает подключения", "waiting for device"),
+                applying: localized("отправлена устройству", "sent to device"),
+                applied: localized("применена", "applied"),
+                failed: localized("ошибка применения", "apply failed")
+            };
+            return localized(
+                `Сохранена конфигурация версии ${saved[1]}: ${statuses[saved[2]] || saved[2]}`,
+                `Configuration version ${saved[1]} saved: ${statuses[saved[2]] || saved[2]}`
+            );
+        }
+        const failure = value.match(/Ошибка применения аппаратной конфигурации версии (\d+):?\s*(.*)/i);
+        if (failure) {
+            const detail = failure[2] ? `: ${failure[2]}` : "";
+            return localized(`Ошибка конфигурации версии ${failure[1]}${detail}`, `Configuration version ${failure[1]} failed${detail}`);
+        }
+        return localized(`Настройка оборудования: ${value}`, `Hardware configuration: ${value}`);
+    }
+
     if (event.event_type === "led") {
         if (normalized === "true" || normalized === "1") {
             return localized("Светодиод включён", "LED on");
@@ -4097,7 +4284,8 @@ function renderEvents() {
         { value: "connection", label: localized("Подключения", "Connections") },
         { value: "command", label: localized("Команды", "Commands") },
         { value: "state", label: localized("Изменения состояния", "State changes") },
-        { value: "schema", label: localized("Обновления Schema", "Schema updates") }
+        { value: "schema", label: localized("Обновления Schema", "Schema updates") },
+        { value: "configuration", label: localized("Конфигурации", "Configurations") }
     ];
 
     for (const option of filterOptions) {
@@ -4244,11 +4432,16 @@ function renderEvents() {
             typeBadge.textContent = localized("Изменение состояния", "State change");
         } else if (event.event_type === "command") {
             typeBadge.textContent = localized("Результат команды", "Command result");
+        } else if (event.event_type === "configuration") {
+            typeBadge.textContent = localized("Конфигурация", "Configuration");
         } else {
             typeBadge.textContent = event.event_type || localized("Событие", "Event");
         }
 
-        top.append(deviceName, typeBadge);
+        const side = document.createElement("div");
+        side.className = "event-entry-side";
+        side.appendChild(typeBadge);
+        top.append(deviceName, side);
 
         const description = document.createElement("p");
         description.className = "event-description";
@@ -4272,17 +4465,20 @@ function renderEvents() {
             const openRun = document.createElement("button");
             openRun.type = "button";
             openRun.className = "event-automation-link";
-            openRun.textContent = scenario?.config?.name
+            const openRunLabel = scenario?.config?.name
                 ? localized(
                     `Открыть запуск «${scenario.config.name}»`,
                     `Open run “${scenario.config.name}”`
                 )
                 : localized("Открыть запуск сценария", "Open scenario run");
+            openRun.textContent = ">>";
+            openRun.title = openRunLabel;
+            openRun.setAttribute("aria-label", openRunLabel);
             openRun.addEventListener("click", () => openAutomationRunFromEvent(
                 automationSource.automation_id,
                 automationSource.run_id
             ));
-            row.appendChild(openRun);
+            side.appendChild(openRun);
         }
 
         const isPermanentlyBlocked =
@@ -4449,6 +4645,713 @@ function createActionArgumentInput(definition) {
     }
 
     return input;
+}
+
+function stableJson(value) {
+    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+    if (value && typeof value === "object") {
+        return `{${Object.keys(value).sort().map(key =>
+            `${JSON.stringify(key)}:${stableJson(value[key])}`
+        ).join(",")}}`;
+    }
+    return JSON.stringify(value);
+}
+
+function downloadEmbeddedDeviceConfiguration(configuration, version) {
+    const canonical = stableJson(configuration);
+    const header = [
+        "#pragma once",
+        "",
+        "// Generated by IoT Gateway. Copy this file to esp32/universal/include/.",
+        `#define UNIVERSAL_GENERATED_CONFIGURATION_VERSION ${version}UL`,
+        `#define UNIVERSAL_GENERATED_CONFIGURATION_JSON ${JSON.stringify(canonical)}`,
+        ""
+    ].join("\n");
+    const blob = new Blob([header], { type: "text/x-c++hdr;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "device_configuration.generated.h";
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function openDeviceConfigurationDialog(device) {
+    if (deviceConfigurationDialog) deviceConfigurationDialog.close();
+
+    const drivers = Array.isArray(device.driver_catalog) ? device.driver_catalog : [];
+    const components = JSON.parse(JSON.stringify(
+        device.hardware_configuration?.components || []
+    ));
+    let identifyIndicator = device.hardware_configuration?.identify_indicator
+        ? JSON.parse(JSON.stringify(device.hardware_configuration.identify_indicator))
+        : null;
+    for (const component of components) {
+        component.ui_control = parameterUiPreferences?.[device.device]?.[component.parameter_id] || "schema";
+        if (component.driver === "analog_input") {
+            component.raw_min ??= 0;
+            component.raw_max ??= 4095;
+            component.value_min ??= 0;
+            component.value_max ??= 4095;
+        }
+        if (component.driver === "pwm_output") {
+            component.min_value ??= 0;
+            component.max_value ??= 255;
+        }
+    }
+    const dialog = document.createElement("dialog");
+    dialog.className = "action-dialog device-config-dialog";
+    const form = document.createElement("form");
+    form.className = "action-dialog-form device-config-form";
+    form.addEventListener("submit", event => event.preventDefault());
+
+    const heading = document.createElement("h3");
+    heading.textContent = localized("Конфигурация оборудования", "Hardware configuration");
+    const intro = document.createElement("p");
+    intro.textContent = localized(
+        "Выбирайте только драйверы и GPIO, объявленные прошивкой. Конфигурация хранится в Gateway и применяется после подтверждения ESP32.",
+        "Choose only drivers and GPIO pins advertised by the firmware. Gateway stores the configuration and waits for the ESP32 to confirm it."
+    );
+    const status = document.createElement("p");
+    status.className = "device-config-status";
+    status.setAttribute("aria-live", "polite");
+    const componentList = document.createElement("div");
+    componentList.className = "device-config-components";
+    const toolbar = document.createElement("div");
+    toolbar.className = "device-config-toolbar";
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "event-tool-button";
+    add.textContent = localized("Добавить компонент", "Add component");
+    add.disabled = drivers.length === 0;
+    const exportButton = document.createElement("button");
+    exportButton.type = "button";
+    exportButton.className = "event-tool-button";
+    exportButton.textContent = localized("Экспорт JSON", "Export JSON");
+    const savedExportButton = document.createElement("button");
+    savedExportButton.type = "button";
+    savedExportButton.className = "event-tool-button";
+    savedExportButton.textContent = localized("Скачать Schema из Gateway", "Download Schema from Gateway");
+    const firmwareButton = document.createElement("button");
+    firmwareButton.type = "button";
+    firmwareButton.className = "event-tool-button";
+    firmwareButton.textContent = localized("Файл для прошивки (.h)", "Firmware file (.h)");
+    const importLabel = document.createElement("label");
+    importLabel.className = "event-tool-button device-config-import";
+    importLabel.textContent = localized("Импорт JSON", "Import JSON");
+    const importInput = document.createElement("input");
+    importInput.type = "file";
+    importInput.accept = "application/json,.json";
+    importLabel.appendChild(importInput);
+    toolbar.append(add, exportButton, savedExportButton, firmwareButton, importLabel);
+
+    const firmwareHelp = document.createElement("p");
+    firmwareHelp.className = "device-config-firmware-help";
+    firmwareHelp.textContent = localized(
+        "Файл .h можно добавить в esp32/universal/include и прошить устройство с этой конфигурацией. Для обычных изменений это не требуется: Gateway передаёт конфигурацию устройству сам.",
+        "You can add the .h file to esp32/universal/include and flash the device with this configuration. Regular changes do not need reflashing; Gateway can apply them directly."
+    );
+    const schemaLocation = document.createElement("p");
+    schemaLocation.className = "device-config-firmware-help";
+    schemaLocation.textContent = localized(
+        `JSON-копия Schema хранится в gateway/schemas/${device.device}.json. Кнопка «Скачать Schema из Gateway» загружает именно сохранённый файл; «Экспорт JSON» выгружает текущий черновик.`,
+        `The saved Schema is stored at gateway/schemas/${device.device}.json. “Download Schema from Gateway” retrieves that saved file; “Export JSON” exports the current draft.`
+    );
+
+    const feedback = document.createElement("p");
+    feedback.className = "device-config-feedback";
+    feedback.setAttribute("aria-live", "polite");
+
+    const buttons = document.createElement("div");
+    buttons.className = "action-dialog-buttons";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "device-config-save";
+    save.textContent = localized("Сохранить и применить", "Save and apply");
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "secondary-button";
+    cancel.textContent = localized("Закрыть", "Close");
+    cancel.addEventListener("click", () => dialog.close());
+    buttons.append(save, cancel);
+
+    function field(labelText, value, type, onChange, options = {}) {
+        const label = document.createElement("label");
+        label.className = "device-config-field";
+        const caption = document.createElement("span");
+        caption.textContent = labelText;
+        const input = type === "select"
+            ? document.createElement("select")
+            : document.createElement("input");
+        if (type !== "select") input.type = type;
+        if (options.options) {
+            for (const optionData of options.options) {
+                const option = document.createElement("option");
+                option.value = String(optionData.value);
+                option.textContent = optionData.label;
+                option.disabled = optionData.disabled === true;
+                input.appendChild(option);
+            }
+        }
+        input.value = value == null ? "" : String(value);
+        if (options.required) input.required = true;
+        if (options.maxLength) input.maxLength = options.maxLength;
+        if (options.pattern) input.pattern = options.pattern;
+        if (options.min !== undefined) input.min = String(options.min);
+        if (options.max !== undefined) input.max = String(options.max);
+        if (options.step !== undefined) input.step = String(options.step);
+        input.addEventListener(type === "select" ? "change" : "input", () => {
+            let nextValue = input.value;
+            if (options.number) nextValue = input.value === "" ? null : Number(input.value);
+            if (options.boolean) nextValue = input.value === "true";
+            onChange(nextValue);
+        });
+        label.append(caption, input);
+        return label;
+    }
+
+    function defaultComponent(index, driver) {
+        let nextId = Math.max(1, index + 1);
+        while (components.some(component =>
+            component.id === `component_${nextId}` ||
+            component.parameter_id === `value_${nextId}`
+        )) nextId += 1;
+        const pin = driver.pins?.find(candidate =>
+            !components.some(component => component.pin === candidate) &&
+            identifyIndicator?.pin !== candidate
+        ) ?? driver.pins?.[0] ?? null;
+        return {
+            id: `component_${nextId}`,
+            driver: driver.id,
+            label: driver.label,
+            parameter_id: `value_${nextId}`,
+            parameter_label: driver.label,
+            ui_control: "schema",
+            pin,
+            ...(driver.id === "gpio_output" ? { active_high: true, initial_value: false } : {}),
+            ...(driver.id === "digital_input" ? { pull: "up", interval_ms: 1000 } : {}),
+            ...(driver.id === "analog_input"
+                ? {
+                    interval_ms: 1000, unit: "raw",
+                    raw_min: 0, raw_max: 4095,
+                    value_min: 0, value_max: 4095
+                }
+                : {}),
+            ...(driver.id === "pwm_output"
+                ? { initial_value: 0, min_value: 0, max_value: 255 }
+                : {})
+        };
+    }
+
+    function renderComponents() {
+        componentList.replaceChildren();
+        components.forEach((component, index) => {
+            const driver = drivers.find(item => item.id === component.driver) || drivers[0];
+            if (!driver) return;
+            const section = document.createElement("fieldset");
+            section.className = "device-config-component";
+            const legend = document.createElement("legend");
+            legend.textContent = `${localized("Компонент", "Component")} ${index + 1}`;
+            section.appendChild(legend);
+            const fields = document.createElement("div");
+            fields.className = "device-config-fields";
+            fields.appendChild(field(
+                localized("Драйвер", "Driver"),
+                component.driver,
+                "select",
+                value => {
+                    const replacement = defaultComponent(index, drivers.find(item => item.id === value) || driver);
+                    replacement.label = component.label;
+                    replacement.id = component.id;
+                    replacement.parameter_id = component.parameter_id;
+                    replacement.parameter_label = component.parameter_label;
+                    components[index] = replacement;
+                    renderComponents();
+                },
+                { required: true, options: drivers.map(item => ({ value: item.id, label: item.label })) }
+            ));
+            fields.appendChild(field(
+                localized("Логический ID", "Component ID"), component.id, "text",
+                value => { component.id = value.trim(); }, {
+                    required: true, maxLength: 64,
+                    pattern: "[A-Za-z][A-Za-z0-9_.-]{0,63}"
+                }
+            ));
+            fields.appendChild(field(
+                localized("Название компонента", "Component label"), component.label, "text",
+                value => { component.label = value; }, { required: true, maxLength: 80 }
+            ));
+            fields.appendChild(field(
+                localized("GPIO", "GPIO pin"), component.pin, "select",
+                value => { component.pin = Number(value); },
+                { required: true, options: driver.pins.map(pin => ({
+                    value: pin,
+                    label: `GPIO ${pin}`,
+                    disabled: components.some((other, otherIndex) =>
+                        otherIndex !== index && Number(other.pin) === pin
+                    ) || identifyIndicator?.pin === pin
+                })) }
+            ));
+            fields.appendChild(field(
+                localized("ID параметра", "Parameter ID"), component.parameter_id, "text",
+                value => { component.parameter_id = value.trim(); }, {
+                    required: true, maxLength: 64,
+                    pattern: "[A-Za-z][A-Za-z0-9_.-]{0,63}"
+                }
+            ));
+            fields.appendChild(field(
+                localized("Название параметра", "Parameter label"), component.parameter_label, "text",
+                value => { component.parameter_label = value; }, { required: true, maxLength: 80 }
+            ));
+
+            if (component.driver === "gpio_output") {
+                fields.appendChild(field(
+                    localized("Отображение", "Control style"),
+                    component.ui_control || "schema",
+                    "select",
+                    value => { component.ui_control = value; },
+                    { options: [
+                        { value: "schema", label: localized("Автоматически", "Automatic") },
+                        { value: "toggle", label: localized("Переключатель", "Switch") },
+                        { value: "list", label: localized("Список", "List") }
+                    ] }
+                ));
+            } else if (component.driver === "pwm_output") {
+                fields.appendChild(field(
+                    localized("Минимальное значение", "Minimum value"),
+                    component.min_value ?? 0,
+                    "number",
+                    value => { component.min_value = value; },
+                    { required: true, number: true, min: 0, max: 254, step: 1 }
+                ));
+                fields.appendChild(field(
+                    localized("Максимальное значение", "Maximum value"),
+                    component.max_value ?? 255,
+                    "number",
+                    value => { component.max_value = value; },
+                    { required: true, number: true, min: 1, max: 255, step: 1 }
+                ));
+                fields.appendChild(field(
+                    localized("Отображение", "Control style"),
+                    component.ui_control || "schema",
+                    "select",
+                    value => { component.ui_control = value; },
+                    { options: [
+                        { value: "schema", label: localized("Автоматически", "Automatic") },
+                        { value: "slider", label: localized("Ползунок", "Slider") },
+                        { value: "input", label: localized("Ввод числа", "Number input") }
+                    ] }
+                ));
+            } else if (component.driver === "analog_input") {
+                fields.appendChild(field(
+                    localized("ADC: raw минимум", "ADC raw minimum"),
+                    component.raw_min ?? 0,
+                    "number",
+                    value => { component.raw_min = value; },
+                    { required: true, number: true, min: 0, max: 4094, step: 1 }
+                ));
+                fields.appendChild(field(
+                    localized("ADC: raw максимум", "ADC raw maximum"),
+                    component.raw_max ?? 4095,
+                    "number",
+                    value => { component.raw_max = value; },
+                    { required: true, number: true, min: 1, max: 4095, step: 1 }
+                ));
+                fields.appendChild(field(
+                    localized("Значение минимум", "Value minimum"),
+                    component.value_min ?? 0,
+                    "number",
+                    value => { component.value_min = value; },
+                    { required: true, number: true, min: -1000000, max: 999999, step: 1 }
+                ));
+                fields.appendChild(field(
+                    localized("Значение максимум", "Value maximum"),
+                    component.value_max ?? 4095,
+                    "number",
+                    value => { component.value_max = value; },
+                    { required: true, number: true, min: -999999, max: 1000000, step: 1 }
+                ));
+                fields.appendChild(field(
+                    localized("Единица измерения", "Unit"), component.unit, "text",
+                    value => { component.unit = value; }, { maxLength: 24 }
+                ));
+            }
+
+            if (component.driver === "gpio_output") {
+                fields.appendChild(field(
+                    localized("Активный уровень", "Active level"), component.active_high,
+                    "select", value => { component.active_high = value; },
+                    { boolean: true, options: [
+                        { value: true, label: "HIGH" },
+                        { value: false, label: "LOW" }
+                    ] }
+                ));
+                fields.appendChild(field(
+                    localized("Начальное состояние", "Initial state"), component.initial_value,
+                    "select", value => { component.initial_value = value; },
+                    { boolean: true, options: [
+                        { value: false, label: localized("Выключено", "Off") },
+                        { value: true, label: localized("Включено", "On") }
+                    ] }
+                ));
+            } else if (component.driver === "digital_input") {
+                fields.appendChild(field(
+                    localized("Подтяжка входа", "Input pull"), component.pull, "select",
+                    value => { component.pull = value; },
+                    { options: [
+                        { value: "none", label: localized("Нет", "None") },
+                        { value: "up", label: "Pull-up" },
+                        { value: "down", label: "Pull-down" }
+                    ] }
+                ));
+                fields.appendChild(field(
+                    localized("Опрос, мс", "Polling interval, ms"), component.interval_ms,
+                    "number", value => { component.interval_ms = value; },
+                    { number: true, min: 100, max: 60000, step: 100, required: true }
+                ));
+            } else if (component.driver === "analog_input") {
+                fields.appendChild(field(
+                    localized("Опрос, мс", "Polling interval, ms"), component.interval_ms,
+                    "number", value => { component.interval_ms = value; },
+                    { number: true, min: 250, max: 60000, step: 250, required: true }
+                ));
+            } else if (component.driver === "pwm_output") {
+                fields.appendChild(field(
+                    localized("Начальное значение", "Initial value"),
+                    component.initial_value, "number",
+                    value => { component.initial_value = value; },
+                    { number: true, min: 0, max: 255, step: 1, required: true }
+                ));
+            }
+
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "schema-delete-button";
+            remove.textContent = localized("Удалить компонент", "Remove component");
+            remove.addEventListener("click", () => {
+                components.splice(index, 1);
+                renderComponents();
+            });
+            section.append(fields, remove);
+            componentList.appendChild(section);
+        });
+        add.disabled = drivers.length === 0 || components.length >= 8;
+        if (!components.length) {
+            const empty = document.createElement("p");
+            empty.className = "device-config-empty";
+            empty.textContent = localized(
+                "Компоненты не добавлены. В пустой конфигурации прошивка не управляет GPIO.",
+                "No components are configured. With an empty configuration, the firmware will not drive GPIO pins."
+            );
+            componentList.appendChild(empty);
+        }
+
+        const identifySection = document.createElement("fieldset");
+        identifySection.className = "device-config-component device-config-identify";
+        const identifyLegend = document.createElement("legend");
+        identifyLegend.textContent = localized("Индикатор для «Найти устройство»", "Indicator for Find device");
+        identifySection.appendChild(identifyLegend);
+        const identifyFields = document.createElement("div");
+        identifyFields.className = "device-config-fields";
+        identifyFields.appendChild(field(
+            localized("Тип индикатора", "Indicator type"),
+            identifyIndicator?.driver || "none",
+            "select",
+            value => {
+                const freeGpioPin = drivers.find(item => item.id === "gpio_output")?.pins
+                    ?.find(pin => !components.some(component => Number(component.pin) === pin));
+                const freeNeoPixelPin = [38, 48].find(pin =>
+                    !components.some(component => Number(component.pin) === pin)
+                );
+                identifyIndicator = value === "gpio"
+                    ? { driver: "gpio", pin: freeGpioPin ?? null, active_high: true, built_in: false }
+                    : value === "neopixel"
+                        ? { driver: "neopixel", pin: freeNeoPixelPin ?? null, brightness: 32, built_in: true }
+                        : null;
+                renderComponents();
+            },
+            { options: [
+                { value: "none", label: localized("Не использовать", "Not used") },
+                { value: "gpio", label: localized("Обычный светодиод на GPIO", "Regular GPIO LED") },
+                { value: "neopixel", label: localized("Адресный RGB (NeoPixel)", "Addressable RGB (NeoPixel)") }
+            ] }
+        ));
+        if (identifyIndicator?.driver === "gpio") {
+            const gpioPins = drivers.find(item => item.id === "gpio_output")?.pins || [];
+            identifyFields.appendChild(field(
+                localized("GPIO индикатора", "Indicator GPIO"),
+                identifyIndicator.pin ?? "",
+                "select",
+                value => { identifyIndicator.pin = Number(value); },
+                { required: true, options: gpioPins.map(pin => ({
+                    value: pin,
+                    label: `GPIO ${pin}`,
+                    disabled: components.some(component => Number(component.pin) === pin)
+                })) }
+            ));
+            identifyFields.appendChild(field(
+                localized("Активный уровень", "Active level"),
+                identifyIndicator.active_high,
+                "select",
+                value => { identifyIndicator.active_high = value; },
+                { boolean: true, options: [
+                    { value: true, label: "HIGH" },
+                    { value: false, label: "LOW" }
+                ] }
+            ));
+        } else if (identifyIndicator?.driver === "neopixel") {
+            identifyFields.appendChild(field(
+                localized("Пин адресного индикатора", "Addressable LED pin"),
+                identifyIndicator.pin ?? "",
+                "select",
+                value => { identifyIndicator.pin = Number(value); },
+                { required: true, options: [38, 48].map(pin => ({
+                    value: pin,
+                    label: `GPIO ${pin} (${pin === 48 ? "ESP32-S3 v1.0" : "ESP32-S3 v1.1"})`,
+                    disabled: components.some(component => Number(component.pin) === pin)
+                })) }
+            ));
+            identifyFields.appendChild(field(
+                localized("Яркость", "Brightness"),
+                identifyIndicator.brightness ?? 32,
+                "number",
+                value => { identifyIndicator.brightness = value; },
+                { number: true, min: 1, max: 255, step: 1, required: true }
+            ));
+        }
+        if (identifyIndicator) {
+            identifyFields.appendChild(field(
+                localized("Считать встроенным индикатором", "Mark as built-in indicator"),
+                identifyIndicator.built_in ?? identifyIndicator.driver === "neopixel",
+                "select",
+                value => { identifyIndicator.built_in = value; },
+                { boolean: true, options: [
+                    { value: true, label: localized("Да", "Yes") },
+                    { value: false, label: localized("Нет", "No") }
+                ] }
+            ));
+        }
+        const identifyHelp = document.createElement("p");
+        identifyHelp.className = "device-config-firmware-help";
+        identifyHelp.textContent = localized(
+            "Пин выбирается вручную: прошивка не может определить, где физически подключён индикатор. GPIO 38/48 зарезервированы для адресного индикатора ESP32-S3 и зависят от ревизии платы.",
+            "Choose the pin manually; firmware cannot detect the indicator wiring. GPIO 38/48 are reserved for the ESP32-S3 addressable LED and depend on board revision."
+        );
+        identifySection.append(identifyFields, identifyHelp);
+        componentList.appendChild(identifySection);
+    }
+
+    function configurationFromDraft() {
+        const configuration = {
+            format_version: 1,
+            components: components.map(component => {
+                const base = {
+                    id: component.id,
+                    driver: component.driver,
+                    label: component.label,
+                    parameter_id: component.parameter_id,
+                    parameter_label: component.parameter_label,
+                    pin: component.pin
+                };
+                if (component.driver === "gpio_output") {
+                    base.active_high = component.active_high;
+                    base.initial_value = component.initial_value;
+                } else if (component.driver === "digital_input") {
+                    base.pull = component.pull;
+                    base.interval_ms = component.interval_ms;
+                } else if (component.driver === "analog_input") {
+                    base.interval_ms = component.interval_ms;
+                    base.unit = component.unit;
+                    base.raw_min = component.raw_min ?? 0;
+                    base.raw_max = component.raw_max ?? 4095;
+                    base.value_min = component.value_min ?? 0;
+                    base.value_max = component.value_max ?? 4095;
+                } else if (component.driver === "pwm_output") {
+                    base.initial_value = component.initial_value;
+                    base.min_value = component.min_value ?? 0;
+                    base.max_value = component.max_value ?? 255;
+                }
+                return base;
+            })
+        };
+        if (identifyIndicator) {
+            configuration.identify_indicator = { ...identifyIndicator };
+        }
+        return configuration;
+    }
+
+    function uiPreferencesFromDraft() {
+        const preferences = {};
+        for (const component of components) {
+            if (!["gpio_output", "pwm_output"].includes(component.driver)) continue;
+            preferences[component.parameter_id] = component.ui_control || "schema";
+        }
+        return preferences;
+    }
+
+    firmwareButton.addEventListener("click", () => {
+        const savedConfiguration = device.hardware_configuration;
+        const version = Number(device.configuration_version);
+        if (
+            !savedConfiguration ||
+            !Number.isInteger(version) || version < 1 ||
+            stableJson(configurationFromDraft()) !== stableJson(savedConfiguration)
+        ) {
+            feedback.textContent = localized(
+                "Сначала сохраните эту конфигурацию в Gateway. После этого скачайте файл для прошивки.",
+                "Save this configuration on Gateway first, then download the firmware file."
+            );
+            return;
+        }
+        downloadEmbeddedDeviceConfiguration(savedConfiguration, version);
+        feedback.textContent = localized(
+            "Скопируйте файл в esp32/universal/include/device_configuration.generated.h и соберите прошивку. Gateway продолжит хранить основную копию конфигурации.",
+            "Copy the file to esp32/universal/include/device_configuration.generated.h and build the firmware. Gateway remains the primary configuration store."
+        );
+    });
+
+    add.addEventListener("click", () => {
+        if (components.length >= 8 || !drivers.length) return;
+        components.push(defaultComponent(components.length, drivers[0]));
+        renderComponents();
+    });
+    save.addEventListener("click", () => {
+        if (!form.reportValidity()) return;
+        const draft = configurationFromDraft();
+        const oversizedLabel = draft.components.find(component =>
+            new TextEncoder().encode(component.label.trim()).length > 80 ||
+            new TextEncoder().encode(component.parameter_label.trim()).length > 80
+        );
+        if (oversizedLabel) {
+            feedback.textContent = localized(
+                "Каждое название должно занимать не более 80 байт UTF-8.",
+                "Each label must use no more than 80 UTF-8 bytes."
+            );
+            return;
+        }
+        const oversizedUnit = draft.components.find(component =>
+            typeof component.unit === "string" &&
+            new TextEncoder().encode(component.unit.trim()).length > 24
+        );
+        if (oversizedUnit) {
+            feedback.textContent = localized(
+                "Единица измерения должна занимать не более 24 байт UTF-8.",
+                "The unit label must use no more than 24 UTF-8 bytes."
+            );
+            return;
+        }
+        if (!device.connected) {
+            feedback.textContent = localized(
+                "Устройство отключено: Gateway сохранит конфигурацию и отправит её при следующем подключении.",
+                "The device is offline. Gateway will save the configuration and send it when the device reconnects."
+            );
+        }
+        save.disabled = true;
+        if (!sendGatewayAction("save_device_configuration", {
+            device: device.device,
+            configuration: draft,
+            ui_preferences: uiPreferencesFromDraft()
+        })) save.disabled = false;
+    });
+    exportButton.addEventListener("click", () => {
+        const envelope = {
+            export_format: "smartest-home-device",
+            export_version: 1,
+            exported_at: new Date().toISOString(),
+            device_id: device.device,
+            device_profile: device.device_profile,
+            board_profile: device.board_profile,
+            schema_version: device.schema_version ?? null,
+            schema: device.schema,
+            hardware_configuration: configurationFromDraft(),
+            ui_preferences: uiPreferencesFromDraft(),
+            configuration_version: device.configuration_version ?? null,
+            configuration_status: device.configuration_status ?? null
+        };
+        const blob = new Blob([JSON.stringify(envelope, null, 2)], {
+            type: "application/json;charset=utf-8"
+        });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${device.device}-configuration.json`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    });
+    savedExportButton.addEventListener("click", () => {
+        const link = document.createElement("a");
+        link.href = deviceConfigurationExportUrl(device.device);
+        link.download = `${device.device}.json`;
+        link.hidden = true;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+    });
+    importInput.addEventListener("change", async () => {
+        const file = importInput.files?.[0];
+        if (!file) return;
+        try {
+            const imported = JSON.parse(await file.text());
+            const configuration = imported?.hardware_configuration || imported?.configuration || imported;
+            if (configuration?.format_version !== 1 || !Array.isArray(configuration.components)) {
+                throw new Error(localized("Файл не содержит конфигурацию версии 1.", "File does not contain a version 1 configuration."));
+            }
+            if (configuration.components.length > 8 || configuration.components.some(component =>
+                !component || typeof component !== "object" ||
+                !drivers.some(driver => driver.id === component.driver)
+            )) {
+                throw new Error(localized(
+                    "Файл содержит неизвестный драйвер или больше восьми компонентов.",
+                    "The file contains an unknown driver or more than eight components."
+                ));
+            }
+            components.splice(0, components.length, ...JSON.parse(JSON.stringify(configuration.components)));
+            identifyIndicator = configuration.identify_indicator
+                ? JSON.parse(JSON.stringify(configuration.identify_indicator))
+                : null;
+            const importedPreferences = imported?.ui_preferences || {};
+            for (const component of components) {
+                component.ui_control = importedPreferences[component.parameter_id] || "schema";
+            }
+            renderComponents();
+            feedback.textContent = localized("Конфигурация загружена. Нажмите «Сохранить и применить».", "Configuration loaded. Select Save and apply to continue.");
+        } catch (error) {
+            feedback.textContent = error.message || localized("Не удалось прочитать JSON.", "Could not read the JSON file.");
+        } finally {
+            importInput.value = "";
+        }
+    });
+
+    renderComponents();
+    const currentStatus = device.configuration_status || "not_configured";
+    const statusText = {
+        not_configured: localized("Не настроено: GPIO остаются неактивны.", "Not configured: GPIO pins remain inactive."),
+        pending: localized("Сохранено в Gateway, ожидает устройства.", "Saved on Gateway; waiting for the device."),
+        applying: localized("Gateway ожидает подтверждение ESP32.", "Waiting for ESP32 confirmation."),
+        failed: device.configuration_error || localized("Последнее применение завершилось ошибкой.", "The last apply attempt failed."),
+        applied: localized(`Применена версия ${device.configuration_version || 0}.`, `Version ${device.configuration_version || 0} is applied.`)
+    };
+    status.textContent = statusText[currentStatus] || statusText.not_configured;
+    dialog.dataset.deviceId = device.device;
+    form.append(heading, intro, status, toolbar, firmwareHelp, schemaLocation, componentList, feedback, buttons);
+    dialog.appendChild(form);
+    dialog.addEventListener("close", () => {
+        dialog.remove();
+        if (deviceConfigurationDialog === dialog) deviceConfigurationDialog = null;
+    }, { once: true });
+    document.body.appendChild(dialog);
+    deviceConfigurationDialog = dialog;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else {
+        dialog.remove();
+        deviceConfigurationDialog = null;
+        setActivity(localized("Этот браузер не поддерживает окно конфигуратора.", "This browser does not support the configuration dialog."));
+    }
 }
 
 function openDeviceIdentityDialog(device) {

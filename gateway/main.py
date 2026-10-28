@@ -16,6 +16,12 @@ from websockets.datastructures import Headers
 from websockets.http11 import Response
 from websockets.exceptions import ConnectionClosed
 
+from device_configuration import (
+    DRIVERS,
+    public_driver_catalog,
+    validate_device_configuration
+)
+
 for stream in (sys.stdin, sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
@@ -41,8 +47,10 @@ if not DB_PATH_VALUE.strip():
     raise RuntimeError("GATEWAY_DB_PATH must not be empty.")
 DB_PATH = Path(DB_PATH_VALUE).expanduser()
 DATABASE_BACKUP_DIR = DB_PATH.parent / "backups"
+DEVICE_CONFIGURATION_EXPORT_DIR = BASE_DIR / "schemas"
 DATABASE_BACKUP_LIMIT = 20
 DATABASE_BACKUP_DOWNLOAD_LIMIT = 512 * 1024 * 1024
+DEVICE_CONFIGURATION_EXPORT_DOWNLOAD_LIMIT = 1024 * 1024
 DATABASE_BACKUP_ID_PATTERN = re.compile(
     r"gateway-\d{8}-\d{6}-[a-f0-9]{32}\.sqlite3"
 )
@@ -159,6 +167,33 @@ def init_db():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_device_schema_history_device
             ON device_schema_history (device_id, id DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_configurations (
+                device_id TEXT PRIMARY KEY,
+                config_version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_configuration_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                config_version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_device_configuration_history_device
+            ON device_configuration_history (device_id, id DESC)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS command_queue (
@@ -278,7 +313,10 @@ def init_db():
             "schema_json": "TEXT",
             "state_json": "TEXT",
             "last_telemetry_at": "TEXT",
-            "trust_policy": "TEXT DEFAULT 'allow'"
+            "trust_policy": "TEXT DEFAULT 'allow'",
+            "device_profile": "TEXT",
+            "board_profile": "TEXT",
+            "driver_catalog_json": "TEXT"
         }
 
         for column, column_type in metadata_columns.items():
@@ -342,6 +380,21 @@ def init_db():
             UPDATE command_queue SET status = 'queued', updated_at = ?
             WHERE status = 'sent'
         """, (current_time(),))
+        # A configuration may have reached the device immediately before a
+        # Gateway restart. Reapply the saved desired configuration on reconnect.
+        conn.execute("""
+            UPDATE device_configurations
+            SET status = 'pending', updated_at = ?
+            WHERE status = 'applying'
+        """, (current_time(),))
+        conn.execute("""
+            UPDATE device_configuration_history
+            SET status = 'pending'
+            WHERE (device_id, config_version) IN (
+                SELECT device_id, config_version FROM device_configurations
+                WHERE status = 'pending'
+            )
+        """)
 
         runtime_checkpoint_at = datetime.now(timezone.utc).isoformat()
         conn.execute("""
@@ -413,6 +466,12 @@ def get_database_stats():
         schema_snapshot_count = conn.execute(
             "SELECT COUNT(*) FROM device_schema_history"
         ).fetchone()[0]
+        device_configuration_count = conn.execute(
+            "SELECT COUNT(*) FROM device_configurations"
+        ).fetchone()[0]
+        device_configuration_history_count = conn.execute(
+            "SELECT COUNT(*) FROM device_configuration_history"
+        ).fetchone()[0]
         command_record_count = conn.execute(
             "SELECT COUNT(*) FROM command_queue"
         ).fetchone()[0]
@@ -462,6 +521,7 @@ def get_database_stats():
         "database_size_bytes": database_size_bytes,
         "record_count": (
             device_count + event_count + schema_snapshot_count + command_record_count
+            + device_configuration_count + device_configuration_history_count
             + parameter_ui_preference_count + automation_count
             + automation_run_count + automation_run_step_count
         ),
@@ -472,6 +532,8 @@ def get_database_stats():
         "connected_device_count": len(devices),
         "event_count": event_count,
         "schema_snapshot_count": schema_snapshot_count,
+        "device_configuration_count": device_configuration_count,
+        "device_configuration_history_count": device_configuration_history_count,
         "command_record_count": command_record_count,
         "session_uptime_seconds": session_uptime_seconds,
         "total_uptime_seconds": total_uptime_seconds,
@@ -573,16 +635,33 @@ def restore_database_file(path):
 
 
 def handle_http_request(connection, request):
-    match = re.fullmatch(
+    backup_match = re.fullmatch(
         r"/gateway-backups/(gateway-\d{8}-\d{6}-[a-f0-9]{32}\.sqlite3)",
         request.path
     )
-    if match is None:
+    schema_match = re.fullmatch(
+        r"/gateway-schemas/([A-Za-z][A-Za-z0-9_.-]{0,63})\.json",
+        request.path
+    )
+    if backup_match is None and schema_match is None:
         return None
     if request.method != "GET":
         status_code, reason, body = 405, "Method Not Allowed", b"Method not allowed"
+    elif schema_match is not None:
+        device_id = schema_match.group(1)
+        schema_path = DEVICE_CONFIGURATION_EXPORT_DIR / f"{device_id}.json"
+        try:
+            if not schema_path.is_file():
+                status_code, reason, body = 404, "Not Found", b"Schema export not found"
+            elif schema_path.stat().st_size > DEVICE_CONFIGURATION_EXPORT_DOWNLOAD_LIMIT:
+                status_code, reason, body = 413, "Content Too Large", b"Schema export is too large"
+            else:
+                body = schema_path.read_bytes()
+                status_code, reason = 200, "OK"
+        except OSError:
+            status_code, reason, body = 404, "Not Found", b"Schema export not found"
     else:
-        backup_path = DATABASE_BACKUP_DIR / match.group(1)
+        backup_path = DATABASE_BACKUP_DIR / backup_match.group(1)
         try:
             if not backup_path.is_file():
                 status_code, reason, body = 404, "Not Found", b"Backup not found"
@@ -595,12 +674,19 @@ def handle_http_request(connection, request):
             status_code, reason, body = 404, "Not Found", b"Backup not found"
 
     headers = Headers()
-    headers["Content-Type"] = "application/octet-stream"
+    headers["Content-Type"] = (
+        "application/json; charset=utf-8"
+        if schema_match is not None else "application/octet-stream"
+    )
     headers["Content-Length"] = str(len(body))
     headers["Cache-Control"] = "no-store"
     headers["X-Content-Type-Options"] = "nosniff"
     if status_code == 200:
-        headers["Content-Disposition"] = f'attachment; filename="{backup_path.name}"'
+        filename = (
+            f"{schema_match.group(1)}.json"
+            if schema_match is not None else backup_path.name
+        )
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     headers["Connection"] = "close"
     return Response(status_code, reason, headers, body)
 
@@ -783,10 +869,45 @@ def validate_schema(schema):
     if not isinstance(schema, dict):
         return False
 
+    format_version = schema.get("format_version")
+    if format_version is not None and (
+        type(format_version) is not int or format_version != 1
+    ):
+        return False
+
     actions = schema.get("actions", {})
     parameters = schema.get("parameters", {})
-    if not isinstance(actions, dict) or not isinstance(parameters, dict):
+    components = schema.get("components", {})
+    if (
+        not isinstance(actions, dict)
+        or not isinstance(parameters, dict)
+        or not isinstance(components, dict)
+        or len(components) > 64
+    ):
         return False
+
+    supported_component_categories = {
+        "sensor", "actuator", "input", "output", "other"
+    }
+    for component_id, component in components.items():
+        if (
+            not isinstance(component_id, str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", component_id)
+            or not isinstance(component, dict)
+            or not set(component).issubset({"label", "category", "description"})
+            or not isinstance(component.get("label"), str)
+            or not 1 <= len(component["label"]) <= 80
+            or not isinstance(component.get("category"), str)
+            or component.get("category") not in supported_component_categories
+            or (
+                "description" in component
+                and (
+                    not isinstance(component["description"], str)
+                    or len(component["description"]) > 240
+                )
+            )
+        ):
+            return False
 
     capabilities = schema.get("capabilities", {})
     if (
@@ -838,8 +959,8 @@ def validate_schema(schema):
 
     supported_types = {"boolean", "integer", "number", "string", "enum", "json"}
     allowed_parameter_fields = {
-        "label", "type", "access", "unit", "precision", "min", "max",
-        "step", "options", "control"
+        "label", "description", "component", "type", "access", "unit",
+        "precision", "min", "max", "step", "options", "control"
     }
     for key, definition in parameters.items():
         parameter_type = definition.get("type") if isinstance(definition, dict) else None
@@ -891,6 +1012,18 @@ def validate_schema(schema):
 
         label = definition.get("label", key)
         if not isinstance(label, str) or not 1 <= len(label) <= 80:
+            return False
+
+        if "description" in definition and (
+            not isinstance(definition["description"], str)
+            or len(definition["description"]) > 240
+        ):
+            return False
+
+        if "component" in definition and (
+            not isinstance(definition["component"], str)
+            or definition["component"] not in components
+        ):
             return False
 
         if "unit" in definition and (
@@ -1157,6 +1290,56 @@ def is_parameter_ui_preference_supported(control, definition):
     return False
 
 
+def validate_parameter_ui_preferences(preferences, schema):
+    if preferences is None:
+        return {}, None
+    if not isinstance(preferences, dict) or len(preferences) > 8:
+        return None, "Можно задать отображение не более чем для восьми параметров."
+    parameters = schema.get("parameters", {}) if isinstance(schema, dict) else {}
+    normalized = {}
+    for parameter_id, control in preferences.items():
+        definition = parameters.get(parameter_id)
+        if (
+            not isinstance(parameter_id, str)
+            or not isinstance(control, str)
+            or not isinstance(definition, dict)
+            or definition.get("access") != "read_write"
+        ):
+            return None, "Настройка отображения ссылается на неизвестный или недоступный параметр."
+        if control != "schema" and not is_parameter_ui_preference_supported(control, definition):
+            return None, f"Вид элемента {control!r} несовместим с параметром {parameter_id!r}."
+        normalized[parameter_id] = control
+    return normalized, None
+
+
+def apply_parameter_ui_preferences(conn, device_id, preferences):
+    timestamp = current_time()
+    for parameter_id, control in preferences.items():
+        if control == "schema":
+            conn.execute(
+                "DELETE FROM parameter_ui_preferences WHERE device_id = ? AND parameter_id = ?",
+                (device_id, parameter_id)
+            )
+        else:
+            conn.execute("""
+                INSERT INTO parameter_ui_preferences (
+                    device_id, parameter_id, control, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(device_id, parameter_id) DO UPDATE SET
+                    control = excluded.control,
+                    updated_at = excluded.updated_at
+            """, (device_id, parameter_id, control, timestamp))
+
+
+def get_device_parameter_ui_preferences(device_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT parameter_id, control FROM parameter_ui_preferences WHERE device_id = ?",
+            (device_id,)
+        ).fetchall()
+    return {parameter_id: control for parameter_id, control in rows}
+
+
 def prune_parameter_ui_preferences(conn, device_id, schema):
     parameters = schema.get("parameters", {}) if isinstance(schema, dict) else {}
     if not isinstance(parameters, dict):
@@ -1247,7 +1430,7 @@ def save_device_metadata(device_id, metadata):
 
     with sqlite3.connect(DB_PATH) as conn:
         previous = conn.execute(
-            "SELECT schema_json, schema_version, firmware_version, display_name, firmware_id FROM devices WHERE device_id = ?",
+            "SELECT schema_json, schema_version, firmware_version, display_name, firmware_id, device_profile, board_profile, driver_catalog_json FROM devices WHERE device_id = ?",
             (device_id,)
         ).fetchone()
         if previous is not None:
@@ -1255,14 +1438,25 @@ def save_device_metadata(device_id, metadata):
                 metadata["display_name"] = previous[3]
             if metadata.get("firmware_id") is None:
                 metadata["firmware_id"] = previous[4]
+            metadata.setdefault("device_profile", previous[5])
+            metadata.setdefault("board_profile", previous[6])
+            if "driver_ids" not in metadata:
+                try:
+                    metadata["driver_ids"] = json.loads(previous[7] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    metadata["driver_ids"] = []
+        driver_ids = metadata.get("driver_ids", [])
+        if not isinstance(driver_ids, list):
+            driver_ids = []
+        driver_catalog_json = json.dumps(driver_ids, ensure_ascii=True)
         conn.execute("""
             INSERT INTO devices (
                 device_id, last_seen, connected, name, display_name, firmware_id,
                 protocol_version, firmware_version, command_dedup,
                 schema_version, schema_json,
-                trust_policy
+                trust_policy, device_profile, board_profile, driver_catalog_json
             )
-            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(device_id) DO UPDATE SET
                 last_seen = excluded.last_seen,
                 connected = 1,
@@ -1274,7 +1468,10 @@ def save_device_metadata(device_id, metadata):
                 command_dedup = excluded.command_dedup,
                 schema_version = excluded.schema_version,
                 schema_json = excluded.schema_json,
-                trust_policy = excluded.trust_policy
+                trust_policy = excluded.trust_policy,
+                device_profile = COALESCE(excluded.device_profile, devices.device_profile),
+                board_profile = COALESCE(excluded.board_profile, devices.board_profile),
+                driver_catalog_json = COALESCE(excluded.driver_catalog_json, devices.driver_catalog_json)
         """, (
             device_id,
             timestamp,
@@ -1286,7 +1483,10 @@ def save_device_metadata(device_id, metadata):
             int(metadata.get("command_dedup") is True),
             metadata.get("schema_version"),
             schema_json,
-            metadata.get("trust_policy")
+            metadata.get("trust_policy"),
+            metadata.get("device_profile"),
+            metadata.get("board_profile"),
+            driver_catalog_json
         ))
 
         previous_schema = None
@@ -1309,6 +1509,7 @@ def save_device_metadata(device_id, metadata):
         conn.commit()
 
     device_metadata[device_id] = metadata
+    write_device_configuration_export(device_id)
 
 
 def load_device_metadata(device_id):
@@ -1321,7 +1522,8 @@ def load_device_metadata(device_id):
         row = conn.execute(
             """
             SELECT name, display_name, firmware_id, protocol_version, firmware_version,
-                   command_dedup, schema_version, schema_json, trust_policy
+                   command_dedup, schema_version, schema_json, trust_policy,
+                   device_profile, board_profile, driver_catalog_json
             FROM devices WHERE device_id = ?
             """,
             (device_id,)
@@ -1337,6 +1539,13 @@ def load_device_metadata(device_id):
     if not validate_schema(schema):
         schema = default_legacy_schema()
 
+    try:
+        driver_ids = json.loads(row["driver_catalog_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        driver_ids = []
+    if not isinstance(driver_ids, list):
+        driver_ids = []
+
     return {
         "name": row["name"],
         "display_name": row["display_name"],
@@ -1346,8 +1555,420 @@ def load_device_metadata(device_id):
         "command_dedup": bool(row["command_dedup"]),
         "schema_version": row["schema_version"],
         "schema": schema,
-        "trust_policy": row["trust_policy"]
+        "trust_policy": row["trust_policy"],
+        "device_profile": row["device_profile"],
+        "board_profile": row["board_profile"],
+        "driver_ids": driver_ids
     }
+
+
+def load_device_configuration(device_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT config_version, config_json, config_hash, status,
+                   last_error, updated_at, applied_at
+            FROM device_configurations WHERE device_id = ?
+            """,
+            (device_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        configuration = json.loads(row["config_json"])
+    except (TypeError, json.JSONDecodeError):
+        configuration = None
+    if not isinstance(configuration, dict):
+        return None
+    return {
+        "config_version": row["config_version"],
+        "config": configuration,
+        "config_hash": row["config_hash"],
+        "status": row["status"],
+        "last_error": row["last_error"],
+        "updated_at": row["updated_at"],
+        "applied_at": row["applied_at"]
+    }
+
+
+def save_device_configuration(device_id, configuration, ui_preferences=None):
+    canonical = json.dumps(
+        configuration, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False
+    )
+    config_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    timestamp = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT config_version, config_hash FROM device_configurations WHERE device_id = ?",
+            (device_id,)
+        ).fetchone()
+        if row is not None and row[1] == config_hash:
+            apply_parameter_ui_preferences(conn, device_id, ui_preferences or {})
+            conn.commit()
+            return {
+                "config_version": row[0], "config_hash": config_hash,
+                "unchanged": True
+            }
+        version = (row[0] if row else 0) + 1
+        status = "applying" if device_id in devices else "pending"
+        conn.execute("""
+            INSERT INTO device_configurations (
+                device_id, config_version, config_json, config_hash,
+                status, last_error, updated_at, applied_at
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)
+            ON CONFLICT(device_id) DO UPDATE SET
+                config_version = excluded.config_version,
+                config_json = excluded.config_json,
+                config_hash = excluded.config_hash,
+                status = excluded.status,
+                last_error = NULL,
+                updated_at = excluded.updated_at,
+                applied_at = NULL
+        """, (device_id, version, canonical, config_hash, status, timestamp))
+        conn.execute("""
+            INSERT INTO device_configuration_history (
+                device_id, config_version, config_json, config_hash,
+                created_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (device_id, version, canonical, config_hash, timestamp, status))
+        conn.execute("""
+            DELETE FROM device_configuration_history
+            WHERE device_id = ? AND id NOT IN (
+                SELECT id FROM device_configuration_history
+                WHERE device_id = ? ORDER BY id DESC LIMIT 50
+            )
+        """, (device_id, device_id))
+        apply_parameter_ui_preferences(conn, device_id, ui_preferences or {})
+        conn.commit()
+    return {"config_version": version, "config_hash": config_hash, "unchanged": False}
+
+
+def update_device_configuration_status(
+    device_id, status, error=None, applied_at=None
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            UPDATE device_configurations
+            SET status = ?, last_error = ?,
+                applied_at = COALESCE(?, applied_at), updated_at = ?
+            WHERE device_id = ?
+        """, (status, error, applied_at, current_time(), device_id))
+        conn.execute("""
+            UPDATE device_configuration_history
+            SET status = ?
+            WHERE device_id = ? AND config_version = (
+                SELECT config_version FROM device_configurations WHERE device_id = ?
+            )
+        """, (status, device_id, device_id))
+        conn.commit()
+
+
+def device_configuration_export_document(device_id):
+    metadata = device_metadata.get(device_id) or load_device_metadata(device_id)
+    configuration = load_device_configuration(device_id)
+    if metadata is None and configuration is None:
+        return None
+    document = {
+        "export_format": "smartest-home-device",
+        "export_version": 1,
+        "exported_at": current_time(),
+        "device_id": device_id,
+        "schema_version": metadata.get("schema_version") if metadata else None,
+        "firmware_version": metadata.get("firmware_version") if metadata else None,
+        "schema": metadata.get("schema") if metadata else None,
+        "device_profile": metadata.get("device_profile") if metadata else None,
+        "board_profile": metadata.get("board_profile") if metadata else None,
+        "hardware_configuration": configuration["config"] if configuration else None,
+        "ui_preferences": get_device_parameter_ui_preferences(device_id),
+        "configuration_version": configuration["config_version"] if configuration else None,
+        "configuration_hash": configuration["config_hash"] if configuration else None,
+        "configuration_status": configuration["status"] if configuration else None
+    }
+    return document
+
+
+def write_device_configuration_export(device_id):
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", device_id or ""):
+        return False
+    document = device_configuration_export_document(device_id)
+    if document is None:
+        return False
+    export_dir = DEVICE_CONFIGURATION_EXPORT_DIR
+    export_dir.mkdir(parents=True, exist_ok=True)
+    destination = export_dir / f"{device_id}.json"
+    temporary = export_dir / f".{device_id}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8"
+        )
+        os.replace(temporary, destination)
+        return True
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"[CONFIG] Could not update export for {device_id}: {error}")
+        return False
+
+
+def sync_device_configuration_exports():
+    """Rebuild portable JSON views from SQLite, the source of truth."""
+    with sqlite3.connect(DB_PATH) as conn:
+        device_ids = [row[0] for row in conn.execute(
+            "SELECT device_id FROM devices ORDER BY device_id"
+        ).fetchall()]
+    failed = [
+        device_id for device_id in device_ids
+        if not write_device_configuration_export(device_id)
+    ]
+    if failed:
+        print(f"[CONFIG] Could not refresh {len(failed)} device JSON export(s).")
+    return len(device_ids) - len(failed)
+
+
+async def send_device_configuration(device_id, websocket=None):
+    metadata = device_metadata.get(device_id) or load_device_metadata(device_id)
+    if metadata is None or metadata.get("device_profile") != "universal":
+        return False
+    target = websocket or devices.get(device_id)
+    if target is None:
+        return False
+    record = load_device_configuration(device_id)
+    if record is None:
+        await send_json(target, {"type": "device_config_request"})
+        return False
+    update_device_configuration_status(device_id, "applying")
+    await send_device_list()
+    try:
+        await send_json(target, {
+            "type": "device_config_apply",
+            "device": firmware_identity_for(device_id),
+            "config_version": record["config_version"],
+            "config_hash": record["config_hash"],
+            "configuration": record["config"]
+        })
+    except ConnectionClosed:
+        update_device_configuration_status(device_id, "pending")
+        await send_device_list()
+        return False
+    return True
+
+
+async def handle_device_configuration_result(device_id, wire_device_id, message):
+    if message.get("device") != wire_device_id:
+        return
+    version = message.get("config_version")
+    config_hash = message.get("config_hash")
+    success = message.get("success")
+    error = message.get("error")
+    metadata = device_metadata.get(device_id) or load_device_metadata(device_id)
+    record = load_device_configuration(device_id)
+
+    if (
+        metadata is None
+        or metadata.get("device_profile") != "universal"
+        or type(version) is not int
+        or type(success) is not bool
+        or not isinstance(config_hash, str)
+        or not isinstance(error, (str, type(None)))
+        or (isinstance(error, str) and len(error) > 240)
+    ):
+        return
+
+    if version == 0 and record is None:
+        _, expected_schema, validation_error = validate_device_configuration(
+            {"format_version": 1, "components": []}, metadata.get("driver_ids", [])
+        )
+        schema = message.get("schema")
+        if (
+            not success
+            or config_hash != ""
+            or validation_error
+            or type(message.get("schema_version")) is not int
+            or message.get("schema_version") != 1
+            or not validate_schema(schema)
+            or not schemas_match(expected_schema, schema)
+        ):
+            print(f"[CONFIG] {device_id}: invalid empty configuration report.")
+            return
+        metadata = dict(metadata)
+        metadata.update({"schema": expected_schema, "schema_version": 1})
+        save_device_metadata(device_id, metadata)
+        update_device_configuration_status(device_id, "not_configured")
+        write_device_configuration_export(device_id)
+        await send_device_list()
+        return
+
+    if (
+        record is None
+        or version != record["config_version"]
+        or config_hash != record["config_hash"]
+    ):
+        return
+
+    normalized, expected_schema, validation_error = validate_device_configuration(
+        record["config"], metadata.get("driver_ids", [])
+    )
+    reported_schema = message.get("schema")
+    if success and (
+        validation_error
+        or not validate_schema(reported_schema)
+        or not schemas_match(expected_schema, reported_schema)
+        or type(message.get("schema_version")) is not int
+        or message.get("schema_version") != version
+    ):
+        success = False
+        error = validation_error or "Schema устройства не соответствует принятой конфигурации."
+
+    if success:
+        metadata = dict(metadata)
+        metadata.update({
+            "schema": expected_schema,
+            "schema_version": version,
+            "device_profile": "universal"
+        })
+        save_device_metadata(device_id, metadata)
+        update_device_configuration_status(
+            device_id, "applied", applied_at=current_time()
+        )
+        event = f"Аппаратная конфигурация версии {version} применена устройством."
+        print(f"[CONFIG] {device_id}: applied configuration v{version}.")
+    else:
+        error = error or "Устройство отклонило аппаратную конфигурацию."
+        update_device_configuration_status(device_id, "failed", error=error)
+        event = f"Ошибка применения аппаратной конфигурации версии {version}: {error}"
+        print(f"[CONFIG] {device_id}: configuration v{version} rejected: {error}")
+
+    write_device_configuration_export(device_id)
+    save_device_event(device_id, "configuration", event)
+    await send_device_list()
+    await send_event_history()
+    await send_database_stats()
+    await broadcast({
+        "type": "device_configuration_apply_result",
+        "success": success,
+        "device": device_id,
+        "config_version": version,
+        "status": "applied" if success else "failed",
+        "message": "Конфигурация применена." if success else error
+    })
+
+
+async def handle_device_configuration_report(device_id, wire_device_id, message):
+    """Reconcile a configuration already stored in ESP32 NVS after DB loss."""
+    metadata = device_metadata.get(device_id) or load_device_metadata(device_id)
+    if (
+        metadata is None
+        or metadata.get("device_profile") != "universal"
+        or message.get("device") != wire_device_id
+        or type(message.get("config_version")) is not int
+        or type(message.get("schema_version")) is not int
+        or not isinstance(message.get("config_hash"), str)
+    ):
+        return
+
+    version = message["config_version"]
+    if version == 0:
+        await handle_device_configuration_result(device_id, wire_device_id, {
+            "device": wire_device_id,
+            "config_version": 0,
+            "config_hash": message["config_hash"],
+            "success": True,
+            "schema_version": message["schema_version"],
+            "schema": message.get("schema")
+        })
+        return
+    if version < 1:
+        return
+
+    # A saved Gateway configuration is authoritative. The report is only used
+    # to recover an empty Gateway configuration table.
+    if load_device_configuration(device_id) is not None:
+        await send_device_configuration(device_id)
+        return
+
+    normalized, expected_schema, validation_error = validate_device_configuration(
+        message.get("configuration"), metadata.get("driver_ids", [])
+    )
+    reported_schema = message.get("schema")
+    config_hash = message["config_hash"]
+    if validation_error:
+        error = validation_error
+    else:
+        canonical = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False
+        )
+        expected_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        error = None
+        if config_hash != expected_hash:
+            error = "Хэш аппаратной конфигурации не совпадает с её содержимым."
+        elif (
+            message["schema_version"] != version
+            or not validate_schema(reported_schema)
+            or not schemas_match(expected_schema, reported_schema)
+        ):
+            error = "Schema устройства не соответствует сохранённой конфигурации."
+    if error:
+        print(f"[CONFIG] {device_id}: stored configuration report rejected: {error}")
+        save_device_event(
+            device_id,
+            "configuration",
+            f"Gateway не восстановил конфигурацию из ESP32: {error}"
+        )
+        await send_event_history()
+        await broadcast({
+            "type": "device_configuration_apply_result",
+            "success": False,
+            "device": device_id,
+            "config_version": version,
+            "status": "failed",
+            "message": error
+        })
+        return
+
+    timestamp = current_time()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            INSERT INTO device_configurations (
+                device_id, config_version, config_json, config_hash,
+                status, last_error, updated_at, applied_at
+            ) VALUES (?, ?, ?, ?, 'applied', NULL, ?, ?)
+        """, (device_id, version, canonical, config_hash, timestamp, timestamp))
+        conn.execute("""
+            INSERT INTO device_configuration_history (
+                device_id, config_version, config_json, config_hash,
+                created_at, status
+            ) VALUES (?, ?, ?, ?, ?, 'applied')
+        """, (device_id, version, canonical, config_hash, timestamp))
+        conn.commit()
+
+    metadata = dict(metadata)
+    metadata.update({"schema": expected_schema, "schema_version": version})
+    save_device_metadata(device_id, metadata)
+    write_device_configuration_export(device_id)
+    save_device_event(
+        device_id,
+        "configuration",
+        f"Gateway восстановил аппаратную конфигурацию версии {version} из ESP32."
+    )
+    await send_device_list()
+    await send_event_history()
+    await send_database_stats()
+    await broadcast({
+        "type": "device_configuration_apply_result",
+        "success": True,
+        "device": device_id,
+        "config_version": version,
+        "status": "applied",
+        "message": f"Конфигурация версии {version} восстановлена из устройства."
+    })
 
 
 def resolve_device_identity(firmware_id):
@@ -1457,7 +2078,8 @@ def update_device_identity(device_id, new_device_id, display_name):
             )
             for table in (
                 "device_events", "device_schema_history", "command_queue",
-                "parameter_ui_preferences"
+                "parameter_ui_preferences", "device_configurations",
+                "device_configuration_history"
             ):
                 conn.execute(
                     f"UPDATE {table} SET device_id = ? WHERE device_id = ?",
@@ -1492,6 +2114,13 @@ def update_device_identity(device_id, new_device_id, display_name):
     if metadata is not None:
         metadata["display_name"] = display_name
         device_metadata[new_device_id] = metadata
+    old_export = BASE_DIR / "schemas" / f"{device_id}.json"
+    if changing_id:
+        try:
+            old_export.unlink(missing_ok=True)
+        except OSError:
+            pass
+    write_device_configuration_export(new_device_id)
     for state_map in (
         device_states, last_device_heartbeat, fresh_device_parameters,
         pending_device_schemas, deferred_device_schemas
@@ -2266,12 +2895,31 @@ def get_all_devices():
                 device_id, last_seen, last_telemetry_at, led, connected, name, display_name, state_json,
                 protocol_version, firmware_version, command_dedup,
                 schema_version, schema_json,
-                trust_policy
+                trust_policy, device_profile, board_profile, driver_catalog_json
             FROM devices
             WHERE trust_policy IS NULL
                OR trust_policy NOT IN ('deny', 'forgotten')
             ORDER BY device_id
         """).fetchall()
+        configuration_rows = conn.execute("""
+            SELECT device_id, config_version, config_json, config_hash,
+                   status, last_error, updated_at, applied_at
+            FROM device_configurations
+        """).fetchall()
+
+    configurations = {}
+    for configuration_row in configuration_rows:
+        try:
+            config_value = json.loads(configuration_row["config_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(config_value, dict):
+            configurations[configuration_row["device_id"]] = {
+                "version": configuration_row["config_version"],
+                "config": config_value,
+                "status": configuration_row["status"],
+                "error": configuration_row["last_error"]
+            }
 
     result = []
 
@@ -2323,8 +2971,14 @@ def get_all_devices():
                 "command_dedup": bool(row["command_dedup"]),
                 "schema_version": row["schema_version"],
                 "schema": stored_schema,
-                "trust_policy": row["trust_policy"]
+                "trust_policy": row["trust_policy"],
+                "device_profile": row["device_profile"],
+                "board_profile": row["board_profile"]
             }
+            try:
+                metadata["driver_ids"] = json.loads(row["driver_catalog_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                metadata["driver_ids"] = []
 
         result.append({
             "device": device_id,
@@ -2348,7 +3002,16 @@ def get_all_devices():
                 else "missing"
             ),
             "trust_policy": metadata.get("trust_policy"),
-            "pending_schema": public_schema_proposal(device_id)
+            "pending_schema": public_schema_proposal(device_id),
+            "device_profile": metadata.get("device_profile"),
+            "board_profile": metadata.get("board_profile"),
+            "driver_catalog": public_driver_catalog(metadata.get("driver_ids", [])),
+            "hardware_configuration": configurations.get(device_id, {}).get("config"),
+            "configuration_version": configurations.get(device_id, {}).get("version", 0),
+            "configuration_status": configurations.get(device_id, {}).get(
+                "status", "not_configured" if metadata.get("device_profile") == "universal" else None
+            ),
+            "configuration_error": configurations.get(device_id, {}).get("error")
         })
 
     known_ids = {item["device"] for item in result}
@@ -2380,7 +3043,16 @@ def get_all_devices():
                     else "missing"
                 ),
                 "trust_policy": metadata.get("trust_policy"),
-                "pending_schema": public_schema_proposal(device_id)
+                "pending_schema": public_schema_proposal(device_id),
+                "device_profile": metadata.get("device_profile"),
+                "board_profile": metadata.get("board_profile"),
+                "driver_catalog": public_driver_catalog(metadata.get("driver_ids", [])),
+                "hardware_configuration": configurations.get(device_id, {}).get("config"),
+                "configuration_version": configurations.get(device_id, {}).get("version", 0),
+                "configuration_status": configurations.get(device_id, {}).get(
+                    "status", "not_configured" if metadata.get("device_profile") == "universal" else None
+                ),
+                "configuration_error": configurations.get(device_id, {}).get("error")
             })
 
     return result
@@ -4018,6 +4690,7 @@ async def wait_for_stable_automation_trigger(
 
 def finalize_restored_database():
     init_db()
+    sync_device_configuration_exports()
     timestamp = current_time()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE devices SET connected = 0")
@@ -4717,6 +5390,85 @@ async def handle_browser_message(websocket, message):
         await send_device_list(websocket)
         return
 
+    if action == "save_device_configuration":
+        device_id = message.get("device")
+        configuration = message.get("configuration")
+        requested_ui_preferences = message.get("ui_preferences")
+        metadata = (
+            device_metadata.get(device_id) or load_device_metadata(device_id)
+            if isinstance(device_id, str)
+            else None
+        )
+        success = False
+        version = None
+        status = None
+        result_message = "Устройство не поддерживает универсальную конфигурацию."
+        if (
+            metadata is not None
+            and metadata.get("device_profile") == "universal"
+            and metadata.get("board_profile") == "esp32-s3-devkitc-1"
+        ):
+            normalized, generated_schema, validation_error = validate_device_configuration(
+                configuration, metadata.get("driver_ids", [])
+            )
+            normalized_ui_preferences = {}
+            if validation_error is None:
+                normalized_ui_preferences, validation_error = validate_parameter_ui_preferences(
+                    requested_ui_preferences, generated_schema
+                )
+            if validation_error:
+                result_message = validation_error
+            else:
+                try:
+                    saved = save_device_configuration(
+                        device_id, normalized, normalized_ui_preferences
+                    )
+                    version = saved["config_version"]
+                    status = "pending"
+                    if saved["unchanged"]:
+                        update_device_configuration_status(device_id, status)
+                    if device_id in devices:
+                        status = "applying" if await send_device_configuration(device_id) else "pending"
+                    export_written = write_device_configuration_export(device_id)
+                    success = True
+                    result_message = (
+                        "Конфигурация уже была сохранена; Gateway повторно отправляет её устройству."
+                        if saved["unchanged"] and status == "applying"
+                        else "Конфигурация сохранена и отправлена устройству."
+                        if status == "applying"
+                        else "Конфигурация сохранена; она будет отправлена при подключении устройства."
+                    )
+                    if not export_written:
+                        result_message += (
+                            " SQLite обновлена, но JSON-файл не удалось обновить; "
+                            "Gateway повторит экспорт при следующем запуске."
+                        )
+                    if not saved["unchanged"]:
+                        save_device_event(
+                            device_id,
+                            "configuration",
+                            f"Сохранена аппаратная конфигурация версии {version}; статус: {status}."
+                        )
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    result_message = f"Не удалось сохранить конфигурацию: {error}"
+        elif metadata is not None and metadata.get("device_profile") == "universal":
+            result_message = "Для этой версии конструктора поддерживается профиль ESP32-S3 DevKitC-1."
+
+        await send_json(websocket, {
+            "type": "device_configuration_save_result",
+            "success": success,
+            "device": device_id,
+            "config_version": version,
+            "status": status,
+            "message": result_message
+        })
+        if success:
+            await send_device_list()
+            await send_parameter_ui_preferences()
+            await send_event_history()
+            await send_database_stats()
+        return
+
     if action == "get_database_stats":
         await send_database_stats(websocket)
         return
@@ -5059,6 +5811,9 @@ async def handle_client(websocket):
                     "schema_version", None if is_legacy else 1
                 )
                 command_dedup = message.get("command_dedup", False)
+                device_profile = message.get("device_profile")
+                board_profile = message.get("board_profile")
+                driver_ids = message.get("driver_catalog", [])
                 if not is_legacy and schema_version is None:
                     schema_version = 1
 
@@ -5074,6 +5829,12 @@ async def handle_client(websocket):
                     value is not None
                     and (not isinstance(value, str) or len(value) > 100)
                     for value in (name, firmware_version)
+                ) or (
+                    device_profile is not None
+                    and (
+                        not isinstance(device_profile, str)
+                        or len(device_profile) > 40
+                    )
                 ):
                     await send_json(websocket, {
                         "type": "error",
@@ -5082,6 +5843,31 @@ async def handle_client(websocket):
                     await websocket.close(code=4002, reason="Invalid device metadata")
                     break
 
+                if device_profile == "universal":
+                    if (
+                        board_profile != "esp32-s3-devkitc-1"
+                        or not isinstance(driver_ids, list)
+                        or not 1 <= len(driver_ids) <= 16
+                        or any(
+                            not isinstance(driver_id, str)
+                            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", driver_id)
+                            for driver_id in driver_ids
+                        )
+                        or any(driver_id not in DRIVERS for driver_id in driver_ids)
+                        or len(set(driver_ids)) != len(driver_ids)
+                        or schema.get("capabilities", {}).get("universal_profile") is not True
+                    ):
+                        await send_json(websocket, {
+                            "type": "error",
+                            "message": "Универсальная прошивка сообщила некорректный профиль или каталог драйверов."
+                        })
+                        await websocket.close(code=4002, reason="Invalid device capabilities")
+                        break
+                else:
+                    device_profile = "custom" if device_profile is not None else None
+                    board_profile = None
+                    driver_ids = []
+
                 metadata = {
                     "name": name,
                     "firmware_id": wire_device_id,
@@ -5089,7 +5875,10 @@ async def handle_client(websocket):
                     "firmware_version": firmware_version,
                     "command_dedup": command_dedup,
                     "schema_version": schema_version,
-                    "schema": schema
+                    "schema": schema,
+                    "device_profile": device_profile,
+                    "board_profile": board_profile,
+                    "driver_ids": driver_ids
                 }
 
                 trust_policy = get_device_trust_policy(device_id)
@@ -5204,9 +5993,21 @@ async def handle_client(websocket):
                 device_wire_ids[device_id] = wire_device_id
                 last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
                 fresh_device_parameters[device_id] = set()
-                schema_status = offer_device_schema(
-                    device_id, metadata, is_legacy=is_legacy
-                )
+                previous_metadata = load_device_metadata(device_id)
+                if (
+                    metadata.get("device_profile") == "universal"
+                    and previous_metadata is not None
+                    and previous_metadata.get("device_profile") == "universal"
+                ):
+                    accepted = dict(metadata)
+                    accepted["schema"] = previous_metadata["schema"]
+                    accepted["schema_version"] = previous_metadata.get("schema_version")
+                    schema_status = "preserved"
+                    save_device_metadata(device_id, accepted)
+                else:
+                    schema_status = offer_device_schema(
+                        device_id, metadata, is_legacy=is_legacy
+                    )
                 save_device_seen(device_id, True)
                 if schema_status == "pending":
                     print(
@@ -5247,11 +6048,25 @@ async def handle_client(websocket):
                 await send_device_list()
                 await send_event_history()
                 if schema_status != "pending":
+                    if metadata.get("device_profile") == "universal":
+                        await send_device_configuration(device_id, websocket)
                     await deliver_queued_commands(device_id)
                     fire_automation_event("device_connected", device_id)
                 else:
                     deferred_connection_automations.add(device_id)
                 await send_command_queue_state()
+                continue
+
+            if client_type == "device" and message_type == "device_config_result":
+                await handle_device_configuration_result(
+                    device_id, wire_device_id, message
+                )
+                continue
+
+            if client_type == "device" and message_type == "device_config_report":
+                await handle_device_configuration_report(
+                    device_id, wire_device_id, message
+                )
                 continue
 
             if client_type == "device" and message_type == "schema_update":
@@ -5843,6 +6658,7 @@ async def device_presence_watchdog():
 async def main():
     init_db()
     load_pending_commands()
+    sync_device_configuration_exports()
 
     print("=" * 48)
     print("        IoT Gateway запускается")

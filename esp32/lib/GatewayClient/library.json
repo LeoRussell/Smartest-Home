@@ -1,0 +1,16 @@
+{
+  "name": "GatewayClient",
+  "version": "0.1.0",
+  "description": "Wi-Fi and WebSocket client for the Smartest-Home Gateway device protocol",
+  "keywords": ["iot", "websocket", "gateway", "esp32"],
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": [
+    {
+      "name": "links2004/WebSockets"
+    },
+    {
+      "name": "bblanchon/ArduinoJson"
+    }
+  ]
+}
