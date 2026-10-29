@@ -64,14 +64,23 @@ String actionIdFor(const char* modeId, const char* operationId) {
 }
 
 bool registrationIsValid(const DeviceModeRegistration& mode) {
-    return validModeId(mode.id) && mode.label != nullptr &&
-           strlen(mode.label) > 0 && strlen(mode.label) <= 80 &&
-           mode.description != nullptr && strlen(mode.description) <= 240;
+    if (!validModeId(mode.id) || mode.label == nullptr ||
+        strlen(mode.label) == 0 || strlen(mode.label) > 80 ||
+        mode.description == nullptr || strlen(mode.description) > 240) {
+        return false;
+    }
+    for (const OperationDefinition& operation : OPERATIONS) {
+        if ((mode.operations & operation.flag) != 0 &&
+            mode.*(operation.handler) != nullptr) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool modeIdWasRegisteredEarlier(size_t index) {
     for (size_t previous = 0; previous < index; ++previous) {
-        if (deviceModes[previous].id != nullptr &&
+        if (registrationIsValid(deviceModes[previous]) &&
             strcmp(deviceModes[previous].id, deviceModes[index].id) == 0) {
             return true;
         }
@@ -84,8 +93,10 @@ void appendRegisteredDeviceModes(JsonObject schema) {
     memset(publishedModeStatuses, 0, sizeof(publishedModeStatuses));
     if (registeredModeCount() == 0) return;
     JsonObject modes = schema["modes"].to<JsonObject>();
-    JsonObject actions = schema["actions"].to<JsonObject>();
-    JsonObject parameters = schema["parameters"].to<JsonObject>();
+    JsonObject actions = schema["actions"].is<JsonObject>()
+        ? schema["actions"].as<JsonObject>() : schema["actions"].to<JsonObject>();
+    JsonObject parameters = schema["parameters"].is<JsonObject>()
+        ? schema["parameters"].as<JsonObject>() : schema["parameters"].to<JsonObject>();
 
     for (size_t index = 0; index < registeredModeCount(); ++index) {
         const DeviceModeRegistration& registration = deviceModes[index];
@@ -181,7 +192,7 @@ bool runRegisteredDeviceModeAction(const char* requestedActionId, String& error)
 
     for (size_t index = 0; index < registeredModeCount(); ++index) {
         const DeviceModeRegistration& registration = deviceModes[index];
-        if (!registrationIsValid(registration)) continue;
+        if (!registrationIsValid(registration) || modeIdWasRegisteredEarlier(index)) continue;
         for (const OperationDefinition& operation : OPERATIONS) {
             DeviceModeHandler handler = registration.*(operation.handler);
             if ((registration.operations & operation.flag) == 0 || handler == nullptr) {

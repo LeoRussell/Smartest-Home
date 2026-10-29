@@ -6,13 +6,24 @@
     let devices = [];
     let language = "ru";
     let container = null;
+    let resizeObserver = null;
+    let resizeFrame = null;
+    let deviceCatalogSignature = "";
     let stateBeforeDeviceRefresh = null;
     const pendingDeviceIdRenames = new Map();
+    const selectionFields = {
+        iot_when_parameter_changes: ["PARAMETER", "MATCH"],
+        iot_device_parameter: ["PARAMETER"],
+        iot_parameter_compare: ["PARAMETER", "OPERATOR"],
+        iot_set_parameter: ["PARAMETER"],
+        iot_invoke_action: ["ACTION"],
+        iot_invoke_mode: ["MODE", "OPERATION"]
+    };
 
     const words = {
         ru: {
             events: "События", conditions: "Условия", logic: "Логика", actions: "Действия", values: "Значения",
-            parameterChanged: "Когда изменилось значение", triggerFilter: "Фильтр", anyChange: "любое изменение", changedTo: "стало равно", invalidTriggerValue: "Задайте корректное значение фильтра запуска.", stableFor: "Без новых изменений", cooldown: "Пауза после запуска", seconds: "сек.", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
+            parameterChanged: "Когда изменилось значение", triggerFilter: "Фильтр", anyChange: "любое изменение", changedTo: "стало равно", invalidTriggerValue: "Задайте корректное значение фильтра запуска.", stableFor: "Без новых изменений", cooldown: "Пауза после запуска", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
             readParameter: "текущее значение параметра", readParameterHelp: "Подключите к сравнению или вычислению; сам по себе блок не запускает сценарий.", parameterValue: "значение параметра", equals: "равно", notEquals: "не равно", lessThan: "меньше", atMost: "не больше", greaterThan: "больше", atLeast: "не меньше",
             isConnected: "устройство подключено", setParameter: "установить параметр", invokeAction: "запустить действие / режим",
             choose: "выберите устройство", parameter: "параметр", action: "действие", mode: "режим", operation: "операция", selectMode: "выполнить режим", enableMode: "включить режим", disableMode: "выключить режим", and: "И", or: "ИЛИ", noParameters: "нет доступных параметров", noActions: "нет объявленных действий", noModes: "нет зарегистрированных режимов",
@@ -23,7 +34,7 @@
         },
         en: {
             events: "Events", conditions: "Conditions", logic: "Logic", actions: "Actions", values: "Values",
-            parameterChanged: "When a parameter changes", triggerFilter: "Filter", anyChange: "any change", changedTo: "changed to", invalidTriggerValue: "Enter a valid trigger filter value.", stableFor: "No further changes for", cooldown: "Cooldown", seconds: "sec.", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
+            parameterChanged: "When a parameter changes", triggerFilter: "Filter", anyChange: "any change", changedTo: "changed to", invalidTriggerValue: "Enter a valid trigger filter value.", stableFor: "No further changes for", cooldown: "Cooldown", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
             readParameter: "current parameter value", readParameterHelp: "Connect this to a comparison or calculation; it does not start a scenario by itself.", parameterValue: "parameter value", equals: "equals", notEquals: "does not equal", lessThan: "is less than", atMost: "is at most", greaterThan: "is greater than", atLeast: "is at least",
             isConnected: "device is connected", setParameter: "set parameter", invokeAction: "run device action / mode",
             choose: "select a device", parameter: "parameter", action: "action", mode: "mode", operation: "operation", selectMode: "run mode", enableMode: "enable mode", disableMode: "disable mode", and: "AND", or: "OR", noParameters: "no writable parameters", noActions: "no declared actions", noModes: "no registered modes",
@@ -134,6 +145,14 @@
         return device?.schema?.parameters?.[block.getFieldValue(fieldName)] || null;
     }
 
+    function refreshDropdown(block, fieldName, selectedValue = block.getFieldValue(fieldName)) {
+        const field = block.getField(fieldName);
+        const options = field.getOptions(false);
+        if (!options.some(option => option[1] === selectedValue)) selectedValue = options[0][1];
+        block.setFieldValue(selectedValue, fieldName);
+        return options;
+    }
+
     function triggerValueField(definition) {
         if (definition?.type === "boolean") {
             return new Blockly.FieldDropdown([
@@ -221,14 +240,8 @@
     }
 
     function updateParameterComparison(block) {
-        const parameterChoices = parameterOptions.call(block.getField("PARAMETER"));
-        if (!parameterChoices.some(option => option[1] === block.getFieldValue("PARAMETER"))) {
-            block.setFieldValue(parameterChoices[0][1], "PARAMETER");
-        }
-        const operatorChoices = parameterComparisonOptions.call(block.getField("OPERATOR"));
-        if (!operatorChoices.some(option => option[1] === block.getFieldValue("OPERATOR"))) {
-            block.setFieldValue(operatorChoices[0][1], "OPERATOR");
-        }
+        refreshDropdown(block, "PARAMETER");
+        refreshDropdown(block, "OPERATOR");
         updateValueConnection(block, "PARAMETER", "RIGHT");
     }
 
@@ -276,6 +289,35 @@
         if (!fieldCount) input.appendField(text("action"));
     }
 
+    function restoreBlockSelection(block, selection = {}) {
+        for (const field of ["DEVICE", ...selectionFields[block.type]]) {
+            refreshDropdown(block, field, selection[field] ?? block.getFieldValue(field));
+        }
+        if (block.type === "iot_when_parameter_changes") updateParameterTriggerFilter(block);
+        else if (block.type === "iot_parameter_compare") updateParameterComparison(block);
+        else if (block.type === "iot_device_parameter") updateValueConnection(block);
+        else if (block.type === "iot_set_parameter") updateValueConnection(block, "PARAMETER", "VALUE");
+        else updateActionArguments(block, block.type === "iot_invoke_mode" ? modeActionForBlock(block) : null);
+    }
+
+    function prepareWorkspaceState(state) {
+        const visit = value => {
+            if (!value || typeof value !== "object") return;
+            if (selectionFields[value.type] && value.fields) {
+                // Older saved scenarios have no extraState. Restore their device
+                // selection before Blockly loads dependent dropdowns and arguments.
+                value.extraState = { selection: Object.fromEntries(
+                    ["DEVICE", ...selectionFields[value.type]]
+                        .filter(field => value.fields[field] !== undefined)
+                        .map(field => [field, value.fields[field]])
+                ) };
+            }
+            Object.values(value).forEach(visit);
+        };
+        visit(state);
+        return state;
+    }
+
     function defineBlocks() {
         const Blockly = window.Blockly;
         Blockly.Blocks.iot_when_parameter_changes = {
@@ -299,6 +341,7 @@
                     .appendField(text("cooldown"))
                     .appendField(new Blockly.FieldNumber(0, 0, 86400, 1), "COOLDOWN_SECONDS")
                     .appendField(text("seconds"));
+                refreshDropdown(this, "PARAMETER");
                 this.triggerValueType_ = selectedParameter(this)?.type || "string";
                 this.setNextStatement(true);
                 this.setColour(210);
@@ -308,10 +351,7 @@
             onchange(event) {
                 if (event.type !== Blockly.Events.BLOCK_CHANGE || event.blockId !== this.id) return;
                 if (event.name === "DEVICE") {
-                    const options = parameterOptions.call(this.getField("PARAMETER"));
-                    if (!options.some(item => item[1] === this.getFieldValue("PARAMETER"))) {
-                        this.setFieldValue(options[0][1], "PARAMETER");
-                    }
+                    refreshDropdown(this, "PARAMETER");
                 }
                 if (["DEVICE", "PARAMETER", "MATCH"].includes(event.name)) {
                     updateParameterTriggerFilter(this);
@@ -348,14 +388,13 @@
                 this.setOutput(true);
                 this.setColour(195);
                 this.setTooltip(text("readParameterHelp"));
+                refreshDropdown(this, "PARAMETER");
+                updateValueConnection(this);
             },
             onchange(event) {
                 if (event.type === Blockly.Events.BLOCK_CHANGE && event.blockId === this.id) {
                     if (event.name === "DEVICE") {
-                        const options = parameterOptions.call(this.getField("PARAMETER"));
-                        if (!options.some(item => item[1] === this.getFieldValue("PARAMETER"))) {
-                            this.setFieldValue(options[0][1], "PARAMETER");
-                        }
+                        refreshDropdown(this, "PARAMETER");
                     }
                     updateValueConnection(this);
                 }
@@ -396,15 +435,13 @@
                 this.setPreviousStatement(true);
                 this.setNextStatement(true);
                 this.setColour(25);
+                refreshDropdown(this, "PARAMETER");
                 updateValueConnection(this, "PARAMETER", "VALUE");
             },
             onchange(event) {
                 if (event.type === Blockly.Events.BLOCK_CHANGE && event.blockId === this.id) {
                     if (event.name === "DEVICE") {
-                        const options = writableParameterOptions.call(this.getField("PARAMETER"));
-                        if (!options.some(item => item[1] === this.getFieldValue("PARAMETER"))) {
-                            this.setFieldValue(options[0][1], "PARAMETER");
-                        }
+                        refreshDropdown(this, "PARAMETER");
                     }
                     updateValueConnection(this, "PARAMETER", "VALUE");
                 }
@@ -414,22 +451,17 @@
             init() {
                 this.appendDummyInput("HEADER")
                     .appendField(text("invokeAction"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions, function (value) {
-                        const source = this.getSourceBlock();
-                        const options = actionOptions.call(source.getField("ACTION"));
-                        if (!options.some(item => item[1] === source.getFieldValue("ACTION"))) source.setFieldValue(options[0][1], "ACTION");
-                        return value;
-                    }), "DEVICE")
+                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
                     .appendField(new Blockly.FieldDropdown(actionOptions), "ACTION");
                 this.setPreviousStatement(true);
                 this.setNextStatement(true);
                 this.setColour(25);
+                refreshDropdown(this, "ACTION");
                 updateActionArguments(this);
             },
             onchange(event) {
                 if (event.type === Blockly.Events.BLOCK_CHANGE && event.blockId === this.id && ["DEVICE", "ACTION"].includes(event.name)) {
-                    const options = actionOptions.call(this.getField("ACTION"));
-                    if (!options.some(item => item[1] === this.getFieldValue("ACTION"))) this.setFieldValue(options[0][1], "ACTION");
+                    refreshDropdown(this, "ACTION");
                     updateActionArguments(this);
                 }
             }
@@ -444,19 +476,15 @@
                 this.setPreviousStatement(true);
                 this.setNextStatement(true);
                 this.setColour(25);
+                refreshDropdown(this, "MODE");
+                refreshDropdown(this, "OPERATION");
                 updateActionArguments(this, modeActionForBlock(this));
             },
             onchange(event) {
                 if (event.type !== Blockly.Events.BLOCK_CHANGE || event.blockId !== this.id) return;
                 if (["DEVICE", "MODE"].includes(event.name)) {
-                    const modeChoices = modeOptions.call(this.getField("MODE"));
-                    if (!modeChoices.some(option => option[1] === this.getFieldValue("MODE"))) {
-                        this.setFieldValue(modeChoices[0][1], "MODE");
-                    }
-                    const operationChoices = modeOperationOptions.call(this.getField("OPERATION"));
-                    if (!operationChoices.some(option => option[1] === this.getFieldValue("OPERATION"))) {
-                        this.setFieldValue(operationChoices[0][1], "OPERATION");
-                    }
+                    refreshDropdown(this, "MODE");
+                    refreshDropdown(this, "OPERATION");
                 }
                 if (["DEVICE", "MODE", "OPERATION"].includes(event.name)) {
                     updateActionArguments(this, modeActionForBlock(this));
@@ -474,6 +502,16 @@
                 this.setColour(25);
             }
         };
+        for (const type of Object.keys(selectionFields)) {
+            Blockly.Blocks[type].saveExtraState = function () {
+                return { selection: Object.fromEntries(
+                    ["DEVICE", ...selectionFields[type]].map(field => [field, this.getFieldValue(field)])
+                ) };
+            };
+            Blockly.Blocks[type].loadExtraState = function (state) {
+                restoreBlockSelection(this, state?.selection);
+            };
+        }
     }
 
     function toolbox() {
@@ -512,10 +550,19 @@
     }
 
     function disposeWorkspace() {
+        resizeObserver?.disconnect();
+        resizeObserver = null;
+        if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+        resizeFrame = null;
         if (workspace) {
             workspace.dispose();
             workspace = null;
         }
+    }
+
+    function catalogSignature(nextDevices) {
+        return JSON.stringify(nextDevices.map(device => ({ device: device.device, schema: device.schema }))
+            .sort((left, right) => left.device.localeCompare(right.device)));
     }
 
     function refreshParameterBlockFields() {
@@ -524,10 +571,7 @@
         try {
             for (const block of workspace.getAllBlocks(false)) {
                 if (["iot_when_parameter_changes", "iot_device_parameter"].includes(block.type)) {
-                    const options = parameterOptions.call(block.getField("PARAMETER"));
-                    if (block.getFieldValue("PARAMETER") === "" && options[0]?.[1]) {
-                        block.setFieldValue(options[0][1], "PARAMETER");
-                    }
+                    refreshDropdown(block, "PARAMETER");
                     if (block.type === "iot_device_parameter") updateValueConnection(block);
                     else updateParameterTriggerFilter(block);
                 } else if (block.type === "iot_parameter_compare") {
@@ -544,6 +588,7 @@
         container = document.getElementById(containerId);
         if (!Blockly || !container) return false;
         devices = Array.isArray(nextDevices) ? nextDevices : [];
+        deviceCatalogSignature = catalogSignature(devices);
         language = nextLanguage === "en" ? "en" : "ru";
         applyBlocklyLocale();
         disposeWorkspace();
@@ -562,13 +607,18 @@
         serializedState = applyDeviceIdRenames(serializedState);
         if (serializedState?.blocks) {
             try {
-                Blockly.serialization.workspaces.load(serializedState, workspace);
+                Blockly.serialization.workspaces.load(prepareWorkspaceState(serializedState), workspace);
             } catch (error) {
                 console.warn("Could not restore automation workspace:", error);
             }
         }
         refreshParameterBlockFields();
-        requestAnimationFrame(() => Blockly.svgResize(workspace));
+        workspace.clearUndo();
+        if (typeof ResizeObserver === "function") {
+            resizeObserver = new ResizeObserver(resize);
+            resizeObserver.observe(container);
+        }
+        resize();
         announceHistoryState();
         return true;
     }
@@ -660,42 +710,26 @@
                     parameter: block.getFieldValue("PARAMETER"),
                     value: parseValue(block.getInputTargetBlock("VALUE"), depth + 1)
                 });
-            } else if (block.type === "iot_invoke_action") {
-                const device = devices.find(item => item.device === block.getFieldValue("DEVICE"));
-                const actionId = block.getFieldValue("ACTION");
-                const definition = device?.schema?.actions?.[actionId];
-                const args = {};
-                for (const [id, argument] of Object.entries(definition?.arguments || {})) {
-                    if (argument.type === "json") continue;
-                    const raw = block.getFieldValue(`ARG_${id}`);
-                    if (raw.trim() === "" && argument.required === false) continue;
-                    if (raw.trim() === "" && argument.required !== false && ["integer", "number"].includes(argument.type)) {
-                        throw new Error(text("invalidArgument"));
-                    }
-                    if (argument.type === "boolean") args[id] = raw === "true";
-                    else if (argument.type === "enum") {
-                        try { args[id] = JSON.parse(raw); } catch (error) { throw new Error(text("invalidArgument")); }
-                    } else if (argument.type === "integer") {
-                        const value = Number(raw);
-                        if (!Number.isSafeInteger(value)) throw new Error(text("invalidArgument"));
-                        args[id] = value;
-                    } else if (argument.type === "number") {
-                        const value = Number(raw);
-                        if (!Number.isFinite(value)) throw new Error(text("invalidArgument"));
-                        args[id] = value;
-                    } else args[id] = raw;
-                }
-                statements.push({ type: "invoke_action", device: block.getFieldValue("DEVICE"), action: actionId, arguments: args });
-            } else if (block.type === "iot_invoke_mode") {
+            } else if (["iot_invoke_action", "iot_invoke_mode"].includes(block.type)) {
                 const deviceId = block.getFieldValue("DEVICE");
-                const actionId = modeActionForBlock(block);
+                const actionId = block.type === "iot_invoke_mode"
+                    ? modeActionForBlock(block)
+                    : block.getFieldValue("ACTION");
                 const device = devices.find(item => item.device === deviceId);
                 const definition = device?.schema?.actions?.[actionId];
                 if (!definition) throw new Error(text("missingBlock"));
                 const args = {};
                 for (const [id, argument] of Object.entries(definition.arguments || {})) {
-                    if (argument.type === "json") continue;
-                    const raw = block.getFieldValue(`ARG_${id}`);
+                    if (argument.type === "json") {
+                        if (argument.required !== false) throw new Error(text("invalidArgument"));
+                        continue;
+                    }
+                    const fieldValue = block.getFieldValue(`ARG_${id}`);
+                    if (fieldValue === null || fieldValue === undefined) {
+                        if (argument.required !== false) throw new Error(text("invalidArgument"));
+                        continue;
+                    }
+                    const raw = String(fieldValue);
                     if (raw.trim() === "" && argument.required === false) continue;
                     if (raw.trim() === "" && argument.required !== false && ["integer", "number"].includes(argument.type)) {
                         throw new Error(text("invalidArgument"));
@@ -772,9 +806,10 @@
     function load(state) {
         if (!workspace) return;
         workspace.clear();
-        if (state?.blocks) Blockly.serialization.workspaces.load(state, workspace);
+        if (state?.blocks) Blockly.serialization.workspaces.load(prepareWorkspaceState(state), workspace);
         refreshParameterBlockFields();
-        requestAnimationFrame(() => Blockly.svgResize(workspace));
+        workspace.clearUndo();
+        resize();
         announceHistoryState();
     }
 
@@ -791,7 +826,7 @@
         announceHistoryState();
         const root = workspace.newBlock("iot_when_parameter_changes");
         root.setFieldValue(config.trigger.device, "DEVICE");
-        const triggerParameters = parameterOptions.call(root.getField("PARAMETER"));
+        const triggerParameters = root.getField("PARAMETER").getOptions(false);
         if (triggerParameters.some(option => option[1] === config.trigger.parameter)) {
             root.setFieldValue(config.trigger.parameter, "PARAMETER");
         }
@@ -801,7 +836,7 @@
         compare.setFieldValue(operator, "OP");
         const sensor = workspace.newBlock("iot_device_parameter");
         sensor.setFieldValue(config.trigger.device, "DEVICE");
-        const sensorParameters = parameterOptions.call(sensor.getField("PARAMETER"));
+        const sensorParameters = sensor.getField("PARAMETER").getOptions(false);
         if (sensorParameters.some(option => option[1] === config.trigger.parameter)) {
             sensor.setFieldValue(config.trigger.parameter, "PARAMETER");
         }
@@ -815,7 +850,7 @@
         if (config.target.kind === "action") {
             const action = workspace.newBlock("iot_invoke_action");
             action.setFieldValue(config.target.device, "DEVICE");
-            const actions = actionOptions.call(action.getField("ACTION"));
+            const actions = action.getField("ACTION").getOptions(false);
             if (actions.some(option => option[1] === config.target.name)) {
                 action.setFieldValue(config.target.name, "ACTION");
             }
@@ -834,7 +869,7 @@
         } else {
             const action = workspace.newBlock("iot_set_parameter");
             action.setFieldValue(config.target.device, "DEVICE");
-            const writableParameters = writableParameterOptions.call(action.getField("PARAMETER"));
+            const writableParameters = action.getField("PARAMETER").getOptions(false);
             if (writableParameters.some(option => option[1] === config.target.name)) {
                 action.setFieldValue(config.target.name, "PARAMETER");
             }
@@ -857,12 +892,20 @@
             block.initSvg();
             block.render();
         }
+        workspace.clearUndo();
         announceHistoryState();
         resize();
     }
 
     function resize() {
-        if (workspace) requestAnimationFrame(() => Blockly.svgResize(workspace));
+        if (!workspace || resizeFrame !== null) return;
+        const currentWorkspace = workspace;
+        resizeFrame = requestAnimationFrame(() => {
+            resizeFrame = null;
+            if (workspace === currentWorkspace && container?.clientWidth && container?.clientHeight) {
+                Blockly.svgResize(currentWorkspace);
+            }
+        });
     }
 
     window.AutomationBlockly = {
@@ -890,6 +933,14 @@
             pendingDeviceIdRenames.set(oldId, newId);
         },
         update(nextDevices, nextLanguage) {
+            nextDevices = Array.isArray(nextDevices) ? nextDevices : [];
+            const nextLocale = nextLanguage === "en" ? "en" : "ru";
+            if (workspace && !pendingDeviceIdRenames.size && language === nextLocale &&
+                deviceCatalogSignature === catalogSignature(nextDevices)) {
+                devices = nextDevices;
+                resize();
+                return;
+            }
             const state = applyDeviceIdRenames(
                 workspace ? Blockly.serialization.workspaces.save(workspace) : stateBeforeDeviceRefresh
             );

@@ -6,13 +6,11 @@
 
 namespace {
 constexpr uint16_t GATEWAY_PORT = 8765;
-constexpr unsigned long STATE_INTERVAL_MS = 10000;
 constexpr char BOARD_PROFILE[] = "esp32-s3-devkitc-1";
 constexpr char FIRMWARE_VERSION[] = "1.0.0";
 
 GatewayClient gateway;
 UniversalDevice device;
-unsigned long lastUnconfiguredHeartbeatAt = 0;
 
 void sendHello() {
     JsonDocument message;
@@ -47,7 +45,6 @@ void onGatewayEvent(WStype_t type, uint8_t* payload, size_t length) {
             Serial.println("[GATEWAY] connected");
             sendHello();
             device.sendState(gateway);
-            lastUnconfiguredHeartbeatAt = millis();
             break;
         case WStype_TEXT: {
             JsonDocument message;
@@ -88,9 +85,4 @@ void setup() {
 void loop() {
     gateway.loop();
     device.loop(gateway);
-    if (gateway.isConnected() && !device.configured() &&
-        millis() - lastUnconfiguredHeartbeatAt >= STATE_INTERVAL_MS) {
-        device.sendState(gateway);
-        lastUnconfiguredHeartbeatAt = millis();
-    }
 }

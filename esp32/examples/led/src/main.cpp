@@ -22,12 +22,23 @@ bool commandCacheReady = false;
 unsigned long lastStateSentAt = 0;
 uint32_t stateSequence = 0;
 bool ledState = false;
+bool identifyRunning = false;
+bool identifyOn = false;
+unsigned int identifyPulsesRemaining = 0;
+unsigned long identifyNextAt = 0;
+
+struct CachedCommandResult {
+    String id;
+    String result;
+};
+CachedCommandResult cachedCommands[COMMAND_CACHE_SLOTS];
+uint8_t nextCommandCacheSlot = 0;
 
 #if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
 Adafruit_NeoPixel onboardLed(1, LED_PIN, NEO_GRB + NEO_KHZ800);
 #endif
 
-void setLedOutput(bool enabled) {
+void writeLedOutput(bool enabled) {
 #if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
     onboardLed.setPixelColor(
         0,
@@ -41,7 +52,32 @@ void setLedOutput(bool enabled) {
     const int inactiveLevel = LED_ACTIVE_LEVEL == HIGH ? LOW : HIGH;
     digitalWrite(LED_PIN, enabled ? LED_ACTIVE_LEVEL : inactiveLevel);
 #endif
+}
+
+void setLedOutput(bool enabled) {
     ledState = enabled;
+    if (!identifyRunning) writeLedOutput(enabled);
+}
+
+void startIdentify() {
+    identifyPulsesRemaining = IDENTIFY_PULSE_COUNT;
+    identifyRunning = identifyPulsesRemaining > 0;
+    identifyOn = identifyRunning;
+    writeLedOutput(identifyRunning ? true : ledState);
+    identifyNextAt = millis() + IDENTIFY_PULSE_DURATION_MS;
+}
+
+void updateIdentify() {
+    if (!identifyRunning || static_cast<int32_t>(millis() - identifyNextAt) < 0) return;
+    identifyOn = !identifyOn;
+    if (!identifyOn && --identifyPulsesRemaining == 0) {
+        identifyRunning = false;
+        writeLedOutput(ledState);
+        Serial.println("[IDENTIFY] complete");
+        return;
+    }
+    writeLedOutput(identifyOn);
+    identifyNextAt = millis() + IDENTIFY_PULSE_DURATION_MS;
 }
 
 void initializeLedOutput() {
@@ -62,40 +98,38 @@ void initializeLedOutput() {
     setLedOutput(false);
 }
 
+void loadCommandResults() {
+    if (!commandCacheReady) return;
+    nextCommandCacheSlot = commandCache.getUChar("next", 0) % COMMAND_CACHE_SLOTS;
+    for (uint8_t slot = 0; slot < COMMAND_CACHE_SLOTS; slot++) {
+        String idKey = "id";
+        idKey += String(slot);
+        String resultKey = "r";
+        resultKey += String(slot);
+        String id = commandCache.getString(idKey.c_str(), "");
+        String result = commandCache.getString(resultKey.c_str(), "");
+        if (id.isEmpty() || result.isEmpty()) continue;
+        JsonDocument document;
+        if (deserializeJson(document, result) ||
+            document["type"] != "command_result" ||
+            strcmp(document["command_id"] | "", id.c_str()) != 0) {
+            continue;
+        }
+        cachedCommands[slot].id = id;
+        cachedCommands[slot].result = result;
+    }
+}
+
 bool replayCachedCommandResult(const char* commandId) {
     if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
         return false;
     }
 
-    for (uint8_t slot = 0; slot < COMMAND_CACHE_SLOTS; slot++) {
-        String idKey = "id";
-        idKey += String(slot);
-        if (commandCache.getString(idKey.c_str(), "") != commandId) {
-            continue;
-        }
-
-        String resultKey = "r";
-        resultKey += String(slot);
-        String cachedResult = commandCache.getString(resultKey.c_str(), "");
-        if (cachedResult.length() == 0) {
-            return false;
-        }
-
-        JsonDocument cachedDocument;
-        if (!deserializeJson(cachedDocument, cachedResult)) {
-            const char* parameter = cachedDocument["data"]["parameter"] | "";
-            JsonVariantConst cachedValue = cachedDocument["data"]["value"];
-            if (
-                strcmp(parameter, "led") == 0 &&
-                cachedValue.is<bool>()
-            ) {
-                // A command retry can arrive after an ESP32 reboot. Reapply
-                // the cached logical output before acknowledging the retry.
-                setLedOutput(cachedValue.as<bool>());
-            }
-        }
-
-        gateway.sendText(cachedResult);
+    for (const CachedCommandResult& cached : cachedCommands) {
+        if (cached.id != commandId) continue;
+        // Replaying an acknowledgement must not repeat an old side effect:
+        // newer commands may already have changed the physical output.
+        gateway.sendText(cached.result);
         Serial.println("Replayed cached result for duplicate command");
         return true;
     }
@@ -107,7 +141,7 @@ void rememberCommandResult(const char* commandId, const String& result) {
         return;
     }
 
-    const uint8_t slot = commandCache.getUChar("next", 0) % COMMAND_CACHE_SLOTS;
+    const uint8_t slot = nextCommandCacheSlot;
     String idKey = "id";
     idKey += String(slot);
     String resultKey = "r";
@@ -115,7 +149,10 @@ void rememberCommandResult(const char* commandId, const String& result) {
     commandCache.putString(idKey.c_str(), "");
     commandCache.putString(resultKey.c_str(), result);
     commandCache.putString(idKey.c_str(), commandId);
-    commandCache.putUChar("next", (slot + 1) % COMMAND_CACHE_SLOTS);
+    cachedCommands[slot].id = commandId;
+    cachedCommands[slot].result = result;
+    nextCommandCacheSlot = (slot + 1) % COMMAND_CACHE_SLOTS;
+    commandCache.putUChar("next", nextCommandCacheSlot);
 }
 
 void sendHello() {
@@ -265,6 +302,8 @@ void onWebSocketEvent(
                     break;
                 }
                 if (replayCachedCommandResult(commandId)) {
+                    sendState(ledState, false);
+                    lastStateSentAt = millis();
                     break;
                 }
 
@@ -274,7 +313,6 @@ void onWebSocketEvent(
                         DEVICE_HAS_IDENTIFY_INDICATOR &&
                         strcmp(action, "identify") == 0
                     ) {
-                        const bool ledWasOn = ledState;
                         Serial.printf(
                             "[IDENTIFY] start driver=%s pin=%d pulses=%u duration=%lu ms\n",
 #if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
@@ -286,15 +324,8 @@ void onWebSocketEvent(
                             static_cast<unsigned int>(IDENTIFY_PULSE_COUNT),
                             static_cast<unsigned long>(IDENTIFY_PULSE_DURATION_MS)
                         );
-                        for (unsigned int i = 0; i < IDENTIFY_PULSE_COUNT; i++) {
-                            setLedOutput(true);
-                            delay(IDENTIFY_PULSE_DURATION_MS);
-                            setLedOutput(false);
-                            delay(IDENTIFY_PULSE_DURATION_MS);
-                        }
-                        setLedOutput(ledWasOn);
-                        Serial.println("[IDENTIFY] complete");
-                        sendState(ledWasOn, false);
+                        startIdentify();
+                        sendState(ledState, false);
                         lastStateSentAt = millis();
                         sendActionResult(commandId, action, true);
                     } else {
@@ -317,11 +348,17 @@ void onWebSocketEvent(
                 }
 
                 const char* parameter = doc["data"]["parameter"] | "";
-                bool value = doc["data"]["value"] | false;
+                JsonVariantConst requestedValue = doc["data"]["value"];
                 if (
                     strcmp(commandName, "set") == 0 &&
                     strcmp(parameter, "led") == 0
                 ) {
+                    if (!requestedValue.is<bool>()) {
+                        sendCommandResult(commandId, parameter, false, ledState,
+                                          "LED parameter requires a boolean value");
+                        break;
+                    }
+                    const bool value = requestedValue.as<bool>();
                     setLedOutput(value);
                     const bool appliedValue = ledState;
 
@@ -337,11 +374,8 @@ void onWebSocketEvent(
                     sendCommandResult(
                         commandId,
                         parameter,
-                        appliedValue == value,
-                        appliedValue,
-                        appliedValue == value
-                            ? nullptr
-                            : "LED output did not reach requested value"
+                        true,
+                        appliedValue
                     );
                 } else {
                     sendCommandResult(
@@ -374,6 +408,7 @@ void setup() {
     Serial.begin(115200);
     // Keep acknowledgements from older firmware behavior out of this cache.
     commandCacheReady = commandCache.begin("command_ack_v2", false);
+    loadCommandResults();
     initializeLedOutput();
 
     gateway.begin(
@@ -387,6 +422,7 @@ void setup() {
 
 void loop() {
     gateway.loop();
+    updateIdentify();
     const unsigned long now = millis();
     if (
         gateway.isConnected() &&

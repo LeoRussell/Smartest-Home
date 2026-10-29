@@ -6,26 +6,26 @@ Wi-Fi и WebSocket Gateway; Schema и смысл команд задаёт пр�
 
 ## Подключение библиотеки
 
-Библиотека уже подключена к основной прошивке PlatformIO. Отдельный пример
-пользовательской прошивки расположен в `esp32/examples/advanced_gpio_led`;
-его `platformio.ini` использует общую библиотеку из `esp32/lib/GatewayClient`.
+Рабочий пример пользовательской прошивки расположен в `esp32/examples/led`;
+его `platformio.ini` использует общую библиотеку из `esp32/shared/lib/GatewayClient`.
 Для другого проекта скопируйте каталог `GatewayClient` в его каталог `lib`.
 Библиотека объявляет зависимости WebSockets и ArduinoJson в `library.json`.
 
 В рабочем профиле код разделён по ответственности:
 
-- `GatewayClient` — Wi-Fi, WebSocket, переподключение и JSON-транспорт;
-- `esp32/src/main.cpp` — запуск, телеметрия и обработчики команд конкретного
+- `esp32/shared/lib/GatewayClient` — общие Wi-Fi, WebSocket, переподключение и JSON-транспорт;
+- `esp32/examples/led/src/main.cpp` — запуск, телеметрия и обработчики команд конкретного
   устройства;
-- `esp32/src/DeviceSchema.cpp` — описание параметров и возможностей;
-- `esp32/src/DeviceModes.cpp` — реестр режимов и их обработчики;
-- `esp32/include/device_config.h` и локальный `secrets.h` — ID, профиль платы
-  и настройки подключения.
+- `esp32/examples/led/src/DeviceSchema.cpp` — описание параметров и возможностей;
+- `esp32/examples/led/src/DeviceModes.cpp` — реестр режимов и их обработчики;
+- `esp32/examples/led/include/device_config.h` — ID и настройки устройства;
+- `esp32/examples/led/platformio.ini` — профили платы, драйвера и GPIO;
+- `esp32/shared/include/secrets.h` — общие для прошивок настройки Wi-Fi и Gateway.
 
 В собственном проекте можно сохранить такое же разделение или объединить
 файлы, если проект небольшой. Не добавляйте Wi-Fi-пароль в публикуемые файлы.
 
-Создайте локальный `secrets.h` с параметрами сети:
+Создайте локальный `esp32/shared/include/secrets.h` с параметрами сети:
 
 ```cpp
 #pragma once
@@ -34,19 +34,20 @@ Wi-Fi и WebSocket Gateway; Schema и смысл команд задаёт пр�
 #define GATEWAY_IP "192.168.0.102"
 ```
 
-Рабочий пример регистрирует устройство `esp32-advanced-01`, объявляет
+По умолчанию рабочий пример регистрирует устройство `esp32-01`, объявляет
 управляемый параметр `led`, принимает команды и отправляет подтверждения.
 Он рассчитан на ESP32-S3 с обычным LED на GPIO 48. Скопируйте
-`esp32/include/secrets.example.h` в `esp32/include/secrets.h`, укажите Wi-Fi,
+`esp32/shared/include/secrets.example.h` в `esp32/shared/include/secrets.h`, укажите Wi-Fi,
 затем соберите пример:
 
 ```powershell
-pio run -d esp32/examples/advanced_gpio_led
+pio run -d esp32/examples/led
 ```
 
-Чтобы прошить плату, добавьте `-t upload`. Для другой платы измените пин и
-драйвер под её схему. Этот пример демонстрирует обычный GPIO LED; NeoPixel
-требует соответствующего драйвера.
+Чтобы прошить плату, добавьте `-t upload`. Для другой платы выберите профиль
+через `-e` или настройте пин и драйвер под её схему. Профиль по умолчанию
+демонстрирует обычный GPIO LED; для адресного RGB-индикатора доступны
+NeoPixel-профили в `esp32/examples/led/platformio.ini`.
 
 В собственном обработчике `WStype_CONNECTED` отправляйте `hello`. Например,
 светочувствительный датчик может объявить числовой параметр `illuminance` с
@@ -126,7 +127,7 @@ Gateway отправляет команду параметра так:
 Для произвольной операции используйте `data.command: "invoke"`, ID действия
 из `schema.actions` и объект `data.arguments`. В ответе укажите ID действия в
 `data.action`. Командный обработчик текущей прошивки в
-`esp32/src/main.cpp` — рабочий пример приёма `set` и `invoke`, передачи
+`esp32/examples/led/src/main.cpp` — рабочий пример приёма `set` и `invoke`, передачи
 результата и защиты от повторного выполнения через `command_id`.
 
 Флаг `command_dedup` должен быть `true` только если прошивка действительно
@@ -138,7 +139,7 @@ NVS; библиотека `GatewayClient` намеренно не подменя
 ## Режимы устройства
 
 Сложные режимы остаются в пользовательской прошивке. Зарегистрируйте их в
-`esp32/src/DeviceModes.cpp`: общий код добавит операции режима в Schema и
+`esp32/examples/led/src/DeviceModes.cpp`: общий код добавит операции режима в Schema и
 направит команды соответствующим обработчикам. Допустимые операции
 `select`, `enable` и `disable` ссылаются на ID этих действий. При необходимости
 режим может ссылаться на параметр состояния и перечислить конфликтующие

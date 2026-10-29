@@ -40,13 +40,14 @@ bool GatewayClient::isConnected() {
 }
 
 bool GatewayClient::sendText(const String& message) {
-    return isConnected() && webSocket_.sendTXT(message.c_str());
+    return isConnected() && webSocket_.sendTXT(message.c_str(), message.length());
 }
 
 bool GatewayClient::sendJson(JsonDocument& document) {
     if (!isConnected()) return false;
 
     String message;
+    message.reserve(measureJson(document));
     serializeJson(document, message);
     return sendText(message);
 }

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from websockets.http11 import Headers, Request
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from device_configuration import (
     DRIVERS,
@@ -36,7 +36,7 @@ class DeviceConfigurationTests(unittest.TestCase):
 
     def test_gateway_driver_descriptions_match_universal_firmware(self):
         firmware_path = (
-            Path(__file__).resolve().parents[1]
+            Path(__file__).resolve().parents[2]
             / "esp32" / "universal" / "src" / "UniversalDevice.cpp"
         )
         source = firmware_path.read_text(encoding="utf-8")

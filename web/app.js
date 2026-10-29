@@ -65,6 +65,7 @@ let deviceSort = ["recent", "name", "status"].includes(storedDeviceSort)
     ? storedDeviceSort
     : "recent";
 const deviceDrafts = new Map();
+let overviewRenderSignature = "";
 
 const savedUiSettings = readLocalState(UI_SETTINGS_KEY, {});
 const uiSettings = {
@@ -831,14 +832,19 @@ function setGatewayConnectionStatus(message, connected) {
     const wasConnected = gatewayIsConnectedState;
     lastGatewayStatusMessage = message;
     gatewayIsConnectedState = connected;
-    if (!connected && wasConnected && databaseBackupRefreshPending) {
-        databaseBackupRefreshPending = false;
-        if (databaseBackupFeedback) {
+    if (!connected && wasConnected) {
+        if ((databaseBackupRefreshPending || databaseBackupActionPending) && databaseBackupFeedback) {
             databaseBackupFeedback.textContent = localized(
-                "Не удалось обновить список: соединение с Gateway потеряно.",
-                "Could not refresh the list: Gateway connection was lost."
+                "Соединение с Gateway потеряно. После подключения обновите список и проверьте результат операции.",
+                "Gateway connection was lost. Reconnect and refresh the list to check the operation result."
             );
         }
+        databaseBackupRefreshPending = false;
+        databaseBackupActionPending = false;
+        const configurationSave = deviceConfigurationDialog?.querySelector(".device-config-save");
+        if (configurationSave) configurationSave.disabled = false;
+        const identitySave = deviceIdentityDialog?.querySelector('[data-role="identity-save"]');
+        if (identitySave) identitySave.disabled = false;
     }
     if (connected && !wasConnected) {
         const now = performance.now() / 1000;
@@ -885,15 +891,18 @@ function clearPendingCommand(commandId) {
 }
 
 function hasPendingParameterCommand(deviceId, parameter) {
-    return [...pendingCommands.values()].some(pending =>
-        pending.deviceId === deviceId && pending.parameter === parameter
-    );
+    return Boolean(findPendingCommand(deviceId, "parameter", parameter));
 }
 
 function hasPendingAction(deviceId, actionId) {
-    return [...pendingCommands.values()].some(pending =>
-        pending.deviceId === deviceId && pending.actionId === actionId
-    );
+    return Boolean(findPendingCommand(deviceId, "actionId", actionId));
+}
+
+function findPendingCommand(deviceId, field, name) {
+    for (const pending of pendingCommands.values()) {
+        if (pending.deviceId === deviceId && pending[field] === name) return pending;
+    }
+    return null;
 }
 
 function isGatewayConnected() {
@@ -1490,15 +1499,18 @@ function connectGateway() {
 
     const host = window.location.hostname || "localhost";
 
-    socket = new WebSocket(`ws://${host}:8765`);
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const gatewaySocket = new WebSocket(`${protocol}//${host}:8765`);
+    socket = gatewaySocket;
 
-    socket.addEventListener("open", () => {
+    gatewaySocket.addEventListener("open", () => {
+        if (socket !== gatewaySocket) return;
         setGatewayConnectionStatus("Gateway подключён", true);
         setActivity("Подключено к Gateway.");
         for (const device of devices) updateDevicePanel(device);
         renderBlockedDevices();
 
-        socket.send(JSON.stringify({
+        gatewaySocket.send(JSON.stringify({
             type: "browser_hello"
         }));
 
@@ -1507,7 +1519,8 @@ function connectGateway() {
         sendGatewayAction("get_automations");
     });
 
-    socket.addEventListener("message", (event) => {
+    gatewaySocket.addEventListener("message", (event) => {
+        if (socket !== gatewaySocket) return;
         let message;
 
         try {
@@ -1521,13 +1534,22 @@ function connectGateway() {
         handleGatewayMessage(message);
     });
 
-    socket.addEventListener("close", () => {
+    gatewaySocket.addEventListener("close", () => {
+        if (socket !== gatewaySocket) return;
         setGatewayConnectionStatus("Нет соединения с Gateway", false);
         pendingSchemaDecisions.clear();
         schemaHistoryRequests.clear();
+        automationRunHistoryRequests.clear();
+        automationRunHistoryRefreshRequested.clear();
+        activeEventRequest = null;
+        eventsLoading = false;
         notificationBackfillActive = null;
+        pendingDeviceAccessRequests = [];
+        renderDeviceAccessDialog();
         for (const device of devices) updateDevicePanel(device);
         renderBlockedDevices();
+        renderEvents();
+        renderAutomations();
 
         setActivity(
             "Соединение потеряно. Повторное подключение..."
@@ -1540,7 +1562,8 @@ function connectGateway() {
         }, 2000);
     });
 
-    socket.addEventListener("error", (error) => {
+    gatewaySocket.addEventListener("error", (error) => {
+        if (socket !== gatewaySocket) return;
         setGatewayConnectionStatus("Ошибка соединения с Gateway", false);
         console.error("Ошибка WebSocket:", error);
         setActivity("Ошибка соединения с Gateway.");
@@ -1556,6 +1579,11 @@ function handleGatewayMessage(message) {
         case "automation_list": {
             automations = Array.isArray(message.automations) ? message.automations : [];
             const automationIds = new Set(automations.map(item => item.automation_id));
+            for (const counts of [automationRunHistoryCounts, automationRunHistoryCompletedCounts]) {
+                for (const automationId of counts.keys()) {
+                    if (!automationIds.has(automationId)) counts.delete(automationId);
+                }
+            }
             if (
                 pendingAutomationRunFocus &&
                 !automationIds.has(pendingAutomationRunFocus.automationId)
@@ -3584,7 +3612,14 @@ function updateDeviceHint(device, panel = null) {
 }
 
 function updateDeviceFreshnessHints() {
-    for (const device of devices) updateDeviceHint(device);
+    const panels = new Map(
+        [...(deviceCard?.querySelectorAll(".device-panel") || [])]
+            .map(panel => [panel.dataset.deviceId, panel])
+    );
+    for (const device of devices) {
+        const panel = panels.get(device.device);
+        if (panel) updateDeviceHint(device, panel);
+    }
 }
 
 function updateDevicePanel(device) {
@@ -3655,11 +3690,9 @@ function updateDevicePanel(device) {
         const parameterId = button.dataset.parameterId;
         const definition = device.schema?.parameters?.[parameterId];
         const value = device.parameters?.[parameterId];
-        const pending = hasPendingParameterCommand(device.device, parameterId);
+        const pendingCommand = findPendingCommand(device.device, "parameter", parameterId);
+        const pending = Boolean(pendingCommand);
         const label = definition?.label || parameterId;
-        const pendingCommand = [...pendingCommands.values()].find(command =>
-            command.deviceId === device.device && command.parameter === parameterId
-        );
         const isOn = value === true;
         button.classList.toggle("is-on", isOn);
         button.setAttribute("aria-checked", String(isOn));
@@ -3698,9 +3731,7 @@ function updateDevicePanel(device) {
     }
 
     for (const button of panel.querySelectorAll('[data-role="device-action"]')) {
-        const pendingAction = [...pendingCommands.values()].find(command =>
-            command.deviceId === device.device && command.actionId === button.dataset.actionId
-        );
+        const pendingAction = findPendingCommand(device.device, "actionId", button.dataset.actionId);
         if (pendingAction) {
             const label = device.schema?.actions?.[button.dataset.actionId]?.label || button.dataset.actionId;
             button.textContent = pendingAction.status === "queued"
@@ -3711,15 +3742,13 @@ function updateDevicePanel(device) {
         }
         button.disabled = !device.connected || !isGatewayConnected() ||
             Boolean(device.pending_schema) ||
-            hasPendingAction(device.device, button.dataset.actionId);
+            Boolean(pendingAction);
     }
 
     const identifyButton = panel.querySelector('[data-role="device-identify"]');
     if (identifyButton) {
-        const pending = hasPendingAction(device.device, "identify");
-        const pendingCommand = [...pendingCommands.values()].find(command =>
-            command.deviceId === device.device && command.actionId === "identify"
-        );
+        const pendingCommand = findPendingCommand(device.device, "actionId", "identify");
+        const pending = Boolean(pendingCommand);
         const label = device.schema?.actions?.identify?.label ||
             localized("Найти устройство", "Find device");
         identifyButton.disabled = !device.connected || !isGatewayConnected() ||
@@ -3756,8 +3785,17 @@ function updateDevicePanel(device) {
 
 function renderOverview() {
     if (!overview) return;
-    const online = devices.filter(device => device.connected).length;
-    const favoriteCount = devices.filter(device => favoriteDeviceIds.has(device.device)).length;
+    let online = 0;
+    let favoriteCount = 0;
+    for (const device of devices) {
+        if (device.connected) online += 1;
+        if (favoriteDeviceIds.has(device.device)) favoriteCount += 1;
+    }
+    const signature = JSON.stringify([
+        devices.length, online, favoriteCount, deviceFilter, uiSettings.language
+    ]);
+    if (overviewRenderSignature === signature) return;
+    overviewRenderSignature = signature;
     const metrics = [
         {
             value: String(devices.length),
@@ -4044,7 +4082,29 @@ function getAutomationEventSource(event) {
     }
 }
 
-function isCommandEchoEvent(event, eventList) {
+function createCommandEchoIndex(eventList) {
+    const index = new Map();
+    for (const event of eventList) {
+        if (event.event_type !== "command") continue;
+        try {
+            const command = JSON.parse(event.event_value || "{}");
+            const value = command.result_value ?? command.requested_value;
+            const time = Date.parse(event.timestamp);
+            if (command.status !== "succeeded" || !command.parameter ||
+                command.command_id?.startsWith("auto-") || !Number.isFinite(time) ||
+                (value !== null && typeof value === "object")) continue;
+            const key = JSON.stringify([event.device_id, command.parameter, typeof value, value]);
+            if (!index.has(key)) index.set(key, []);
+            index.get(key).push({ id: event.id, time });
+        } catch (error) {
+            // Historical events may contain a legacy, non-JSON payload.
+        }
+    }
+    for (const commands of index.values()) commands.sort((left, right) => left.time - right.time);
+    return index;
+}
+
+function isCommandEchoEvent(event, commandIndex) {
     let parameter;
     let value;
     try {
@@ -4070,30 +4130,20 @@ function isCommandEchoEvent(event, eventList) {
     const stateTime = new Date(event.timestamp).getTime();
     if (!parameter || Number.isNaN(stateTime)) return false;
 
-    return eventList.some(commandEvent => {
-        if (
-            commandEvent.event_type !== "command" ||
-            commandEvent.device_id !== event.device_id ||
-            (Number.isFinite(commandEvent.id) && Number.isFinite(event.id) && commandEvent.id <= event.id)
-        ) {
-            return false;
-        }
-
-        try {
-            const command = JSON.parse(commandEvent.event_value || "{}");
-            if (command.command_id?.startsWith("auto-")) return false;
-            if (command.status !== "succeeded" || command.parameter !== parameter) {
-                return false;
-            }
-            const commandValue = command.result_value ?? command.requested_value;
-            const commandTime = new Date(commandEvent.timestamp).getTime();
-            return commandValue === value &&
-                !Number.isNaN(commandTime) &&
-                Math.abs(commandTime - stateTime) <= 5000;
-        } catch (error) {
-            return false;
-        }
-    });
+    const key = JSON.stringify([event.device_id, parameter, typeof value, value]);
+    const commands = commandIndex.get(key) || [];
+    let left = 0;
+    let right = commands.length;
+    while (left < right) {
+        const middle = (left + right) >>> 1;
+        if (commands[middle].time < stateTime - 5000) left = middle + 1;
+        else right = middle;
+    }
+    for (let index = left; index < commands.length && commands[index].time <= stateTime + 5000; index += 1) {
+        const command = commands[index];
+        if (!Number.isFinite(command.id) || !Number.isFinite(event.id) || command.id > event.id) return true;
+    }
+    return false;
 }
 
 // =========================
@@ -4318,9 +4368,10 @@ function renderEvents() {
 
     const deduplicatedEvents = [];
     const lastLedValues = new Map();
+    const commandEchoIndex = createCommandEchoIndex(events);
 
     for (const event of events) {
-        if (String(event.id) !== pendingEventFocusId && isCommandEchoEvent(event, events)) {
+        if (String(event.id) !== pendingEventFocusId && isCommandEchoEvent(event, commandEchoIndex)) {
             continue;
         }
 
@@ -4611,20 +4662,20 @@ function createActionArgumentInput(definition) {
         if (!required) {
             const empty = document.createElement("option");
             empty.value = "";
-            empty.textContent = "Не указывать";
+            empty.textContent = localized("Не указывать", "Not set");
             input.appendChild(empty);
         }
         for (const value of [true, false]) {
             const option = document.createElement("option");
             option.value = String(value);
-            option.textContent = value ? "Да" : "Нет";
+            option.textContent = value ? localized("Да", "Yes") : localized("Нет", "No");
             input.appendChild(option);
         }
     } else if (definition.type === "enum") {
         if (!required) {
             const empty = document.createElement("option");
             empty.value = "";
-            empty.textContent = "Не указывать";
+            empty.textContent = localized("Не указывать", "Not set");
             input.appendChild(empty);
         }
         for (const option of definition.options || []) {
@@ -4647,18 +4698,8 @@ function createActionArgumentInput(definition) {
     return input;
 }
 
-function stableJson(value) {
-    if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-    if (value && typeof value === "object") {
-        return `{${Object.keys(value).sort().map(key =>
-            `${JSON.stringify(key)}:${stableJson(value[key])}`
-        ).join(",")}}`;
-    }
-    return JSON.stringify(value);
-}
-
 function downloadEmbeddedDeviceConfiguration(configuration, version) {
-    const canonical = stableJson(configuration);
+    const canonical = canonicalJson(configuration);
     const header = [
         "#pragma once",
         "",
@@ -4681,6 +4722,7 @@ function downloadEmbeddedDeviceConfiguration(configuration, version) {
 
 function openDeviceConfigurationDialog(device) {
     if (deviceConfigurationDialog) deviceConfigurationDialog.close();
+    const currentDevice = () => devices.find(item => item.device === device.device) || device;
 
     const drivers = Array.isArray(device.driver_catalog) ? device.driver_catalog : [];
     const components = JSON.parse(JSON.stringify(
@@ -4757,8 +4799,8 @@ function openDeviceConfigurationDialog(device) {
     const schemaLocation = document.createElement("p");
     schemaLocation.className = "device-config-firmware-help";
     schemaLocation.textContent = localized(
-        `JSON-копия Schema хранится в gateway/schemas/${device.device}.json. Кнопка «Скачать Schema из Gateway» загружает именно сохранённый файл; «Экспорт JSON» выгружает текущий черновик.`,
-        `The saved Schema is stored at gateway/schemas/${device.device}.json. “Download Schema from Gateway” retrieves that saved file; “Export JSON” exports the current draft.`
+        `JSON-копия Schema хранится в schemas/${device.device}.json рядом с базой Gateway. Кнопка «Скачать Schema из Gateway» загружает именно сохранённый файл; «Экспорт JSON» выгружает текущий черновик.`,
+        `The saved Schema is stored at schemas/${device.device}.json next to the Gateway database. “Download Schema from Gateway” retrieves that saved file; “Export JSON” exports the current draft.`
     );
 
     const feedback = document.createElement("p");
@@ -5149,11 +5191,11 @@ function openDeviceConfigurationDialog(device) {
             format_version: 1,
             components: components.map(component => {
                 const base = {
-                    id: component.id,
+                    id: String(component.id || "").trim(),
                     driver: component.driver,
-                    label: component.label,
-                    parameter_id: component.parameter_id,
-                    parameter_label: component.parameter_label,
+                    label: String(component.label || "").trim(),
+                    parameter_id: String(component.parameter_id || "").trim(),
+                    parameter_label: String(component.parameter_label || "").trim(),
                     pin: component.pin
                 };
                 if (component.driver === "gpio_output") {
@@ -5164,7 +5206,7 @@ function openDeviceConfigurationDialog(device) {
                     base.interval_ms = component.interval_ms;
                 } else if (component.driver === "analog_input") {
                     base.interval_ms = component.interval_ms;
-                    base.unit = component.unit;
+                    base.unit = String(component.unit || "").trim() || "raw";
                     base.raw_min = component.raw_min ?? 0;
                     base.raw_max = component.raw_max ?? 4095;
                     base.value_min = component.value_min ?? 0;
@@ -5193,12 +5235,13 @@ function openDeviceConfigurationDialog(device) {
     }
 
     firmwareButton.addEventListener("click", () => {
-        const savedConfiguration = device.hardware_configuration;
-        const version = Number(device.configuration_version);
+        const latestDevice = currentDevice();
+        const savedConfiguration = latestDevice.hardware_configuration;
+        const version = Number(latestDevice.configuration_version);
         if (
             !savedConfiguration ||
             !Number.isInteger(version) || version < 1 ||
-            stableJson(configurationFromDraft()) !== stableJson(savedConfiguration)
+            canonicalJson(configurationFromDraft()) !== canonicalJson(savedConfiguration)
         ) {
             feedback.textContent = localized(
                 "Сначала сохраните эту конфигурацию в Gateway. После этого скачайте файл для прошивки.",
@@ -5243,7 +5286,7 @@ function openDeviceConfigurationDialog(device) {
             );
             return;
         }
-        if (!device.connected) {
+        if (!currentDevice().connected) {
             feedback.textContent = localized(
                 "Устройство отключено: Gateway сохранит конфигурацию и отправит её при следующем подключении.",
                 "The device is offline. Gateway will save the configuration and send it when the device reconnects."
@@ -5257,19 +5300,20 @@ function openDeviceConfigurationDialog(device) {
         })) save.disabled = false;
     });
     exportButton.addEventListener("click", () => {
+        const latestDevice = currentDevice();
         const envelope = {
             export_format: "smartest-home-device",
             export_version: 1,
             exported_at: new Date().toISOString(),
             device_id: device.device,
-            device_profile: device.device_profile,
-            board_profile: device.board_profile,
-            schema_version: device.schema_version ?? null,
-            schema: device.schema,
+            device_profile: latestDevice.device_profile,
+            board_profile: latestDevice.board_profile,
+            schema_version: latestDevice.schema_version ?? null,
+            schema: latestDevice.schema,
             hardware_configuration: configurationFromDraft(),
             ui_preferences: uiPreferencesFromDraft(),
-            configuration_version: device.configuration_version ?? null,
-            configuration_status: device.configuration_status ?? null
+            configuration_version: latestDevice.configuration_version ?? null,
+            configuration_status: latestDevice.configuration_status ?? null
         };
         const blob = new Blob([JSON.stringify(envelope, null, 2)], {
             type: "application/json;charset=utf-8"
@@ -5501,6 +5545,10 @@ function openActionDialog(deviceId, actionId, definition) {
     const submit = document.createElement("button");
     submit.type = "button";
     submit.textContent = localized("Выполнить", "Run action");
+    form.addEventListener("submit", event => {
+        event.preventDefault();
+        submit.click();
+    });
     submit.addEventListener("click", () => {
         for (const field of fields) {
             if (!field.input.checkValidity()) {
@@ -5614,21 +5662,11 @@ function isValueCompatible(value, definition) {
 // =========================
 
 function requestDevices() {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-            type: "browser_message",
-            action: "get_devices"
-        }));
-    }
+    if (isGatewayConnected()) sendGatewayAction("get_devices");
 }
 
 function requestDatabaseStats() {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-            type: "browser_message",
-            action: "get_database_stats"
-        }));
-    }
+    if (isGatewayConnected()) sendGatewayAction("get_database_stats");
 }
 
 function sendSchemaDecision(deviceId, proposalId, decision) {

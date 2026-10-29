@@ -14,7 +14,6 @@ public:
     void handleMessage(JsonDocument& message, GatewayClient& gateway);
     void fillSchema(JsonObject schema) const;
     void sendState(GatewayClient& gateway, bool logMessage = false);
-    bool configured() const;
     uint32_t configurationVersion() const;
 
 private:

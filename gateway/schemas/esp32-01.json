@@ -1,7 +1,7 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-10-28T19:28:13+03:00",
+  "exported_at": "2026-10-29T21:53:27+03:00",
   "device_id": "esp32-01",
   "schema_version": 7,
   "firmware_version": "1.5.0",

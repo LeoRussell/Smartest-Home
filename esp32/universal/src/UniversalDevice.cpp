@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cstring>
 #include <mbedtls/sha256.h>
+#include <esp_arduino_version.h>
 
 #if defined(__has_include)
 #if __has_include("device_configuration.generated.h")
@@ -13,6 +14,37 @@
 
 namespace {
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 10000;
+
+uint32_t readConfigurationVersion(JsonVariantConst value) {
+    return value.is<uint32_t>() && !value.is<bool>() ? value.as<uint32_t>() : 0;
+}
+
+void configurePwm(uint8_t pin, uint8_t channel, uint32_t value) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttachChannel(pin, 1000, 8, channel);
+    ledcWriteChannel(channel, value);
+#else
+    ledcSetup(channel, 1000, 8);
+    ledcAttachPin(pin, channel);
+    ledcWrite(channel, value);
+#endif
+}
+
+void writePwm(uint8_t channel, uint32_t value) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcWriteChannel(channel, value);
+#else
+    ledcWrite(channel, value);
+#endif
+}
+
+void detachPwm(uint8_t pin) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcDetach(pin);
+#else
+    ledcDetachPin(pin);
+#endif
+}
 
 bool copyString(JsonVariantConst value, char* destination, size_t capacity) {
     if (!value.is<const char*>()) return false;
@@ -63,7 +95,10 @@ bool calculateConfigurationHash(JsonVariantConst configuration, String& hash) {
 
 bool UniversalDevice::begin() {
     analogReadResolution(12);
-    preferences_.begin("device_cfg", false);
+    if (!preferences_.begin("device_cfg", false)) {
+        Serial.println("[CONFIG] NVS could not be opened; GPIO remains inactive.");
+        return false;
+    }
 
     const String savedEnvelope = preferences_.getString("envelope", "");
     if (savedEnvelope.length() == 0) {
@@ -83,7 +118,7 @@ bool UniversalDevice::begin() {
         configurationHash_ = "";
         return false;
     }
-    configurationVersion_ = envelope["version"] | 0;
+    configurationVersion_ = readConfigurationVersion(envelope["version"]);
     configurationHash_ = envelope["hash"] | "";
     JsonVariantConst storedConfiguration = envelope["configuration"];
     if (configurationVersion_ == 0 || configurationHash_.length() != 64) {
@@ -129,11 +164,6 @@ bool UniversalDevice::begin() {
     Serial.printf("[CONFIG] Loaded version %lu with %u components.\n",
                   static_cast<unsigned long>(configurationVersion_),
                   static_cast<unsigned int>(componentCount_));
-    String embeddedError;
-    if (!loadEmbeddedConfiguration(embeddedError)) {
-        Serial.printf("[CONFIG] Embedded configuration ignored: %s\n",
-                      embeddedError.c_str());
-    }
     return true;
 }
 
@@ -163,10 +193,6 @@ bool UniversalDevice::loadEmbeddedConfiguration(String& error) {
     (void)error;
 #endif
     return true;
-}
-
-bool UniversalDevice::configured() const {
-    return configured_;
 }
 
 uint32_t UniversalDevice::configurationVersion() const {
@@ -299,8 +325,9 @@ bool UniversalDevice::parseAndValidate(
         for (JsonPairConst pair : indicator) {
             const char* key = pair.key().c_str();
             if (strcmp(key, "driver") != 0 && strcmp(key, "pin") != 0 &&
-                strcmp(key, "active_high") != 0 && strcmp(key, "brightness") != 0 &&
-                strcmp(key, "built_in") != 0) {
+                strcmp(key, "built_in") != 0 &&
+                !(identify.driver == IdentifyDriver::Gpio && strcmp(key, "active_high") == 0) &&
+                !(identify.driver == IdentifyDriver::NeoPixel && strcmp(key, "brightness") == 0)) {
                 error = "identify_indicator contains an unsupported field";
                 return false;
             }
@@ -475,6 +502,10 @@ bool UniversalDevice::applyConfiguration(
     const char* hash,
     String& error
 ) {
+    if (measureJson(configuration) > MAX_CONFIGURATION_BYTES) {
+        error = "configuration exceeds the supported size limit";
+        return false;
+    }
     if (version == 0 || hash == nullptr || strlen(hash) != 64) {
         error = "configuration version or hash is invalid";
         return false;
@@ -511,7 +542,9 @@ bool UniversalDevice::applyConfiguration(
                 next.booleanValue = previous.booleanValue;
             } else if (next.driver == Driver::PwmOutput &&
                        next.initialInteger == previous.initialInteger) {
-                next.integerValue = previous.integerValue;
+                next.integerValue = constrain(
+                    previous.integerValue, next.minimumValue, next.maximumValue
+                );
             }
             break;
         }
@@ -540,6 +573,12 @@ bool UniversalDevice::applyConfiguration(
     const IdentifyIndicator previousIdentify = identifyIndicator_;
     for (uint8_t oldIndex = 0; oldIndex < componentCount_; ++oldIndex) {
         const Component& oldComponent = components_[oldIndex];
+        // PWM channels belong to component slots, not GPIOs. Release the old
+        // route before reusing a pin or slot for another component/driver.
+        if (oldComponent.driver == Driver::PwmOutput) {
+            writePwm(oldIndex, 0);
+            detachPwm(oldComponent.pin);
+        }
         bool pinRetained = false;
         for (uint8_t newIndex = 0; newIndex < parsedCount; ++newIndex) {
             if (parsed[newIndex].pin == oldComponent.pin) {
@@ -557,8 +596,6 @@ bool UniversalDevice::applyConfiguration(
                 oldComponent.pin,
                 oldComponent.activeHigh ? LOW : HIGH
             );
-        } else if (oldComponent.driver == Driver::PwmOutput) {
-            analogWrite(oldComponent.pin, 0);
         }
         pinMode(oldComponent.pin, INPUT);
     }
@@ -621,7 +658,7 @@ void UniversalDevice::configurePins() {
                 break;
             case Driver::PwmOutput:
                 pinMode(component.pin, OUTPUT);
-                analogWrite(component.pin, component.integerValue);
+                configurePwm(component.pin, index, component.integerValue);
                 break;
         }
         component.lastPollAt = millis();
@@ -769,7 +806,7 @@ void UniversalDevice::sendState(GatewayClient& gateway, bool logMessage) {
             value.set(component.integerValue);
         }
     }
-    gateway.sendJson(message);
+    if (!gateway.sendJson(message)) return;
     lastHeartbeatAt_ = millis();
     if (logMessage) {
         String serialized;
@@ -814,7 +851,7 @@ int32_t UniversalDevice::scaleAnalogValue(
 
 void UniversalDevice::loop(GatewayClient& gateway) {
     updateIdentify();
-    if (!gateway.isConnected() || !configured_) return;
+    if (!gateway.isConnected()) return;
     const unsigned long now = millis();
     bool changed = false;
     for (uint8_t index = 0; index < componentCount_; ++index) {
@@ -859,7 +896,7 @@ bool UniversalDevice::setParameter(
                 return false;
             }
             component.integerValue = requested.as<int>();
-            analogWrite(component.pin, component.integerValue);
+            writePwm(index, component.integerValue);
             applied.set(component.integerValue);
             return true;
         }
@@ -921,7 +958,7 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
     }
     if (strcmp(messageType, "device_config_apply") == 0) {
         const char* target = message["device"] | "";
-        const uint32_t version = message["config_version"] | 0;
+        const uint32_t version = readConfigurationVersion(message["config_version"]);
         const char* hash = message["config_hash"] | "";
         String error;
         const bool targetMatches = target[0] == '\0' || strcmp(target, UNIVERSAL_DEVICE_ID) == 0;

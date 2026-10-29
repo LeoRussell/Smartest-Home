@@ -1,0 +1,7 @@
+{
+    "folders": [
+        { "name": "Smartest-Home", "path": "." },
+        { "name": "ESP32 LED", "path": "esp32/examples/led" },
+        { "name": "ESP32 Universal", "path": "esp32/universal" }
+    ]
+}

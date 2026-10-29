@@ -7,7 +7,7 @@ import re
 import sqlite3
 import sys
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,7 +47,7 @@ if not DB_PATH_VALUE.strip():
     raise RuntimeError("GATEWAY_DB_PATH must not be empty.")
 DB_PATH = Path(DB_PATH_VALUE).expanduser()
 DATABASE_BACKUP_DIR = DB_PATH.parent / "backups"
-DEVICE_CONFIGURATION_EXPORT_DIR = BASE_DIR / "schemas"
+DEVICE_CONFIGURATION_EXPORT_DIR = DB_PATH.parent / "schemas"
 DATABASE_BACKUP_LIMIT = 20
 DATABASE_BACKUP_DOWNLOAD_LIMIT = 512 * 1024 * 1024
 DEVICE_CONFIGURATION_EXPORT_DOWNLOAD_LIMIT = 1024 * 1024
@@ -108,12 +108,20 @@ GATEWAY_SESSION_STARTED_AT = None
 GATEWAY_RUNTIME_CHECKPOINT_SECONDS = 30
 
 
+@contextmanager
+def database_connection():
+    """Commit or roll back the transaction, then always release its file handle."""
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        with connection:
+            yield connection
+
+
 def init_db():
     global GATEWAY_SESSION_STARTED_AT
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS devices (
                 device_id TEXT PRIMARY KEY,
@@ -408,17 +416,14 @@ def init_db():
             WHERE singleton_id = 1
         """, (runtime_checkpoint_at,))
 
-        conn.commit()
-
     print(f"База данных: {DB_PATH}")
-
 
     GATEWAY_SESSION_STARTED_AT = datetime.now(timezone.utc)
 
 
 def checkpoint_gateway_runtime(final=False):
     now = datetime.now(timezone.utc)
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute("""
             SELECT total_seconds, checkpoint_at
             FROM gateway_runtime WHERE singleton_id = 1
@@ -447,12 +452,11 @@ def checkpoint_gateway_runtime(final=False):
             total_seconds,
             None if final else now.isoformat(timespec="microseconds")
         ))
-        conn.commit()
 
 
 def get_database_stats():
     now = datetime.now(timezone.utc)
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         device_count = conn.execute(
             "SELECT COUNT(*) FROM devices"
         ).fetchone()[0]
@@ -695,6 +699,30 @@ async def gateway_runtime_checkpoint_loop():
     while True:
         await asyncio.sleep(GATEWAY_RUNTIME_CHECKPOINT_SECONDS)
         checkpoint_gateway_runtime()
+
+
+def schema_values_match(actual, expected):
+    """Compare JSON values without treating booleans as the numbers 0 and 1."""
+    pairs = [(actual, expected)]
+    while pairs:
+        left, right = pairs.pop()
+        if type(left) in (int, float) and type(right) in (int, float):
+            if left != right:
+                return False
+            continue
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            if left.keys() != right.keys():
+                return False
+            pairs.extend((value, right[key]) for key, value in left.items())
+        elif isinstance(left, list):
+            if len(left) != len(right):
+                return False
+            pairs.extend(zip(left, right))
+        elif left != right:
+            return False
+    return True
 
 
 def is_schema_value(value, parameter_schema):
@@ -1332,7 +1360,7 @@ def apply_parameter_ui_preferences(conn, device_id, preferences):
 
 
 def get_device_parameter_ui_preferences(device_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         rows = conn.execute(
             "SELECT parameter_id, control FROM parameter_ui_preferences WHERE device_id = ?",
             (device_id,)
@@ -1363,7 +1391,7 @@ def prune_parameter_ui_preferences(conn, device_id, schema):
 
 
 def get_parameter_ui_preferences():
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         rows = conn.execute(
             "SELECT device_id, parameter_id, control FROM parameter_ui_preferences"
         ).fetchall()
@@ -1384,7 +1412,7 @@ def save_parameter_ui_preference(device_id, parameter_id, control):
     ):
         return False, "Некорректный идентификатор устройства, параметра или вид элемента."
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute(
             "SELECT schema_version, schema_json FROM devices WHERE device_id = ?",
             (device_id,)
@@ -1407,28 +1435,28 @@ def save_parameter_ui_preference(device_id, parameter_id, control):
                 "DELETE FROM parameter_ui_preferences WHERE device_id = ? AND parameter_id = ?",
                 (device_id, parameter_id)
             )
-            conn.commit()
-            return True, "Используется вид элемента из Schema."
+            result_message = "Используется вид элемента из Schema."
+        else:
+            if not is_parameter_ui_preference_supported(control, definition):
+                return False, "Этот вид элемента несовместим с параметром в текущей Schema."
 
-        if not is_parameter_ui_preference_supported(control, definition):
-            return False, "Этот вид элемента несовместим с параметром в текущей Schema."
-
-        conn.execute("""
-            INSERT INTO parameter_ui_preferences (device_id, parameter_id, control, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(device_id, parameter_id) DO UPDATE SET
-                control = excluded.control,
-                updated_at = excluded.updated_at
-        """, (device_id, parameter_id, control, current_time()))
-        conn.commit()
-    return True, "Вид элемента сохранён."
+            conn.execute("""
+                INSERT INTO parameter_ui_preferences (device_id, parameter_id, control, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(device_id, parameter_id) DO UPDATE SET
+                    control = excluded.control,
+                    updated_at = excluded.updated_at
+            """, (device_id, parameter_id, control, current_time()))
+            result_message = "Вид элемента сохранён."
+    write_device_configuration_export(device_id)
+    return True, result_message
 
 
 def save_device_metadata(device_id, metadata):
     schema_json = json.dumps(metadata["schema"], ensure_ascii=False)
     timestamp = current_time()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         previous = conn.execute(
             "SELECT schema_json, schema_version, firmware_version, display_name, firmware_id, device_profile, board_profile, driver_catalog_json FROM devices WHERE device_id = ?",
             (device_id,)
@@ -1506,7 +1534,6 @@ def save_device_metadata(device_id, metadata):
                 conn, device_id, metadata, timestamp, "accepted"
             )
         prune_parameter_ui_preferences(conn, device_id, metadata["schema"])
-        conn.commit()
 
     device_metadata[device_id] = metadata
     write_device_configuration_export(device_id)
@@ -1517,7 +1544,7 @@ def load_device_metadata(device_id):
     if metadata is not None:
         return dict(metadata)
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
@@ -1563,7 +1590,7 @@ def load_device_metadata(device_id):
 
 
 def load_device_configuration(device_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
@@ -1599,7 +1626,7 @@ def save_device_configuration(device_id, configuration, ui_preferences=None):
     )
     config_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     timestamp = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT config_version, config_hash FROM device_configurations WHERE device_id = ?",
@@ -1607,7 +1634,6 @@ def save_device_configuration(device_id, configuration, ui_preferences=None):
         ).fetchone()
         if row is not None and row[1] == config_hash:
             apply_parameter_ui_preferences(conn, device_id, ui_preferences or {})
-            conn.commit()
             return {
                 "config_version": row[0], "config_hash": config_hash,
                 "unchanged": True
@@ -1642,14 +1668,13 @@ def save_device_configuration(device_id, configuration, ui_preferences=None):
             )
         """, (device_id, device_id))
         apply_parameter_ui_preferences(conn, device_id, ui_preferences or {})
-        conn.commit()
     return {"config_version": version, "config_hash": config_hash, "unchanged": False}
 
 
 def update_device_configuration_status(
     device_id, status, error=None, applied_at=None
 ):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("""
             UPDATE device_configurations
             SET status = ?, last_error = ?,
@@ -1663,7 +1688,6 @@ def update_device_configuration_status(
                 SELECT config_version FROM device_configurations WHERE device_id = ?
             )
         """, (status, device_id, device_id))
-        conn.commit()
 
 
 def device_configuration_export_document(device_id):
@@ -1697,10 +1721,10 @@ def write_device_configuration_export(device_id):
     if document is None:
         return False
     export_dir = DEVICE_CONFIGURATION_EXPORT_DIR
-    export_dir.mkdir(parents=True, exist_ok=True)
     destination = export_dir / f"{device_id}.json"
     temporary = export_dir / f".{device_id}.{uuid.uuid4().hex}.tmp"
     try:
+        export_dir.mkdir(parents=True, exist_ok=True)
         temporary.write_text(
             json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
             encoding="utf-8"
@@ -1718,7 +1742,7 @@ def write_device_configuration_export(device_id):
 
 def sync_device_configuration_exports():
     """Rebuild portable JSON views from SQLite, the source of truth."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         device_ids = [row[0] for row in conn.execute(
             "SELECT device_id FROM devices ORDER BY device_id"
         ).fetchall()]
@@ -1933,7 +1957,7 @@ async def handle_device_configuration_report(device_id, wire_device_id, message)
         return
 
     timestamp = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("""
             INSERT INTO device_configurations (
@@ -1947,7 +1971,6 @@ async def handle_device_configuration_report(device_id, wire_device_id, message)
                 created_at, status
             ) VALUES (?, ?, ?, ?, ?, 'applied')
         """, (device_id, version, canonical, config_hash, timestamp))
-        conn.commit()
 
     metadata = dict(metadata)
     metadata.update({"schema": expected_schema, "schema_version": version})
@@ -1972,7 +1995,7 @@ async def handle_device_configuration_report(device_id, wire_device_id, message)
 
 
 def resolve_device_identity(firmware_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute(
             "SELECT device_id FROM devices WHERE firmware_id = ?",
             (firmware_id,)
@@ -1989,14 +2012,13 @@ def resolve_device_identity(firmware_id):
                 "UPDATE devices SET firmware_id = ? WHERE device_id = ?",
                 (firmware_id, firmware_id)
             )
-            conn.commit()
     return firmware_id
 
 
 def firmware_identity_for(device_id):
     if device_id in device_wire_ids:
         return device_wire_ids[device_id]
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute(
             "SELECT firmware_id FROM devices WHERE device_id = ?",
             (device_id,)
@@ -2051,7 +2073,7 @@ def update_device_identity(device_id, new_device_id, display_name):
     ):
         return False, "Такой ID уже запрашивает подключение."
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
         existing = conn.execute(
             "SELECT * FROM devices WHERE device_id = ?",
@@ -2108,13 +2130,12 @@ def update_device_identity(device_id, new_device_id, display_name):
                 "UPDATE devices SET display_name = ? WHERE device_id = ?",
                 (display_name, device_id)
             )
-        conn.commit()
 
     metadata = device_metadata.pop(device_id, None)
     if metadata is not None:
         metadata["display_name"] = display_name
         device_metadata[new_device_id] = metadata
-    old_export = BASE_DIR / "schemas" / f"{device_id}.json"
+    old_export = DEVICE_CONFIGURATION_EXPORT_DIR / f"{device_id}.json"
     if changing_id:
         try:
             old_export.unlink(missing_ok=True)
@@ -2173,7 +2194,7 @@ def record_schema_snapshot_in_connection(conn, device_id, metadata, timestamp, s
 
 
 def get_schema_history(device_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT id, schema_version, firmware_version, schema_json,
@@ -2203,12 +2224,11 @@ def get_schema_history(device_id):
 
 
 def delete_schema_history_item(device_id, history_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         cursor = conn.execute(
             "DELETE FROM device_schema_history WHERE id = ? AND device_id = ?",
             (history_id, device_id)
         )
-        conn.commit()
         return cursor.rowcount > 0
 
 
@@ -2223,7 +2243,7 @@ def restore_device_schema(device_id, history_id):
     if history is None:
         return False, "Снимок Schema не найден."
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         cursor = conn.execute("""
             UPDATE devices
             SET schema_version = ?, firmware_version = ?, schema_json = ?,
@@ -2236,13 +2256,11 @@ def restore_device_schema(device_id, history_id):
         if cursor.rowcount == 0:
             return False, "Устройство не найдено."
         prune_parameter_ui_preferences(conn, device_id, history["schema"])
-        conn.commit()
-        if cursor.rowcount == 0:
-            return False, "Устройство не найдено."
 
     device_metadata.pop(device_id, None)
     pending_device_schemas.pop(device_id, None)
     deferred_device_schemas.pop(device_id, None)
+    write_device_configuration_export(device_id)
     save_device_event(
         device_id,
         "schema",
@@ -2252,7 +2270,7 @@ def restore_device_schema(device_id, history_id):
 
 
 def get_device_trust_policy(device_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute(
             "SELECT trust_policy FROM devices WHERE device_id = ?",
             (device_id,)
@@ -2261,7 +2279,7 @@ def get_device_trust_policy(device_id):
 
 
 def set_device_trust_policy(device_id, policy, name=None):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("""
             INSERT INTO devices (device_id, connected, trust_policy, name)
             VALUES (?, 0, ?, ?)
@@ -2269,13 +2287,12 @@ def set_device_trust_policy(device_id, policy, name=None):
                 trust_policy = excluded.trust_policy,
                 name = COALESCE(excluded.name, devices.name)
         """, (device_id, policy, name))
-        conn.commit()
     if device_id in device_metadata:
         device_metadata[device_id]["trust_policy"] = policy
 
 
 def get_blocked_devices():
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT device_id, COALESCE(display_name, name) AS name, last_seen
@@ -2322,7 +2339,7 @@ async def send_device_access_state(websocket=None):
 
 
 def load_pending_commands():
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         rows = conn.execute("""
             SELECT command_id, device_id, operation_json, payload_json,
                    status, attempts
@@ -2357,7 +2374,7 @@ def load_pending_commands():
 
 def create_command_queue_record(pending):
     timestamp = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("""
             INSERT INTO command_queue (
                 command_id, device_id, operation_json, payload_json,
@@ -2369,11 +2386,10 @@ def create_command_queue_record(pending):
             json.dumps(pending["payload"], ensure_ascii=False),
             timestamp, timestamp
         ))
-        conn.commit()
 
 
 def update_command_queue_record(pending, status, result=None, error=None):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("""
             UPDATE command_queue
             SET status = ?, attempts = ?, updated_at = ?,
@@ -2384,7 +2400,6 @@ def update_command_queue_record(pending, status, result=None, error=None):
             json.dumps(result, ensure_ascii=False) if result is not None else None,
             error, pending["command_id"]
         ))
-        conn.commit()
 
 
 async def send_command_queue_state(websocket=None):
@@ -2582,7 +2597,7 @@ def save_event_in_connection(
 def save_device_event(device_id, event_type, event_value, timestamp=None):
     timestamp = timestamp or current_time()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         save_event_in_connection(
             conn,
             device_id,
@@ -2590,7 +2605,6 @@ def save_device_event(device_id, event_type, event_value, timestamp=None):
             event_value,
             timestamp
         )
-        conn.commit()
 
     return timestamp
 
@@ -2598,7 +2612,7 @@ def save_device_event(device_id, event_type, event_value, timestamp=None):
 def save_device_seen(device_id, connected):
     timestamp = current_time()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("""
             INSERT INTO devices (
                 device_id,
@@ -2615,8 +2629,6 @@ def save_device_seen(device_id, connected):
             int(connected)
         ))
 
-        conn.commit()
-
     return timestamp
 
 
@@ -2632,7 +2644,7 @@ def save_device_state(
     deferred_events = []
     defer_parameters = defer_parameters or set()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute("""
             SELECT led, state_json, last_telemetry_at
             FROM devices
@@ -2676,7 +2688,7 @@ def save_device_state(
         for parameter_id, value in parameters.items():
             if (
                 parameter_id not in saved_parameters
-                or saved_parameters[parameter_id] == value
+                or schema_values_match(saved_parameters[parameter_id], value)
             ):
                 continue
 
@@ -2766,8 +2778,6 @@ def save_device_state(
                 device_id
             ))
 
-        conn.commit()
-
     return timestamp, has_changes, deferred_events, last_telemetry_at
 
 
@@ -2781,7 +2791,7 @@ def get_recent_events(limit=30):
     Записи в самой базе при этом не удаляются.
     """
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute("""
@@ -2850,13 +2860,7 @@ def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None, searc
         if conditions
         else ""
     )
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.create_function("casefold", 1, sqlite_casefold)
-        matching_count = conn.execute(
-            f"SELECT COUNT(*) FROM device_events {matching_where}",
-            tuple(parameters)
-        ).fetchone()[0]
-
+    matching_parameters = tuple(parameters)
     if before_id is not None:
         conditions.append("id < ?")
         parameters.append(before_id)
@@ -2867,9 +2871,13 @@ def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None, searc
         else ""
     )
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.create_function("casefold", 1, sqlite_casefold)
         conn.row_factory = sqlite3.Row
+        matching_count = conn.execute(
+            f"SELECT COUNT(*) FROM device_events {matching_where}",
+            matching_parameters
+        ).fetchone()[0]
         rows = conn.execute(f"""
             SELECT id, device_id, event_type, event_value, timestamp
             FROM device_events
@@ -2887,7 +2895,7 @@ def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None, searc
 
 
 def get_all_devices():
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute("""
@@ -3224,7 +3232,7 @@ async def send_pending_command_result(pending, status, value, error):
         and value is not None
         and any(
             state_event["parameter"] == operation["name"]
-            and state_event["value"] == value
+            and schema_values_match(state_event["value"], value)
             for state_event in pending.get("deferred_state_events", [])
         )
     ):
@@ -3239,7 +3247,7 @@ async def send_pending_command_result(pending, status, value, error):
             and value is not None
             and operation["kind"] == "parameter"
             and state_event["parameter"] == operation["name"]
-            and state_event["value"] == value
+            and schema_values_match(state_event["value"], value)
         )
         if is_confirmed_command_state:
             continue
@@ -3620,7 +3628,7 @@ async def dispatch_device_action(
 
 
 def get_automations():
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         rows = conn.execute("""
             SELECT automation_id, config_json, enabled, created_at,
                    updated_at, last_triggered_at, run_status,
@@ -3654,7 +3662,7 @@ def get_automation_run_count(automation_id, completed_only=False):
     where_clause = "automation_id = ?"
     if completed_only:
         where_clause += " AND status != 'running'"
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM automation_runs WHERE {where_clause}",
             (automation_id,)
@@ -3663,7 +3671,7 @@ def get_automation_run_count(automation_id, completed_only=False):
 
 
 def get_automation_run_history(automation_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.row_factory = sqlite3.Row
         runs = conn.execute("""
             SELECT run_id, automation_name, trigger_json, trigger_reason,
@@ -3734,7 +3742,7 @@ def create_automation_run(automation_id, config, reason):
         "trigger": trigger,
         "reason": reason
     }
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         cursor = conn.execute("""
             UPDATE automations SET run_status = 'running', last_error = NULL,
                    last_triggered_at = ? WHERE automation_id = ? AND enabled = 1
@@ -3774,7 +3782,7 @@ def create_automation_run(automation_id, config, reason):
 
 def start_automation_run_step(run_id, step_type, details=None):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with database_connection() as conn:
             sequence = conn.execute("""
                 SELECT COALESCE(MAX(sequence), 0) + 1
                 FROM automation_run_steps WHERE run_id = ?
@@ -3797,7 +3805,7 @@ def finish_automation_run_step(step_id, status, details=None, error=None):
     if step_id is None:
         return
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with database_connection() as conn:
             row = conn.execute(
                 "SELECT details_json FROM automation_run_steps WHERE step_id = ?",
                 (step_id,)
@@ -3827,7 +3835,7 @@ def finish_automation_run_step(step_id, status, details=None, error=None):
 
 def finish_automation_run(run_id, status, error=None):
     finished_at = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         if status in {"failed", "stopped", "interrupted"}:
             conn.execute("""
                 UPDATE automation_run_steps
@@ -3848,7 +3856,12 @@ def automation_device_metadata(device_id):
 
 
 def validate_automation_program(program):
-    if not isinstance(program, dict) or set(program) != {"version", "trigger", "body"} or program.get("version") != 1:
+    if (
+        not isinstance(program, dict)
+        or set(program) != {"version", "trigger", "body"}
+        or type(program.get("version")) is not int
+        or program["version"] != 1
+    ):
         return "Некорректный формат программы автоматизации."
     trigger = program.get("trigger")
     body = program.get("body")
@@ -3969,7 +3982,10 @@ def validate_automation_program(program):
             )
             if not comparable:
                 raise ValueError("Нельзя сравнить значения разных типов.")
-            if expression["operator"] not in {"eq", "ne"} and left_type in {"boolean", "enum", "null"}:
+            if (
+                expression["operator"] not in {"eq", "ne"}
+                and {left_type, right_type} & {"boolean", "enum", "null"}
+            ):
                 raise ValueError("Для этого типа допустима только проверка равенства.")
             return "boolean"
         raise ValueError("Неизвестный тип выражения.")
@@ -4011,8 +4027,8 @@ def validate_automation_program(program):
                 if (
                     set(statement) != {"type", "seconds"}
                     or type(seconds) not in (int, float)
-                    or not math.isfinite(seconds)
                     or not 0 <= seconds <= 3600
+                    or not math.isfinite(seconds)
                 ):
                     raise ValueError("Пауза должна быть числом от 0 до 3600 секунд.")
             elif kind == "if":
@@ -4034,23 +4050,27 @@ def validate_automation_program(program):
         if not 1 <= len(body) <= 100:
             return "В программе должно быть от 1 до 100 блоков действий."
         validate_statements(body)
-    except (TypeError, ValueError, KeyError) as error:
+    except (TypeError, ValueError, KeyError, OverflowError) as error:
         return str(error)
     return None
 
 
 def validate_automation_config(config):
     if isinstance(config, dict) and config.get("version") == 2:
-        if set(config) != {"version", "name", "workspace", "program"}:
+        if (
+            type(config["version"]) is not int
+            or set(config) != {"version", "name", "workspace", "program"}
+        ):
             return "Некорректная структура сценария."
         name = config.get("name")
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
             return "Укажите название сценария длиной от 1 до 80 символов."
         try:
             serialized = json.dumps(config, ensure_ascii=False, allow_nan=False)
+            serialized_size = len(serialized.encode("utf-8"))
         except (TypeError, ValueError, RecursionError):
             return "Сценарий содержит некорректные данные."
-        if len(serialized.encode("utf-8")) > 48 * 1024:
+        if serialized_size > 48 * 1024:
             return "Сценарий слишком большой (лимит 48 КБ)."
         workspace_state = config.get("workspace")
         if not isinstance(workspace_state, dict) or not isinstance(workspace_state.get("blocks"), dict):
@@ -4084,7 +4104,7 @@ def validate_automation_config(config):
         or not isinstance(operator, str)
         or operator not in {"above", "at_least", "below", "at_most"}
         or type(threshold) not in (int, float)
-        or not math.isfinite(threshold)
+        or (type(threshold) is float and not math.isfinite(threshold))
     ):
         return "Проверьте устройство, датчик и порог в блоке условия."
     source_schema = source_metadata.get("schema", {})
@@ -4141,7 +4161,7 @@ def save_automation(automation_id, config, enabled=True):
     if error:
         return False, error
     now = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         exists = conn.execute(
             "SELECT 1 FROM automations WHERE automation_id = ?", (automation_id,)
         ).fetchone()
@@ -4208,11 +4228,11 @@ def evaluate_automation_expression(expression):
     if kind == "compare":
         left = evaluate_automation_expression(expression["left"])
         right = evaluate_automation_expression(expression["right"])
+        operator = expression["operator"]
         if type(left) is not type(right) and not (
             type(left) in (int, float) and type(right) in (int, float)
         ):
-            return False
-        operator = expression["operator"]
+            return operator == "ne"
         if operator == "eq": return left == right
         if operator == "ne": return left != right
         if operator == "lt": return left < right
@@ -4478,7 +4498,7 @@ async def execute_automation_run(automation_id, config, reason, run_id):
         # Сценарий могли уже перезапустить. Завершение старого запуска не
         # должно сбрасывать состояние нового запуска или его запрос остановки.
         if automation_tasks.get(automation_id) is current_task:
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 conn.execute("""
                     UPDATE automations SET run_status = 'idle', last_run_status = ?,
                            last_error = ? WHERE automation_id = ?
@@ -4494,7 +4514,7 @@ async def execute_automation_run(automation_id, config, reason, run_id):
 def fire_automation_event(event_type, device_id=None, parameter=None, value=None):
     if database_restore_in_progress:
         return
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         rows = conn.execute("""
             SELECT automation_id, config_json FROM automations WHERE enabled = 1
         """).fetchall()
@@ -4511,7 +4531,7 @@ def fire_automation_event(event_type, device_id=None, parameter=None, value=None
                     and trigger.get("parameter") == parameter
                     and (
                         "value" not in trigger
-                        or automation_trigger_value_matches(value, trigger.get("value"))
+                        or schema_values_match(value, trigger.get("value"))
                     )
                 )
             elif event_type in {"device_connected", "device_disconnected"}:
@@ -4527,9 +4547,11 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
         return
     changed_parameters = {
         key for key, value in current_parameters.items()
-        if key not in previous_parameters or previous_parameters[key] != value
+        if key not in previous_parameters or not schema_values_match(previous_parameters[key], value)
     }
-    with sqlite3.connect(DB_PATH) as conn:
+    if not changed_parameters:
+        return
+    with database_connection() as conn:
         rows = conn.execute("""
             SELECT automation_id, config_json, last_triggered_at
             FROM automations WHERE enabled = 1
@@ -4549,7 +4571,7 @@ async def evaluate_automations(device_id, previous_parameters, current_parameter
                     value = current_parameters.get(parameter)
                     if (
                         "value" not in trigger
-                        or automation_trigger_value_matches(value, trigger["value"])
+                        or schema_values_match(value, trigger["value"])
                     ):
                         schedule_parameter_automation_trigger(
                             automation_id, config, device_id, parameter, value
@@ -4597,7 +4619,7 @@ def cancel_pending_automation_triggers_for_device(device_id):
 def automation_cooldown_remaining(automation_id, cooldown_seconds):
     if cooldown_seconds <= 0:
         return 0
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         row = conn.execute(
             "SELECT enabled, last_triggered_at FROM automations WHERE automation_id = ?",
             (automation_id,)
@@ -4640,7 +4662,7 @@ async def wait_for_stable_automation_trigger(
             await asyncio.sleep(stable_seconds)
 
         while automation_trigger_tasks.get(automation_id) is task:
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 row = conn.execute(
                     "SELECT enabled, config_json FROM automations WHERE automation_id = ?",
                     (automation_id,)
@@ -4659,11 +4681,11 @@ async def wait_for_stable_automation_trigger(
             if parameter not in current_parameters:
                 return
             current_value = current_parameters[parameter]
-            if not automation_trigger_value_matches(current_value, value):
+            if not schema_values_match(current_value, value):
                 return
             if (
                 "value" in trigger
-                and not automation_trigger_value_matches(current_value, trigger["value"])
+                and not schema_values_match(current_value, trigger["value"])
             ):
                 return
 
@@ -4692,7 +4714,7 @@ def finalize_restored_database():
     init_db()
     sync_device_configuration_exports()
     timestamp = current_time()
-    with sqlite3.connect(DB_PATH) as conn:
+    with database_connection() as conn:
         conn.execute("UPDATE devices SET connected = 0")
         conn.execute("""
             UPDATE command_queue
@@ -4700,7 +4722,6 @@ def finalize_restored_database():
                 error = 'Command queue cleared during database restore.'
             WHERE status IN ('queued', 'sent')
         """, (timestamp,))
-        conn.commit()
 
 
 async def restore_database_backup(backup_id):
@@ -4825,15 +4846,6 @@ async def restore_database_backup(backup_id):
     return False, "Database restore failed."
 
 
-def automation_trigger_value_matches(actual, expected):
-    if (
-        type(actual) in (int, float)
-        and type(expected) in (int, float)
-    ):
-        return actual == expected
-    return type(actual) is type(expected) and actual == expected
-
-
 async def handle_browser_message(websocket, message):
 
     action = message.get("action")
@@ -4858,7 +4870,7 @@ async def handle_browser_message(websocket, message):
         )
         exists = False
         if valid_id:
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 exists = conn.execute(
                     "SELECT 1 FROM automations WHERE automation_id = ?",
                     (automation_id,)
@@ -4886,7 +4898,7 @@ async def handle_browser_message(websocket, message):
         success = False
         result_message = "Запуск не найден."
         if valid:
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 row = conn.execute(
                     "SELECT status FROM automation_runs WHERE run_id = ? AND automation_id = ?",
                     (run_id, automation_id)
@@ -4933,7 +4945,7 @@ async def handle_browser_message(websocket, message):
         deleted_count = 0
         result_message = "Сценарий не найден."
         if valid:
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 exists = conn.execute(
                     "SELECT 1 FROM automations WHERE automation_id = ?",
@@ -4958,7 +4970,6 @@ async def handle_browser_message(websocket, message):
                         if deleted_count
                         else "Завершённых записей для удаления нет."
                     )
-                conn.commit()
         await send_json(websocket, {
             "type": "automation_run_clear_result",
             "success": success,
@@ -5009,7 +5020,7 @@ async def handle_browser_message(websocket, message):
         )
         success = False
         if valid:
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 cursor = conn.execute(
                     "UPDATE automations SET enabled = ?, updated_at = ? WHERE automation_id = ?",
                     (int(enabled), current_time(), automation_id)
@@ -5051,7 +5062,7 @@ async def handle_browser_message(websocket, message):
         if active_task is not None and not active_task.done():
             success = False
         elif isinstance(automation_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", automation_id):
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 cursor = conn.execute(
                     "DELETE FROM automations WHERE automation_id = ?", (automation_id,)
                 )
@@ -5125,12 +5136,11 @@ async def handle_browser_message(websocket, message):
                 "Подключение устройства запрещено.",
                 retry=False
             )
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 conn.execute(
                     "UPDATE devices SET connected = 0 WHERE device_id = ?",
                     (device_id,)
                 )
-                conn.commit()
             save_device_event(
                 device_id,
                 "connection",
@@ -5178,7 +5188,7 @@ async def handle_browser_message(websocket, message):
             })
             return
 
-        with sqlite3.connect(DB_PATH) as conn:
+        with database_connection() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM devices WHERE device_id = ?",
                 (device_id,)
@@ -5205,12 +5215,11 @@ async def handle_browser_message(websocket, message):
             "Доступ к устройству отозван.",
             retry=False
         )
-        with sqlite3.connect(DB_PATH) as conn:
+        with database_connection() as conn:
             conn.execute(
                 "UPDATE devices SET connected = 0 WHERE device_id = ?",
                 (device_id,)
             )
-            conn.commit()
         save_device_event(
             device_id,
             "connection",
@@ -5974,7 +5983,7 @@ async def handle_client(websocket):
                 old_connection = devices.get(device_id)
 
                 if device_id not in device_states:
-                    with sqlite3.connect(DB_PATH) as conn:
+                    with database_connection() as conn:
                         saved_state_row = conn.execute(
                             "SELECT state_json, led FROM devices WHERE device_id = ?",
                             (device_id,)
@@ -6160,7 +6169,7 @@ async def handle_client(websocket):
                         status = "failed"
                         result_error = "Устройство вернуло значение, не соответствующее Schema."
                         value = None
-                    elif success and value != operation["value"]:
+                    elif success and not schema_values_match(value, operation["value"]):
                         status = "failed"
                         result_error = "Устройство подтвердило значение, отличающееся от запрошенного."
                     elif success:
@@ -6204,7 +6213,7 @@ async def handle_client(websocket):
                         "parameters": device_states[device_id],
                         "last_seen": last_seen
                     })
-                    if parameter not in previous_parameters or previous_parameters[parameter] != value:
+                    if parameter not in previous_parameters or not schema_values_match(previous_parameters[parameter], value):
                         automation_state_change = (
                             previous_parameters,
                             dict(device_states[device_id])
@@ -6308,7 +6317,7 @@ async def handle_client(websocket):
 
                 previous_parameters = dict(device_states.get(device_id, {}))
                 telemetry_changed = any(
-                    key not in previous_parameters or previous_parameters[key] != value
+                    key not in previous_parameters or not schema_values_match(previous_parameters[key], value)
                     for key, value in accepted_parameters.items()
                 )
                 device_states[device_id] = {
@@ -6324,7 +6333,7 @@ async def handle_client(websocket):
                         pending["device"] == device_id
                         and operation["kind"] == "parameter"
                         and operation["name"] in accepted_parameters
-                        and accepted_parameters[operation["name"]] == operation["value"]
+                        and schema_values_match(accepted_parameters[operation["name"]], operation["value"])
                     ):
                         pending_state_echoes[operation["name"]] = pending
 
@@ -6423,13 +6432,12 @@ async def handle_client(websocket):
                 "Устройство отключилось до получения результата команды."
             )
 
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 conn.execute("""
                     UPDATE devices
                     SET connected = 0
                     WHERE device_id = ?
                 """, (device_id,))
-                conn.commit()
 
             save_device_event(
                 device_id,
@@ -6586,7 +6594,7 @@ async def console_loop():
                 )
 
         elif command == "history":
-            with sqlite3.connect(DB_PATH) as conn:
+            with database_connection() as conn:
                 rows = conn.execute("""
                     SELECT device_id, name, last_seen, state_json, led, connected,
                            firmware_version, schema_version
