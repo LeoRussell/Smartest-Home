@@ -1670,7 +1670,7 @@ body.nav-side .navigation-label {
 }
 
 .automation-card.is-disabled {
-    opacity: .72;
+    background: #e2e0d9;
 }
 
 .automation-card-copy {
@@ -1705,6 +1705,105 @@ body.nav-side .navigation-label {
     justify-content: flex-end;
     gap: 5px;
     min-width: 0;
+}
+
+.automation-enabled-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 5px;
+    border: 1px solid #808080;
+    background: #fff;
+    color: #000080;
+    font-size: 10px;
+    font-weight: 400;
+    vertical-align: middle;
+}
+
+.automation-list-tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 10px;
+    margin-bottom: 12px;
+    padding: 10px;
+    border: 2px inset #dfdfdf;
+    background: #c0c0c0;
+}
+
+.automation-list-tools label {
+    display: grid;
+    flex: 1 1 190px;
+    gap: 4px;
+    min-width: 0;
+    color: #111;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.automation-list-tools input,
+.automation-list-tools select {
+    width: 100%;
+    min-width: 0;
+}
+
+#automation-result-count {
+    flex: 1 1 100%;
+    color: #333;
+    font-size: 11px;
+}
+
+.automation-check-button {
+    border-color: #fff #404040 #404040 #fff;
+    background: #c0c0c0;
+    color: #000080;
+    font-weight: 700;
+}
+
+.automation-diagnostics {
+    flex: 1 1 100%;
+    min-width: 0;
+    margin-top: 8px;
+    padding: 10px;
+    border: 2px inset #dfdfdf;
+    border-left: 5px solid #000080;
+    background: #fff;
+    color: #111;
+    overflow-wrap: anywhere;
+}
+
+.automation-diagnostics.has-errors { border-left-color: #800000; }
+.automation-diagnostics.has-warnings { border-left-color: #805000; }
+.automation-diagnostics.is-ready { border-left-color: #006000; }
+
+.automation-diagnostics > strong {
+    display: block;
+    font-size: 12px;
+}
+
+.automation-diagnostics ul {
+    display: grid;
+    gap: 7px;
+    margin: 8px 0;
+    padding-left: 20px;
+}
+
+.automation-diagnostics li { font-size: 12px; }
+.automation-diagnostics li.is-error { color: #800000; }
+.automation-diagnostics li.is-warning { color: #654000; }
+
+.automation-diagnostics > small {
+    display: block;
+    margin-top: 7px;
+    color: #404040;
+    font-size: 10px;
+}
+
+.automation-diagnostic-device {
+    min-height: 22px;
+    margin-left: 7px;
+    padding: 1px 5px;
+    color: #000080;
+    font-size: 11px;
 }
 
 .device-modes {
@@ -1763,6 +1862,12 @@ body.nav-side .navigation-label {
     .automation-card {
         align-items: flex-start;
         flex-direction: column;
+        flex-wrap: nowrap;
+    }
+
+    .automation-card > * {
+        flex: 0 0 auto;
+        width: 100%;
     }
 
     .automation-card-actions {
@@ -3728,6 +3833,65 @@ body.nav-side .main-navigation {
     color: #c0c0c0;
 }
 
+.device-config-form [hidden] { display: none !important; }
+
+.device-config-saved-details {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 5px 12px;
+    margin: 0;
+    padding: 8px;
+    border: 2px inset #dfdfdf;
+    background: #e6e6e6;
+    font-size: 11px;
+}
+
+.device-config-saved-details > div { min-width: 0; }
+.device-config-saved-details dt { color: #333; }
+.device-config-saved-details dd { margin: 2px 0 0; color: #111; font-weight: 700; }
+.device-config-progress { width: 100%; height: 12px; accent-color: #000080; }
+.device-config-form .device-config-draft-status.is-dirty { color: #704200; font-weight: 700; }
+.device-config-status[data-state="failed"] { background: #ffe8e2; color: #800000; }
+.device-config-status[data-state="applied"] { background: #e6f2dd; color: #164400; }
+
+.device-config-add-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 8px;
+    border: 2px groove #fff;
+    background: #d4d0c8;
+}
+
+.device-config-preset { display: grid; gap: 4px; flex: 1 1 220px; font-size: 11px; font-weight: 700; }
+.device-config-preset select { min-height: 29px; width: 100%; min-width: 0; padding: 4px 6px; border: 2px inset #dfdfdf; border-radius: 0; background: #fff; color: #111; }
+.device-config-field-help { color: #333; font-size: 10px; font-weight: 400; line-height: 1.35; }
+.device-config-field-error { color: #800000; font-size: 11px; font-weight: 700; line-height: 1.35; }
+.device-config-field [aria-invalid="true"] { border-color: #a00000; background: #fff3f0; }
+.device-config-form .device-config-driver-help { margin-bottom: 8px; padding-bottom: 7px; border-bottom: 1px solid #a0a0a0; }
+.device-config-form .device-config-validation { padding: 7px; border: 1px solid #808080; background: #e6e6e6; font-weight: 700; }
+.device-config-form .device-config-validation[data-state="invalid"] { color: #800000; background: #fff0e9; }
+.device-config-form .device-config-validation[data-state="valid"] { color: #164400; background: #e6f2dd; }
+.device-config-errors { margin: 0; padding: 0 0 0 22px; color: #800000; font-size: 11px; }
+
+.device-config-preview { min-width: 0; padding: 10px; border: 2px groove #fff; background: #d4d0c8; }
+.device-config-preview h4 { margin: 0 0 5px; color: #000080; font-size: 12px; }
+.device-config-preview-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin: 8px 0; }
+.device-config-preview-item { display: grid; gap: 5px; min-width: 0; padding: 8px; border: 2px inset #dfdfdf; background: #fff; color: #111; font-size: 11px; }
+.device-config-preview-item small { color: #333; }
+.device-config-preview-item input[type="range"] { display: block; width: 100%; }
+.device-config-preview-control { width: fit-content; padding: 4px 8px; border: 2px outset #dfdfdf; background: #c0c0c0; font-weight: 700; }
+.device-config-files { min-width: 0; padding: 8px; border: 2px groove #fff; }
+.device-config-files summary { color: #000080; font-size: 11px; font-weight: 700; cursor: pointer; }
+.device-config-files[open] > :not(summary) { margin-top: 8px; }
+.device-config-actions { position: sticky; bottom: 0; z-index: 1; flex-wrap: wrap; padding: 8px 0 0; border-top: 1px solid #808080; background: #c0c0c0; }
+.device-config-actions button { flex: 1 1 150px; }
+.device-config-actions .device-config-save:hover:not(:disabled) { background: #0000a0; color: #fff; }
+.device-config-card-status { margin: 4px 0 0; color: #333; font-size: 10px; }
+.device-config-card-status[data-state="failed"] { color: #800000; font-weight: 700; }
+.device-config-card-status[data-state="applied"] { color: #164400; }
+
 @media (max-width: 680px) {
     .device-config-fields {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3738,4 +3902,6 @@ body.nav-side .main-navigation {
     .device-config-fields {
         grid-template-columns: minmax(0, 1fr);
     }
+    .device-config-preview-list { grid-template-columns: minmax(0, 1fr); }
+    .device-config-saved-details { grid-template-columns: minmax(0, 1fr); }
 }

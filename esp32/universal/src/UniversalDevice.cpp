@@ -46,12 +46,27 @@ void detachPwm(uint8_t pin) {
 #endif
 }
 
-bool copyString(JsonVariantConst value, char* destination, size_t capacity) {
+bool containsControlCharacters(JsonString value) {
+    const unsigned char* bytes = reinterpret_cast<const unsigned char*>(value.c_str());
+    for (size_t index = 0; index < value.size(); ++index) {
+        if (bytes[index] < 0x20 || bytes[index] == 0x7F ||
+            (bytes[index] == 0xC2 && index + 1 < value.size() &&
+             bytes[index + 1] >= 0x80 && bytes[index + 1] <= 0x9F)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool copyString(JsonVariantConst value, char* destination, size_t capacity,
+                bool allowEmpty = false) {
     if (!value.is<const char*>()) return false;
-    const char* source = value.as<const char*>();
-    const size_t length = strnlen(source, capacity);
-    if (length == 0 || length >= capacity) return false;
-    memcpy(destination, source, length + 1);
+    const JsonString source = value.as<JsonString>();
+    const size_t length = source.size();
+    if ((!allowEmpty && length == 0) || length >= capacity ||
+        containsControlCharacters(source)) return false;
+    memcpy(destination, source.c_str(), length);
+    destination[length] = '\0';
     return true;
 }
 
@@ -261,8 +276,9 @@ bool UniversalDevice::parseAndValidate(
     }
     for (JsonPairConst pair : root) {
         const char* key = pair.key().c_str();
-        if (strcmp(key, "format_version") != 0 && strcmp(key, "components") != 0 &&
-            strcmp(key, "identify_indicator") != 0) {
+        if (containsControlCharacters(pair.key()) ||
+            (strcmp(key, "format_version") != 0 && strcmp(key, "components") != 0 &&
+             strcmp(key, "identify_indicator") != 0)) {
             error = "configuration contains an unsupported field";
             return false;
         }
@@ -276,6 +292,14 @@ bool UniversalDevice::parseAndValidate(
             return false;
         }
         JsonObjectConst indicator = identifyValue.as<JsonObjectConst>();
+        for (JsonPairConst pair : indicator) {
+            if (containsControlCharacters(pair.key()) ||
+                (pair.value().is<const char*>() &&
+                 containsControlCharacters(pair.value().as<JsonString>()))) {
+                error = "identify indicator contains a control character";
+                return false;
+            }
+        }
         const char* driver = indicator["driver"] | "";
         JsonVariantConst builtInValue = indicator["built_in"];
         if (!builtInValue.isUnbound() && !isBool(builtInValue)) {
@@ -348,6 +372,14 @@ bool UniversalDevice::parseAndValidate(
             return false;
         }
         JsonObjectConst source = raw.as<JsonObjectConst>();
+        for (JsonPairConst pair : source) {
+            if (containsControlCharacters(pair.key()) ||
+                (pair.value().is<const char*>() &&
+                 containsControlCharacters(pair.value().as<JsonString>()))) {
+                error = "component text contains a control character";
+                return false;
+            }
+        }
         const char* driverName = source["driver"] | "";
         Component component;
         if (strcmp(driverName, "gpio_output") == 0) {
@@ -443,13 +475,13 @@ bool UniversalDevice::parseAndValidate(
             const int rawMaximum = rawMaximumValue.isUnbound() ? 4095 : rawMaximumValue.as<int>();
             const int valueMinimum = valueMinimumValue.isUnbound() ? 0 : valueMinimumValue.as<int>();
             const int valueMaximum = valueMaximumValue.isUnbound() ? 4095 : valueMaximumValue.as<int>();
-            if (!unitValue.isUnbound() && !unitValue.is<const char*>()) {
-                error = "ADC unit must be a string";
+            if (!unitValue.isUnbound() &&
+                !copyString(unitValue, component.unit, sizeof(component.unit), true)) {
+                error = "ADC unit must be a string of at most 24 bytes without control characters";
                 return false;
             }
-            const char* unit = unitValue.isUnbound() ? "raw" : unitValue.as<const char*>();
             if (!isAllowedAdcPin(component.pin) || !isInteger(source["interval_ms"]) ||
-                interval < 250 || interval > 60000 || strnlen(unit, 25) > 24 ||
+                interval < 250 || interval > 60000 ||
                 (!rawMinimumValue.isUnbound() && !isInteger(rawMinimumValue)) ||
                 (!rawMaximumValue.isUnbound() && !isInteger(rawMaximumValue)) ||
                 (!valueMinimumValue.isUnbound() && !isInteger(valueMinimumValue)) ||
@@ -460,8 +492,7 @@ bool UniversalDevice::parseAndValidate(
                 error = "ADC pin, scale range, unit or polling interval is invalid";
                 return false;
             }
-            strlcpy(component.unit, unit[0] == '\0' ? "raw" : unit,
-                    sizeof(component.unit));
+            if (component.unit[0] == '\0') strlcpy(component.unit, "raw", sizeof(component.unit));
             component.intervalMs = static_cast<uint32_t>(interval);
             component.rawMinimum = rawMinimum;
             component.rawMaximum = rawMaximum;
@@ -529,6 +560,12 @@ bool UniversalDevice::applyConfiguration(
         return false;
     }
 
+    const bool identicalConfiguration = configured_ && configurationHash_ == hash;
+    if (identicalConfiguration && version == configurationVersion_) {
+        Serial.println("[CONFIG] Configuration is already active; GPIO and NVS unchanged.");
+        return true;
+    }
+
     for (uint8_t newIndex = 0; newIndex < parsedCount; ++newIndex) {
         Component& next = parsed[newIndex];
         for (uint8_t oldIndex = 0; oldIndex < componentCount_; ++oldIndex) {
@@ -562,6 +599,10 @@ bool UniversalDevice::applyConfiguration(
     if (preferences_.putString("envelope", serialized) != serialized.length()) {
         error = "configuration could not be saved to NVS";
         return false;
+    }
+    if (identicalConfiguration) {
+        configurationVersion_ = version;
+        return true;
     }
 
     if (identifyRunning_) {
@@ -849,9 +890,8 @@ int32_t UniversalDevice::scaleAnalogValue(
     return static_cast<int32_t>(component.minimumValue + scaledOffset);
 }
 
-void UniversalDevice::loop(GatewayClient& gateway) {
+void UniversalDevice::loop(GatewayClient& gateway, bool registered) {
     updateIdentify();
-    if (!gateway.isConnected()) return;
     const unsigned long now = millis();
     bool changed = false;
     for (uint8_t index = 0; index < componentCount_; ++index) {
@@ -862,7 +902,8 @@ void UniversalDevice::loop(GatewayClient& gateway) {
         component.lastPollAt = now;
         changed = readComponent(component) || changed;
     }
-    if (changed || now - lastHeartbeatAt_ >= HEARTBEAT_INTERVAL_MS) {
+    if (registered && gateway.isConnected() &&
+        (changed || now - lastHeartbeatAt_ >= HEARTBEAT_INTERVAL_MS)) {
         sendState(gateway);
     }
 }
@@ -962,10 +1003,8 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
         const char* hash = message["config_hash"] | "";
         String error;
         const bool targetMatches = target[0] == '\0' || strcmp(target, UNIVERSAL_DEVICE_ID) == 0;
-        const bool alreadyApplied = targetMatches && configured_ &&
-            version == configurationVersion_ && configurationHash_ == hash;
-        const bool success = targetMatches && (alreadyApplied ||
-            applyConfiguration(message["configuration"], version, hash, error));
+        const bool success = targetMatches &&
+            applyConfiguration(message["configuration"], version, hash, error);
         if (!targetMatches) error = "configuration is addressed to another device";
         sendConfigurationResult(
             gateway, version, hash, success, success ? nullptr : error.c_str()
@@ -991,6 +1030,7 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
     JsonObject data = result["data"].to<JsonObject>();
     bool success = false;
     String error;
+    if (!configured_) error = "device has no applied hardware configuration";
     if (strcmp(commandName, "set") == 0) {
         const char* parameter = message["data"]["parameter"] | "";
         JsonVariant applied = data["value"];

@@ -32,7 +32,9 @@ bool publishedModeStatuses[MAX_REGISTERED_MODES] = {};
 
 size_t registeredModeCount() {
     size_t count = 0;
-    while (count < MAX_REGISTERED_MODES && deviceModes[count].id != nullptr) ++count;
+    const size_t registrationSlots = sizeof(deviceModes) / sizeof(deviceModes[0]);
+    while (count < MAX_REGISTERED_MODES && count < registrationSlots &&
+           deviceModes[count].id != nullptr) ++count;
     return count;
 }
 

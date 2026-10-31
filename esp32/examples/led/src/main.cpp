@@ -22,6 +22,7 @@ bool commandCacheReady = false;
 unsigned long lastStateSentAt = 0;
 uint32_t stateSequence = 0;
 bool ledState = false;
+bool gatewayRegistered = false;
 bool identifyRunning = false;
 bool identifyOn = false;
 unsigned int identifyPulsesRemaining = 0;
@@ -270,9 +271,8 @@ void onWebSocketEvent(
     switch (type) {
         case WStype_CONNECTED:
             Serial.println("WebSocket connected!");
+            gatewayRegistered = false;
             sendHello();
-            sendState(ledState);
-            lastStateSentAt = millis();
             break;
 
         case WStype_TEXT: {
@@ -286,6 +286,13 @@ void onWebSocketEvent(
             }
 
             const char* typeName = doc["type"] | "";
+            if (strcmp(typeName, "hello_ack") == 0) {
+                gatewayRegistered = true;
+                sendState(ledState);
+                lastStateSentAt = millis();
+                break;
+            }
+            if (!gatewayRegistered) break;
 
             if (strcmp(typeName, "command") == 0) {
                 const char* commandName = doc["data"]["command"] | "set";
@@ -392,6 +399,7 @@ void onWebSocketEvent(
         }
 
         case WStype_DISCONNECTED:
+            gatewayRegistered = false;
             Serial.println("WebSocket disconnected");
             break;
 
@@ -406,6 +414,10 @@ void onWebSocketEvent(
 
 void setup() {
     Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+    // A closed or unread native USB console must not stall network processing.
+    Serial.setTxTimeoutMs(1);
+#endif
     // Keep acknowledgements from older firmware behavior out of this cache.
     commandCacheReady = commandCache.begin("command_ack_v2", false);
     loadCommandResults();
@@ -425,7 +437,7 @@ void loop() {
     updateIdentify();
     const unsigned long now = millis();
     if (
-        gateway.isConnected() &&
+        gatewayRegistered && gateway.isConnected() &&
         now - lastStateSentAt >= STATE_INTERVAL_MS
     ) {
         sendState(ledState, false);

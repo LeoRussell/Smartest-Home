@@ -132,10 +132,32 @@
                         <form id="automation-editor-form" class="automation-form">
                             <label class="automation-name-field"><span data-ru="Название сценария" data-en="Scenario name">Название сценария</span><input id="automation-name" maxlength="80" required placeholder="Сценарий автоматизации" data-placeholder-ru="Сценарий автоматизации" data-placeholder-en="Automation scenario"></label>
                             <div id="automation-workspace" class="automation-workspace" role="application" aria-label="Визуальный редактор автоматизаций"></div>
-                            <div class="automation-form-actions"><button id="automation-undo" class="automation-history-button" type="button" disabled data-ru="Отменить изменение" data-en="Undo change">Отменить изменение</button><button id="automation-redo" class="automation-history-button" type="button" disabled data-ru="Вернуть изменение" data-en="Redo change">Вернуть изменение</button><button id="automation-save-button" class="refresh-button" type="submit" data-ru="Сохранить сценарий" data-en="Save scenario">Сохранить сценарий</button><button id="automation-clear" class="event-action-button" type="button" data-ru="Очистить блоки" data-en="Clear blocks">Очистить блоки</button><button id="automation-cancel-edit" class="event-action-button" type="button" hidden data-ru="Отменить редактирование" data-en="Cancel editing">Отменить редактирование</button><span id="automation-feedback" aria-live="polite"></span></div>
+                            <div class="automation-form-actions">
+                                <button id="automation-undo" class="automation-history-button" type="button" disabled data-ru="Отменить изменение" data-en="Undo change">Отменить изменение</button>
+                                <button id="automation-redo" class="automation-history-button" type="button" disabled data-ru="Вернуть изменение" data-en="Redo change">Вернуть изменение</button>
+                                <button id="automation-check-draft" class="automation-history-button" type="button" disabled data-ru="Проверить сценарий" data-en="Check scenario">Проверить сценарий</button>
+                                <button id="automation-save-button" class="refresh-button" type="submit" data-ru="Сохранить сценарий" data-en="Save scenario">Сохранить сценарий</button>
+                                <button id="automation-clear" class="event-action-button" type="button" data-ru="Очистить блоки" data-en="Clear blocks">Очистить блоки</button>
+                                <button id="automation-cancel-edit" class="event-action-button" type="button" hidden data-ru="Отменить редактирование" data-en="Cancel editing">Отменить редактирование</button>
+                                <span id="automation-feedback" aria-live="polite"></span>
+                            </div>
                         </form>
+                        <div id="automation-editor-diagnostics" hidden></div>
                     </section>
-                    <section class="automation-list-section"><h2 data-ru="Сценарии" data-en="Scenarios">Сценарии</h2><div id="automation-list" class="automation-list"></div></section>
+                    <section class="automation-list-section">
+                        <h2 data-ru="Сценарии" data-en="Scenarios">Сценарии</h2>
+                        <div class="automation-list-tools">
+                            <label><span data-ru="Найти сценарий" data-en="Find a scenario">Найти сценарий</span><input id="automation-search" type="search" maxlength="120" autocomplete="off"></label>
+                            <label><span data-ru="Показать" data-en="Show">Показать</span><select id="automation-filter">
+                                <option value="all" data-ru="Все сценарии" data-en="All scenarios">Все сценарии</option>
+                                <option value="enabled" data-ru="Включённые" data-en="Enabled">Включённые</option>
+                                <option value="disabled" data-ru="Отключённые" data-en="Disabled">Отключённые</option>
+                                <option value="attention" data-ru="Требуют внимания" data-en="Need attention">Требуют внимания</option>
+                            </select></label>
+                            <span id="automation-result-count" role="status" aria-live="polite"></span>
+                        </div>
+                        <div id="automation-list" class="automation-list"></div>
+                    </section>
                 </section>
 
                 <section id="events-page" class="page-panel" data-page-panel="events" role="tabpanel" aria-labelledby="tab-events" hidden>
@@ -286,6 +308,7 @@
     <script src="vendor/blockly/msg/ru.js"></script>
     <script>window.BlocklyLocales.ru = { ...Blockly.Msg };</script>
     <script src="automation-blockly.js"></script>
+    <script src="automation-diagnostics.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

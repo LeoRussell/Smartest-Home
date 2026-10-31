@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import json
 import sqlite3
@@ -22,6 +23,8 @@ class TemporaryGatewayDatabase:
             ("device_states", {}), ("device_wire_ids", {}),
             ("device_handler_tasks", set()), ("browser_clients", set()),
             ("last_device_heartbeat", {}), ("fresh_device_parameters", {}),
+            ("last_device_telemetry", {}), ("last_parameter_telemetry", {}),
+            ("last_device_probe", {}),
             ("pending_commands", {}), ("pending_device_connections", {}),
             ("pending_device_schemas", {}), ("deferred_device_schemas", {}),
             ("deferred_connection_automations", set()),
@@ -145,7 +148,7 @@ class DatabaseConnectionTests(TemporaryGatewayDatabase, unittest.TestCase):
         self.assertFalse(changed)
 
 
-class AutomationValidationTests(unittest.TestCase):
+class AutomationValidationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.program = {
             "version": 1,
@@ -188,7 +191,7 @@ class AutomationValidationTests(unittest.TestCase):
                 }]
                 self.assertIsNotNone(gateway.validate_automation_program(self.program))
 
-    def test_enum_inequality_distinguishes_boolean_from_integer(self):
+    async def test_enum_inequality_distinguishes_boolean_from_integer(self):
         metadata = {"lamp": {"schema": {"parameters": {
             "mode": {"type": "enum", "access": "read_only", "options": [
                 {"label": "Boolean", "value": True}, {"label": "Integer", "value": 1}
@@ -204,6 +207,9 @@ class AutomationValidationTests(unittest.TestCase):
             patch.object(gateway, "device_metadata", metadata),
             patch.object(gateway, "device_states", {"lamp": {"mode": True}}),
             patch.object(gateway, "fresh_device_parameters", {"lamp": {"mode"}}),
+            patch.object(gateway, "last_parameter_telemetry", {
+                "lamp": {"mode": asyncio.get_running_loop().time()}
+            }),
         ):
             self.assertTrue(gateway.evaluate_automation_expression(expression))
             expression["operator"] = "eq"

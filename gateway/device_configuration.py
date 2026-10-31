@@ -65,6 +65,19 @@ MAX_COMPONENTS = 8
 MAX_CONFIGURATION_BYTES = 3000
 
 
+class ConfigurationValidationError(str):
+    """Keep the existing text error contract while identifying its form field."""
+
+    def __new__(cls, message, path):
+        instance = super().__new__(cls, message)
+        instance.path = path
+        return instance
+
+
+def configuration_error(path, message):
+    return None, None, ConfigurationValidationError(message, path)
+
+
 def public_driver_catalog(driver_ids):
     """Return only known drivers actually advertised by this firmware."""
     if not isinstance(driver_ids, list):
@@ -85,13 +98,13 @@ def validate_device_configuration(configuration, driver_ids):
         or not {"format_version", "components"}.issubset(configuration)
         or set(configuration) - {"format_version", "components", "identify_indicator"}
     ):
-        return None, None, "Конфигурация должна содержать format_version и components."
+        return configuration_error("configuration", "Конфигурация должна содержать format_version и components.")
     if type(configuration.get("format_version")) is not int or configuration["format_version"] != 1:
-        return None, None, "Поддерживается только версия конфигурации 1."
+        return configuration_error("format_version", "Поддерживается только версия конфигурации 1.")
 
     components = configuration.get("components")
     if not isinstance(components, list) or len(components) > MAX_COMPONENTS:
-        return None, None, f"Можно настроить от 0 до {MAX_COMPONENTS} компонентов."
+        return configuration_error("components", f"Можно настроить от 0 до {MAX_COMPONENTS} компонентов.")
 
     advertised = {
         driver_id for driver_id in driver_ids
@@ -105,12 +118,12 @@ def validate_device_configuration(configuration, driver_ids):
     normalized_indicator = None
     if identify_indicator is not None:
         if not isinstance(identify_indicator, dict):
-            return None, None, "Identify indicator must be an object."
+            return configuration_error("identify_indicator", "Identify indicator must be an object.")
         indicator_driver = identify_indicator.get("driver")
         indicator_pin = identify_indicator.get("pin")
         built_in = identify_indicator.get("built_in", indicator_driver == "neopixel")
         if type(built_in) is not bool:
-            return None, None, "Identify indicator built_in must be boolean."
+            return configuration_error("identify_indicator.built_in", "Identify indicator built_in must be boolean.")
         if indicator_driver == "gpio":
             if (
                 set(identify_indicator) - {"driver", "pin", "active_high", "built_in"}
@@ -118,7 +131,8 @@ def validate_device_configuration(configuration, driver_ids):
                 or type(indicator_pin) is not int or indicator_pin not in GPIO_PINS
                 or type(identify_indicator.get("active_high")) is not bool
             ):
-                return None, None, "GPIO identify indicator requires a supported GPIO and boolean active_high."
+                path = "identify_indicator.pin" if type(indicator_pin) is not int or indicator_pin not in GPIO_PINS else "identify_indicator.active_high"
+                return configuration_error(path, "GPIO identify indicator requires a supported GPIO and boolean active_high.")
             normalized_indicator = {
                 "driver": "gpio", "pin": indicator_pin,
                 "active_high": identify_indicator["active_high"],
@@ -132,16 +146,17 @@ def validate_device_configuration(configuration, driver_ids):
                 or type(identify_indicator.get("brightness")) is not int
                 or not 1 <= identify_indicator["brightness"] <= 255
             ):
-                return None, None, "NeoPixel identify indicator requires GPIO 38 or 48 and brightness 1..255."
+                path = "identify_indicator.pin" if type(indicator_pin) is not int or indicator_pin not in (38, 48) else "identify_indicator.brightness"
+                return configuration_error(path, "NeoPixel identify indicator requires GPIO 38 or 48 and brightness 1..255.")
             normalized_indicator = {
                 "driver": "neopixel", "pin": indicator_pin,
                 "brightness": identify_indicator["brightness"],
                 "built_in": built_in
             }
         else:
-            return None, None, "Identify indicator driver must be gpio or neopixel."
+            return configuration_error("identify_indicator.driver", "Identify indicator driver must be gpio or neopixel.")
         if indicator_pin in used_pins:
-            return None, None, f"GPIO {indicator_pin} is already assigned to another component."
+            return configuration_error("identify_indicator.pin", f"GPIO {indicator_pin} is already assigned to another component.")
         used_pins.add(indicator_pin)
     schema = {
         "format_version": 1,
@@ -152,55 +167,56 @@ def validate_device_configuration(configuration, driver_ids):
     }
 
     for index, raw in enumerate(components, start=1):
+        prefix = f"components.{index - 1}"
         if not isinstance(raw, dict):
-            return None, None, f"Компонент {index}: ожидается объект."
+            return configuration_error(prefix, f"Компонент {index}: ожидается объект.")
         driver_id = raw.get("driver")
         if not isinstance(driver_id, str):
-            return None, None, f"Компонент {index}: укажите ID драйвера строкой."
+            return configuration_error(f"{prefix}.driver", f"Компонент {index}: укажите ID драйвера строкой.")
         driver = DRIVERS.get(driver_id)
         if driver is None or driver_id not in advertised:
-            return None, None, f"Компонент {index}: прошивка не объявила драйвер {driver_id!r}."
+            return configuration_error(f"{prefix}.driver", f"Компонент {index}: прошивка не объявила драйвер {driver_id!r}.")
 
         allowed_keys = {
             "id", "driver", "label", "parameter_id", "parameter_label", "pin"
         } | set(driver["fields"])
         if set(raw) - allowed_keys:
-            return None, None, f"Компонент {index}: найдены неподдерживаемые поля."
+            return configuration_error(prefix, f"Компонент {index}: найдены неподдерживаемые поля.")
 
         component_id = raw.get("id")
         parameter_id = raw.get("parameter_id")
         label = raw.get("label")
         parameter_label = raw.get("parameter_label")
         if not isinstance(component_id, str) or not DEVICE_ID_PATTERN.fullmatch(component_id):
-            return None, None, f"Компонент {index}: некорректный ID."
+            return configuration_error(f"{prefix}.id", f"Компонент {index}: некорректный ID.")
         if component_id in component_ids:
-            return None, None, f"ID компонента {component_id!r} повторяется."
+            return configuration_error(f"{prefix}.id", f"ID компонента {component_id!r} повторяется.")
         if not isinstance(parameter_id, str) or not DEVICE_ID_PATTERN.fullmatch(parameter_id):
-            return None, None, f"Компонент {component_id}: некорректный ID параметра."
+            return configuration_error(f"{prefix}.parameter_id", f"Компонент {component_id}: некорректный ID параметра.")
         if parameter_id in parameter_ids:
-            return None, None, f"ID параметра {parameter_id!r} повторяется."
+            return configuration_error(f"{prefix}.parameter_id", f"ID параметра {parameter_id!r} повторяется.")
         if not isinstance(label, str) or not 1 <= len(label.strip()) <= 80:
-            return None, None, f"Компонент {component_id}: укажите название до 80 символов."
+            return configuration_error(f"{prefix}.label", f"Компонент {component_id}: укажите название до 80 символов.")
         if not isinstance(parameter_label, str) or not 1 <= len(parameter_label.strip()) <= 80:
-            return None, None, f"Компонент {component_id}: укажите название параметра до 80 символов."
+            return configuration_error(f"{prefix}.parameter_label", f"Компонент {component_id}: укажите название параметра до 80 символов.")
         try:
             label_bytes = len(label.strip().encode("utf-8"))
             parameter_label_bytes = len(parameter_label.strip().encode("utf-8"))
         except UnicodeEncodeError:
-            return None, None, f"Компонент {component_id}: названия должны содержать корректный UTF-8 текст."
+            return configuration_error(prefix, f"Компонент {component_id}: названия должны содержать корректный UTF-8 текст.")
         if any(
             unicodedata.category(character) == "Cc"
             for character in label + parameter_label
         ):
-            return None, None, f"Компонент {component_id}: в названиях нельзя использовать управляющие символы."
+            return configuration_error(prefix, f"Компонент {component_id}: в названиях нельзя использовать управляющие символы.")
         if label_bytes > 80 or parameter_label_bytes > 80:
-            return None, None, f"Компонент {component_id}: каждое название должно занимать не более 80 байт UTF-8."
+            return configuration_error(prefix, f"Компонент {component_id}: каждое название должно занимать не более 80 байт UTF-8.")
 
         pin = raw.get("pin")
         if type(pin) is not int or pin not in driver["pins"]:
-            return None, None, f"Компонент {component_id}: GPIO не поддерживается драйвером {driver_id}."
+            return configuration_error(f"{prefix}.pin", f"Компонент {component_id}: GPIO не поддерживается драйвером {driver_id}.")
         if pin in used_pins:
-            return None, None, f"GPIO {pin} назначен нескольким компонентам."
+            return configuration_error(f"{prefix}.pin", f"GPIO {pin} назначен нескольким компонентам.")
 
         component = {
             "id": component_id,
@@ -212,7 +228,7 @@ def validate_device_configuration(configuration, driver_ids):
         }
         if driver_id == "gpio_output":
             if type(raw.get("active_high")) is not bool or type(raw.get("initial_value")) is not bool:
-                return None, None, f"Компонент {component_id}: active_high и initial_value должны быть boolean."
+                return configuration_error(f"{prefix}.active_high" if type(raw.get("active_high")) is not bool else f"{prefix}.initial_value", f"Компонент {component_id}: active_high и initial_value должны быть boolean.")
             component.update({
                 "active_high": raw["active_high"],
                 "initial_value": raw["initial_value"]
@@ -221,9 +237,9 @@ def validate_device_configuration(configuration, driver_ids):
             pull = raw.get("pull")
             interval = raw.get("interval_ms")
             if not isinstance(pull, str) or pull not in ALLOWED_PULLS:
-                return None, None, f"Компонент {component_id}: pull должен быть none, up или down."
+                return configuration_error(f"{prefix}.pull", f"Компонент {component_id}: pull должен быть none, up или down.")
             if type(interval) is not int or not 100 <= interval <= 60000:
-                return None, None, f"Компонент {component_id}: интервал должен быть от 100 до 60000 мс."
+                return configuration_error(f"{prefix}.interval_ms", f"Компонент {component_id}: интервал должен быть от 100 до 60000 мс.")
             component.update({"pull": pull, "interval_ms": interval})
         elif driver_id == "analog_input":
             interval = raw.get("interval_ms")
@@ -233,24 +249,32 @@ def validate_device_configuration(configuration, driver_ids):
             value_min = raw.get("value_min", 0)
             value_max = raw.get("value_max", 4095)
             if type(interval) is not int or not 250 <= interval <= 60000:
-                return None, None, f"Компонент {component_id}: интервал должен быть от 250 до 60000 мс."
+                return configuration_error(f"{prefix}.interval_ms", f"Компонент {component_id}: интервал должен быть от 250 до 60000 мс.")
             if (
                 type(raw_min) is not int or type(raw_max) is not int
                 or not 0 <= raw_min < raw_max <= 4095
                 or type(value_min) is not int or type(value_max) is not int
                 or not -1_000_000 <= value_min < value_max <= 1_000_000
             ):
-                return None, None, f"Компонент {component_id}: укажите упорядоченные raw и итоговые диапазоны."
+                if type(raw_min) is not int or not 0 <= raw_min <= 4095:
+                    field = "raw_min"
+                elif type(raw_max) is not int or not raw_min < raw_max <= 4095:
+                    field = "raw_max"
+                elif type(value_min) is not int or not -1_000_000 <= value_min <= 1_000_000:
+                    field = "value_min"
+                else:
+                    field = "value_max"
+                return configuration_error(f"{prefix}.{field}", f"Компонент {component_id}: укажите упорядоченные raw и итоговые диапазоны.")
             if not isinstance(unit, str):
-                return None, None, f"Компонент {component_id}: единица измерения должна быть текстом."
+                return configuration_error(f"{prefix}.unit", f"Компонент {component_id}: единица измерения должна быть текстом.")
             try:
                 unit_bytes = len(unit.strip().encode("utf-8"))
             except UnicodeEncodeError:
-                return None, None, f"Компонент {component_id}: единица измерения должна содержать корректный UTF-8 текст."
+                return configuration_error(f"{prefix}.unit", f"Компонент {component_id}: единица измерения должна содержать корректный UTF-8 текст.")
             if any(unicodedata.category(character) == "Cc" for character in unit):
-                return None, None, f"Компонент {component_id}: в единице измерения нельзя использовать управляющие символы."
+                return configuration_error(f"{prefix}.unit", f"Компонент {component_id}: в единице измерения нельзя использовать управляющие символы.")
             if unit_bytes > 24:
-                return None, None, f"Компонент {component_id}: единица измерения должна занимать не более 24 байт UTF-8."
+                return configuration_error(f"{prefix}.unit", f"Компонент {component_id}: единица измерения должна занимать не более 24 байт UTF-8.")
             component.update({
                 "interval_ms": interval,
                 "unit": unit.strip() or "raw",
@@ -269,7 +293,13 @@ def validate_device_configuration(configuration, driver_ids):
                 or type(initial_value) is not int
                 or not minimum <= initial_value <= maximum
             ):
-                return None, None, f"Компонент {component_id}: PWM диапазон должен быть внутри 0–255, а начальное значение — внутри выбранного диапазона."
+                if type(minimum) is not int or not 0 <= minimum < 255:
+                    field = "min_value"
+                elif type(maximum) is not int or not minimum < maximum <= 255:
+                    field = "max_value"
+                else:
+                    field = "initial_value"
+                return configuration_error(f"{prefix}.{field}", f"Компонент {component_id}: PWM диапазон должен быть внутри 0–255, а начальное значение — внутри выбранного диапазона.")
             component.update({
                 "initial_value": initial_value,
                 "min_value": minimum,
@@ -326,5 +356,5 @@ def validate_device_configuration(configuration, driver_ids):
         normalized_configuration, ensure_ascii=False, separators=(",", ":"),
         allow_nan=False
     ).encode("utf-8")) > MAX_CONFIGURATION_BYTES:
-        return None, None, f"Размер конфигурации не должен превышать {MAX_CONFIGURATION_BYTES} байт."
+        return configuration_error("configuration", f"Размер конфигурации не должен превышать {MAX_CONFIGURATION_BYTES} байт.")
     return normalized_configuration, schema, None

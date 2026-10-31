@@ -67,11 +67,16 @@ browser_clients = set()
 device_states = {}
 device_metadata = {}
 last_device_heartbeat = {}
+last_device_telemetry = {}
+last_parameter_telemetry = {}
+last_device_probe = {}
 fresh_device_parameters = {}
 deferred_connection_automations = set()
 pending_device_schemas = {}
 deferred_device_schemas = {}
 pending_device_connections = {}
+configuration_apply_tasks = {}
+configuration_confirmed_devices = set()
 
 # Команды, ожидающие результата: command_id -> контекст команды.
 pending_commands = {}
@@ -85,10 +90,14 @@ automation_restart_tasks = set()
 COMMAND_TIMEOUT_SECONDS = 5
 EVENTS_PAGE_SIZE = 30
 DEVICE_STALE_SECONDS = 45
+DEVICE_TRANSPORT_IDLE_SECONDS = 45
+DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS = 20
 MAX_WEBSOCKET_MESSAGE_BYTES = 64 * 1024
 MAX_SCHEMA_BYTES = 60 * 1024
 DEVICE_APPROVAL_TIMEOUT_SECONDS = 180
 COMMAND_RETRY_LIMIT = 3
+CONFIGURATION_APPLY_TIMEOUT_SECONDS = 20
+MAX_CONFIGURATION_VERSION = 0xFFFFFFFF
 
 # =========================
 # ВРЕМЯ
@@ -199,6 +208,17 @@ def init_db():
                 status TEXT NOT NULL
             )
         """)
+        configuration_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(device_configurations)")
+        }
+        if "applied_version" not in configuration_columns:
+            conn.execute(
+                "ALTER TABLE device_configurations ADD COLUMN applied_version INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.execute("""
+                UPDATE device_configurations SET applied_version = config_version
+                WHERE status = 'applied' AND applied_at IS NOT NULL
+            """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_device_configuration_history_device
             ON device_configuration_history (device_id, id DESC)
@@ -1340,6 +1360,35 @@ def validate_parameter_ui_preferences(preferences, schema):
     return normalized, None
 
 
+def validate_device_configuration_request(device_id, configuration, ui_preferences=None):
+    metadata = automation_device_metadata(device_id)
+    if metadata is None or metadata.get("device_profile") != "universal":
+        return None, None, None, [{
+            "path": "device", "message": "Устройство не поддерживает универсальную конфигурацию."
+        }]
+    if metadata.get("board_profile") != "esp32-s3-devkitc-1":
+        return None, None, None, [{
+            "path": "device", "message": "Для этой версии конструктора поддерживается профиль ESP32-S3 DevKitC-1."
+        }]
+    normalized, schema, error = validate_device_configuration(
+        configuration, metadata.get("driver_ids", [])
+    )
+    if error is not None:
+        return None, None, None, [{
+            "path": getattr(error, "path", "configuration"), "message": str(error)
+        }]
+    preferences, error = validate_parameter_ui_preferences(ui_preferences, schema)
+    if error is not None:
+        path = "ui_preferences"
+        if isinstance(ui_preferences, dict):
+            for parameter_id, control in ui_preferences.items():
+                if validate_parameter_ui_preferences({parameter_id: control}, schema)[1]:
+                    path += f".{parameter_id}"
+                    break
+        return None, None, None, [{"path": path, "message": error}]
+    return normalized, schema, preferences, []
+
+
 def apply_parameter_ui_preferences(conn, device_id, preferences):
     timestamp = current_time()
     for parameter_id, control in preferences.items():
@@ -1595,7 +1644,7 @@ def load_device_configuration(device_id):
         row = conn.execute(
             """
             SELECT config_version, config_json, config_hash, status,
-                   last_error, updated_at, applied_at
+                   last_error, updated_at, applied_at, applied_version
             FROM device_configurations WHERE device_id = ?
             """,
             (device_id,)
@@ -1615,7 +1664,8 @@ def load_device_configuration(device_id):
         "status": row["status"],
         "last_error": row["last_error"],
         "updated_at": row["updated_at"],
-        "applied_at": row["applied_at"]
+        "applied_at": row["applied_at"],
+        "applied_version": row["applied_version"]
     }
 
 
@@ -1639,7 +1689,9 @@ def save_device_configuration(device_id, configuration, ui_preferences=None):
                 "unchanged": True
             }
         version = (row[0] if row else 0) + 1
-        status = "applying" if device_id in devices else "pending"
+        if version > MAX_CONFIGURATION_VERSION:
+            raise ValueError("Достигнут предел версий аппаратной конфигурации устройства.")
+        status = "pending"
         conn.execute("""
             INSERT INTO device_configurations (
                 device_id, config_version, config_json, config_hash,
@@ -1651,8 +1703,7 @@ def save_device_configuration(device_id, configuration, ui_preferences=None):
                 config_hash = excluded.config_hash,
                 status = excluded.status,
                 last_error = NULL,
-                updated_at = excluded.updated_at,
-                applied_at = NULL
+                updated_at = excluded.updated_at
         """, (device_id, version, canonical, config_hash, status, timestamp))
         conn.execute("""
             INSERT INTO device_configuration_history (
@@ -1678,9 +1729,10 @@ def update_device_configuration_status(
         conn.execute("""
             UPDATE device_configurations
             SET status = ?, last_error = ?,
-                applied_at = COALESCE(?, applied_at), updated_at = ?
+                applied_at = COALESCE(?, applied_at),
+                applied_version = CASE WHEN ? = 'applied' THEN config_version ELSE applied_version END
             WHERE device_id = ?
-        """, (status, error, applied_at, current_time(), device_id))
+        """, (status, error, applied_at, status, device_id))
         conn.execute("""
             UPDATE device_configuration_history
             SET status = ?
@@ -1709,7 +1761,10 @@ def device_configuration_export_document(device_id):
         "ui_preferences": get_device_parameter_ui_preferences(device_id),
         "configuration_version": configuration["config_version"] if configuration else None,
         "configuration_hash": configuration["config_hash"] if configuration else None,
-        "configuration_status": configuration["status"] if configuration else None
+        "configuration_status": configuration["status"] if configuration else None,
+        "configuration_applied_version": configuration["applied_version"] if configuration else 0,
+        "configuration_updated_at": configuration["updated_at"] if configuration else None,
+        "configuration_applied_at": configuration["applied_at"] if configuration else None
     }
     return document
 
@@ -1755,6 +1810,73 @@ def sync_device_configuration_exports():
     return len(device_ids) - len(failed)
 
 
+def cancel_configuration_apply(device_id, pending=False):
+    task = configuration_apply_tasks.pop(device_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+    if pending:
+        configuration_confirmed_devices.discard(device_id)
+        record = load_device_configuration(device_id)
+        if record is not None and record["status"] == "applying":
+            update_device_configuration_status(device_id, "pending")
+            write_device_configuration_export(device_id)
+    return task
+
+
+def device_configuration_is_pending(device_id):
+    return device_id in configuration_apply_tasks or (
+        device_id in deferred_connection_automations
+        and device_metadata.get(device_id, {}).get("device_profile") == "universal"
+    )
+
+
+async def resume_device_configuration(device_id):
+    if device_id not in devices or device_id in configuration_apply_tasks or device_id in pending_device_schemas:
+        return
+    connected_event_pending = device_id in deferred_connection_automations
+    if connected_event_pending:
+        if device_id not in configuration_confirmed_devices:
+            return
+        parameters = device_metadata.get(device_id, {}).get("schema", {}).get("parameters", {})
+        if not all(parameter_value_is_fresh(device_id, parameter) for parameter in parameters):
+            return
+        deferred_connection_automations.discard(device_id)
+    await deliver_queued_commands(device_id)
+    if connected_event_pending and device_is_connected(device_id):
+        fire_automation_event("device_connected", device_id)
+
+
+async def expire_configuration_apply(device_id, version, config_hash, websocket):
+    task = asyncio.current_task()
+    try:
+        await asyncio.sleep(CONFIGURATION_APPLY_TIMEOUT_SECONDS)
+        record = load_device_configuration(device_id)
+        if (
+            configuration_apply_tasks.get(device_id) is not task
+            or devices.get(device_id) is not websocket
+            or record is None
+            or record["config_version"] != version
+            or record["config_hash"] != config_hash
+            or record["status"] != "applying"
+        ):
+            return
+        error = "Устройство не подтвердило конфигурацию вовремя. Повторите отправку или проверьте подключение."
+        update_device_configuration_status(device_id, "failed", error=error)
+        await finish_pending_commands_for_device(device_id, "unavailable", error, retry=False)
+        write_device_configuration_export(device_id)
+        save_device_event(device_id, "configuration", f"Не получено подтверждение конфигурации версии {version}.")
+        await send_device_list()
+        await send_event_history()
+        await broadcast({
+            "type": "device_configuration_apply_result", "device": device_id,
+            "config_version": version, "success": False, "status": "failed",
+            "message": error
+        })
+    finally:
+        if configuration_apply_tasks.get(device_id) is task:
+            configuration_apply_tasks.pop(device_id, None)
+
+
 async def send_device_configuration(device_id, websocket=None):
     metadata = device_metadata.get(device_id) or load_device_metadata(device_id)
     if metadata is None or metadata.get("device_profile") != "universal":
@@ -1766,8 +1888,13 @@ async def send_device_configuration(device_id, websocket=None):
     if record is None:
         await send_json(target, {"type": "device_config_request"})
         return False
+    cancel_configuration_apply(device_id)
+    configuration_confirmed_devices.discard(device_id)
     update_device_configuration_status(device_id, "applying")
-    await send_device_list()
+    task = asyncio.create_task(expire_configuration_apply(
+        device_id, record["config_version"], record["config_hash"], target
+    ))
+    configuration_apply_tasks[device_id] = task
     try:
         await send_json(target, {
             "type": "device_config_apply",
@@ -1776,10 +1903,12 @@ async def send_device_configuration(device_id, websocket=None):
             "config_hash": record["config_hash"],
             "configuration": record["config"]
         })
-    except ConnectionClosed:
-        update_device_configuration_status(device_id, "pending")
+    except (ConnectionClosed, OSError):
+        if configuration_apply_tasks.get(device_id) is task:
+            cancel_configuration_apply(device_id, pending=True)
         await send_device_list()
         return False
+    await send_device_list()
     return True
 
 
@@ -1823,9 +1952,11 @@ async def handle_device_configuration_result(device_id, wire_device_id, message)
         metadata = dict(metadata)
         metadata.update({"schema": expected_schema, "schema_version": 1})
         save_device_metadata(device_id, metadata)
+        configuration_confirmed_devices.add(device_id)
         update_device_configuration_status(device_id, "not_configured")
         write_device_configuration_export(device_id)
         await send_device_list()
+        await resume_device_configuration(device_id)
         return
 
     if (
@@ -1834,6 +1965,7 @@ async def handle_device_configuration_result(device_id, wire_device_id, message)
         or config_hash != record["config_hash"]
     ):
         return
+    cancel_configuration_apply(device_id)
 
     normalized, expected_schema, validation_error = validate_device_configuration(
         record["config"], metadata.get("driver_ids", [])
@@ -1860,11 +1992,14 @@ async def handle_device_configuration_result(device_id, wire_device_id, message)
         update_device_configuration_status(
             device_id, "applied", applied_at=current_time()
         )
+        fresh_device_parameters[device_id] = set()
+        configuration_confirmed_devices.add(device_id)
         event = f"Аппаратная конфигурация версии {version} применена устройством."
         print(f"[CONFIG] {device_id}: applied configuration v{version}.")
     else:
         error = error or "Устройство отклонило аппаратную конфигурацию."
         update_device_configuration_status(device_id, "failed", error=error)
+        await finish_pending_commands_for_device(device_id, "unavailable", error, retry=False)
         event = f"Ошибка применения аппаратной конфигурации версии {version}: {error}"
         print(f"[CONFIG] {device_id}: configuration v{version} rejected: {error}")
 
@@ -1881,6 +2016,8 @@ async def handle_device_configuration_result(device_id, wire_device_id, message)
         "status": "applied" if success else "failed",
         "message": "Конфигурация применена." if success else error
     })
+    if success:
+        await resume_device_configuration(device_id)
 
 
 async def handle_device_configuration_report(device_id, wire_device_id, message):
@@ -1891,6 +2028,7 @@ async def handle_device_configuration_report(device_id, wire_device_id, message)
         or metadata.get("device_profile") != "universal"
         or message.get("device") != wire_device_id
         or type(message.get("config_version")) is not int
+        or not 0 <= message["config_version"] <= MAX_CONFIGURATION_VERSION
         or type(message.get("schema_version")) is not int
         or not isinstance(message.get("config_hash"), str)
     ):
@@ -1975,6 +2113,8 @@ async def handle_device_configuration_report(device_id, wire_device_id, message)
     metadata = dict(metadata)
     metadata.update({"schema": expected_schema, "schema_version": version})
     save_device_metadata(device_id, metadata)
+    update_device_configuration_status(device_id, "applied", applied_at=timestamp)
+    configuration_confirmed_devices.add(device_id)
     write_device_configuration_export(device_id)
     save_device_event(
         device_id,
@@ -1992,6 +2132,7 @@ async def handle_device_configuration_report(device_id, wire_device_id, message)
         "status": "applied",
         "message": f"Конфигурация версии {version} восстановлена из устройства."
     })
+    await resume_device_configuration(device_id)
 
 
 def resolve_device_identity(firmware_id):
@@ -2144,7 +2285,8 @@ def update_device_identity(device_id, new_device_id, display_name):
     write_device_configuration_export(new_device_id)
     for state_map in (
         device_states, last_device_heartbeat, fresh_device_parameters,
-        pending_device_schemas, deferred_device_schemas
+        pending_device_schemas, deferred_device_schemas, last_device_telemetry,
+        last_parameter_telemetry, last_device_probe
     ):
         if device_id in state_map:
             state_map[new_device_id] = state_map.pop(device_id)
@@ -2441,8 +2583,29 @@ async def deliver_pending_command(pending):
         return False
     device_id = pending["device"]
     websocket = devices.get(device_id)
-    if websocket is None or device_id in pending_device_schemas:
+    if websocket is None or device_id in pending_device_schemas or device_configuration_is_pending(device_id):
         await notify_command_queued(pending)
+        return False
+
+    operation = pending["operation"]
+    schema = device_metadata.get(device_id, {}).get("schema", {})
+    if operation["kind"] == "parameter":
+        definition = schema.get("parameters", {}).get(operation["name"])
+        matches = (
+            definition is not None and definition.get("access") == "read_write"
+            and is_schema_value(operation.get("value"), definition)
+            and value_within_schema_limits(operation.get("value"), definition)
+        )
+    else:
+        definition = schema.get("actions", {}).get(operation["name"])
+        matches = definition is not None and validate_action_arguments(definition, operation.get("arguments", {}))
+    if not matches:
+        removed = remove_pending_command(pending["command_id"])
+        if removed is not None:
+            await send_pending_command_result(
+                removed, "failed", operation.get("value"),
+                "Команда больше не соответствует принятой Schema устройства."
+            )
         return False
 
     pending["sending"] = True
@@ -2812,6 +2975,8 @@ def get_recent_events(limit=30):
 
     for row in rows:
         event = dict(row)
+        if not event_is_visible(event["event_type"], event["event_value"]):
+            continue
 
         if event["event_type"] == "led":
             device_id = event["device_id"]
@@ -2841,8 +3006,29 @@ def sqlite_casefold(value):
     return value.casefold() if isinstance(value, str) else ""
 
 
+def is_automation_command(command_id, automation_id=None):
+    return (isinstance(automation_id, str) and bool(automation_id.strip())) or (
+        isinstance(command_id, str) and command_id.startswith("auto-")
+    )
+
+
+def event_is_visible(event_type, event_value):
+    """Keep successful scenario operations in run history, without duplicate events."""
+    if event_type != "command":
+        return True
+    try:
+        command = json.loads(event_value)
+    except (TypeError, ValueError, RecursionError):
+        return True
+    return not (
+        isinstance(command, dict)
+        and command.get("status") == "succeeded"
+        and is_automation_command(command.get("command_id"), command.get("automation_id"))
+    )
+
+
 def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None, search=""):
-    conditions = []
+    conditions = ["event_is_visible(event_type, event_value) = 1"]
     parameters = []
 
     if device_id is not None:
@@ -2873,6 +3059,7 @@ def get_event_page(limit=EVENTS_PAGE_SIZE, device_id=None, before_id=None, searc
 
     with database_connection() as conn:
         conn.create_function("casefold", 1, sqlite_casefold)
+        conn.create_function("event_is_visible", 2, event_is_visible, deterministic=True)
         conn.row_factory = sqlite3.Row
         matching_count = conn.execute(
             f"SELECT COUNT(*) FROM device_events {matching_where}",
@@ -2911,7 +3098,7 @@ def get_all_devices():
         """).fetchall()
         configuration_rows = conn.execute("""
             SELECT device_id, config_version, config_json, config_hash,
-                   status, last_error, updated_at, applied_at
+                   status, last_error, updated_at, applied_at, applied_version
             FROM device_configurations
         """).fetchall()
 
@@ -2926,7 +3113,10 @@ def get_all_devices():
                 "version": configuration_row["config_version"],
                 "config": config_value,
                 "status": configuration_row["status"],
-                "error": configuration_row["last_error"]
+                "error": configuration_row["last_error"],
+                "applied_version": configuration_row["applied_version"],
+                "updated_at": configuration_row["updated_at"],
+                "applied_at": configuration_row["applied_at"]
             }
 
     result = []
@@ -3016,6 +3206,10 @@ def get_all_devices():
             "driver_catalog": public_driver_catalog(metadata.get("driver_ids", [])),
             "hardware_configuration": configurations.get(device_id, {}).get("config"),
             "configuration_version": configurations.get(device_id, {}).get("version", 0),
+            "configuration_applied_version": configurations.get(device_id, {}).get("applied_version", 0),
+            "configuration_updated_at": configurations.get(device_id, {}).get("updated_at"),
+            "configuration_applied_at": configurations.get(device_id, {}).get("applied_at"),
+            "configuration_sync_pending": device_id in deferred_connection_automations and metadata.get("device_profile") == "universal",
             "configuration_status": configurations.get(device_id, {}).get(
                 "status", "not_configured" if metadata.get("device_profile") == "universal" else None
             ),
@@ -3057,6 +3251,10 @@ def get_all_devices():
                 "driver_catalog": public_driver_catalog(metadata.get("driver_ids", [])),
                 "hardware_configuration": configurations.get(device_id, {}).get("config"),
                 "configuration_version": configurations.get(device_id, {}).get("version", 0),
+                "configuration_applied_version": configurations.get(device_id, {}).get("applied_version", 0),
+                "configuration_updated_at": configurations.get(device_id, {}).get("updated_at"),
+                "configuration_applied_at": configurations.get(device_id, {}).get("applied_at"),
+                "configuration_sync_pending": device_id in deferred_connection_automations and metadata.get("device_profile") == "universal",
                 "configuration_status": configurations.get(device_id, {}).get(
                     "status", "not_configured" if metadata.get("device_profile") == "universal" else None
                 ),
@@ -3226,8 +3424,8 @@ async def send_pending_command_result(pending, status, value, error):
     automation_state_change = pending.pop("automation_state_change", None)
     if (
         automation_state_change is None
-        and pending.get("automation_id")
-        and status == "succeeded"
+        and is_automation_command(pending["command_id"], pending.get("automation_id"))
+        and status in ("succeeded", "failed")
         and operation["kind"] == "parameter"
         and value is not None
         and any(
@@ -3261,7 +3459,7 @@ async def send_pending_command_result(pending, status, value, error):
         except Exception as log_error:
             print(f"[ОШИБКА] Не удалось сохранить изменение состояния: {log_error}")
 
-    if status == "succeeded" and automation_state_change is not None:
+    if status in ("succeeded", "failed") and automation_state_change is not None:
         parameter = automation_state_change["parameter"]
         state_value = automation_state_change["value"]
         state_event_type = "parameter"
@@ -3282,21 +3480,23 @@ async def send_pending_command_result(pending, status, value, error):
         except Exception as log_error:
             print(f"[ОШИБКА] Не удалось записать изменение состояния сценария: {log_error}")
 
-    command_event = {
-        "command_id": pending["command_id"],
-        operation["kind"]: operation["name"],
-        "requested_value": operation.get("value"),
-        "arguments": operation.get("arguments", {}),
-        "result_value": value if status in ("succeeded", "failed") else None,
-        "status": status,
-        "error": error
-    }
-    if pending.get("automation_id"):
-        command_event["automation_id"] = pending["automation_id"]
-        command_event["run_id"] = pending.get("automation_run_id")
-    event_value = json.dumps(command_event, ensure_ascii=False)
     try:
-        save_device_event(pending["device"], "command", event_value)
+        if status != "succeeded" or not is_automation_command(
+            pending["command_id"], pending.get("automation_id")
+        ):
+            command_event = {
+                "command_id": pending["command_id"],
+                operation["kind"]: operation["name"],
+                "requested_value": operation.get("value"),
+                "arguments": operation.get("arguments", {}),
+                "result_value": value if status in ("succeeded", "failed") else None,
+                "status": status,
+                "error": error
+            }
+            if pending.get("automation_id"):
+                command_event["automation_id"] = pending["automation_id"]
+                command_event["run_id"] = pending.get("automation_run_id")
+            save_device_event(pending["device"], "command", json.dumps(command_event, ensure_ascii=False))
         await send_event_history()
     except Exception as log_error:
         print(f"[ОШИБКА] Не удалось сохранить результат команды: {log_error}")
@@ -3433,6 +3633,10 @@ async def dispatch_device_command(
         await reject("Сначала рассмотрите предложенное изменение Schema устройства.")
         return False
 
+    if device_configuration_is_pending(device_id):
+        await reject("Дождитесь подтверждения аппаратной конфигурации устройства.")
+        return False
+
     if not isinstance(parameter, str):
         await reject("Некорректный идентификатор параметра.")
         return False
@@ -3548,6 +3752,9 @@ async def dispatch_device_action(
 
     if device_id in pending_device_schemas:
         await reject("Сначала рассмотрите предложенное изменение Schema устройства.")
+        return False
+    if device_configuration_is_pending(device_id):
+        await reject("Дождитесь подтверждения аппаратной конфигурации устройства.")
         return False
     if not isinstance(action, str):
         await reject("Некорректный идентификатор действия.")
@@ -3856,6 +4063,15 @@ def automation_device_metadata(device_id):
 
 
 def validate_automation_program(program):
+    metadata_cache = {}
+
+    def metadata_for(device_id):
+        if not isinstance(device_id, str):
+            return None
+        if device_id not in metadata_cache:
+            metadata_cache[device_id] = automation_device_metadata(device_id)
+        return metadata_cache[device_id]
+
     if (
         not isinstance(program, dict)
         or set(program) != {"version", "trigger", "body"}
@@ -3886,7 +4102,7 @@ def validate_automation_program(program):
         parameter_id = trigger.get("parameter")
         if not isinstance(device_id, str) or not isinstance(parameter_id, str):
             return "Триггер ссылается на неизвестный параметр устройства."
-        metadata = automation_device_metadata(device_id)
+        metadata = metadata_for(device_id)
         parameter = metadata.get("schema", {}).get("parameters", {}).get(parameter_id) if metadata else None
         if parameter is None or parameter.get("access") not in {"read_only", "read_write"} or parameter.get("type") == "json":
             return "Триггер ссылается на неизвестный параметр устройства."
@@ -3896,7 +4112,7 @@ def validate_automation_program(program):
         ):
             return "Значение фильтра запуска не соответствует Schema параметра."
     elif trigger_type in {"device_connected", "device_disconnected"}:
-        if set(trigger) != {"type", "device"} or automation_device_metadata(trigger.get("device")) is None:
+        if set(trigger) != {"type", "device"} or metadata_for(trigger.get("device")) is None:
             return "Триггер ссылается на неизвестное устройство."
     elif trigger_type == "gateway_started":
         if set(trigger) != {"type"}:
@@ -3940,13 +4156,13 @@ def validate_automation_program(program):
             parameter_id = expression.get("parameter")
             if not isinstance(device_id, str) or not isinstance(parameter_id, str):
                 raise ValueError("Выражение ссылается на недоступный параметр.")
-            metadata = automation_device_metadata(device_id)
+            metadata = metadata_for(device_id)
             definition = metadata.get("schema", {}).get("parameters", {}).get(parameter_id) if metadata else None
             if definition is None or definition.get("access") not in {"read_only", "read_write"} or definition.get("type") == "json":
                 raise ValueError("Выражение ссылается на недоступный параметр.")
             return definition.get("type")
         if kind == "device_connected":
-            if set(expression) != {"type", "device"} or automation_device_metadata(expression.get("device")) is None:
+            if set(expression) != {"type", "device"} or metadata_for(expression.get("device")) is None:
                 raise ValueError("Проверка соединения ссылается на неизвестное устройство.")
             return "boolean"
         if kind == "arithmetic":
@@ -4001,7 +4217,7 @@ def validate_automation_program(program):
             if kind == "set_parameter":
                 if set(statement) != {"type", "device", "parameter", "value"}:
                     raise ValueError("Некорректный блок установки параметра.")
-                metadata = automation_device_metadata(statement.get("device"))
+                metadata = metadata_for(statement.get("device"))
                 definition = metadata.get("schema", {}).get("parameters", {}).get(statement.get("parameter")) if metadata else None
                 if not definition or definition.get("access") != "read_write":
                     raise ValueError("Действие ссылается на неизвестный или доступный только для чтения параметр.")
@@ -4017,7 +4233,7 @@ def validate_automation_program(program):
             elif kind == "invoke_action":
                 if set(statement) != {"type", "device", "action", "arguments"}:
                     raise ValueError("Некорректный блок вызова действия.")
-                metadata = automation_device_metadata(statement.get("device"))
+                metadata = metadata_for(statement.get("device"))
                 definition = metadata.get("schema", {}).get("actions", {}).get(statement.get("action")) if metadata else None
                 arguments = statement.get("arguments")
                 if not definition or not isinstance(arguments, dict) or not validate_action_arguments(definition, arguments):
@@ -4156,6 +4372,125 @@ def validate_automation_config(config):
     return None
 
 
+def automation_diagnostics(config):
+    """Inspect a scenario without executing commands or changing saved state."""
+    issues = []
+    seen = set()
+
+    def issue(severity, code, message, message_en, device=None, parameter=None):
+        key = (code, device, parameter)
+        if key in seen:
+            return
+        seen.add(key)
+        entry = {
+            "severity": severity, "code": code, "message": message,
+            "message_en": message_en
+        }
+        if device is not None:
+            entry["device"] = device
+        if parameter is not None:
+            entry["parameter"] = parameter
+        issues.append(entry)
+
+    try:
+        validation_error = validate_automation_config(config)
+    except (TypeError, ValueError, KeyError, RecursionError, OverflowError):
+        validation_error = "Сценарий содержит некорректные данные."
+    if validation_error:
+        issue("error", "invalid_program", str(validation_error),
+              "Scenario validation failed. Review its blocks and device schema.")
+    if not isinstance(config, dict):
+        return issues, False
+
+    command_targets = set()
+    parameter_reads = set()
+    schema_references = set()
+    if config.get("version") == 2:
+        program = config.get("program")
+        trigger = program.get("trigger") if isinstance(program, dict) else None
+        if isinstance(trigger, dict) and isinstance(trigger.get("device"), str):
+            schema_references.add(trigger["device"])
+        stack = [program]
+        visited = 0
+        while stack and visited < 1000:
+            node = stack.pop()
+            visited += 1
+            if isinstance(node, list):
+                stack.extend(node)
+                continue
+            if not isinstance(node, dict):
+                continue
+            kind = node.get("type")
+            device_id = node.get("device")
+            if isinstance(device_id, str):
+                if kind in ("set_parameter", "invoke_action"):
+                    command_targets.add(device_id)
+                elif kind == "parameter" and isinstance(node.get("parameter"), str):
+                    parameter_reads.add((device_id, node["parameter"]))
+            stack.extend(node.values())
+    else:
+        target = config.get("target")
+        if isinstance(target, dict) and isinstance(target.get("device"), str):
+            command_targets.add(target["device"])
+        trigger = config.get("trigger")
+        if isinstance(trigger, dict) and isinstance(trigger.get("device"), str):
+            schema_references.add(trigger["device"])
+
+    referenced = schema_references | command_targets | {device for device, _ in parameter_reads}
+    metadata_by_id = {device: automation_device_metadata(device) for device in referenced}
+    valid_schema_devices = set()
+    for device_id, metadata in sorted(metadata_by_id.items()):
+        if metadata is None or not validate_schema(metadata.get("schema")):
+            issue("error", "invalid_device_schema",
+                  f"Нет принятой корректной Schema устройства {device_id}.",
+                  f"Device {device_id} has no valid accepted schema.", device_id)
+        else:
+            valid_schema_devices.add(device_id)
+        if device_id in pending_device_schemas:
+            issue("warning", "pending_schema",
+                  f"Рассмотрите изменение Schema устройства {device_id} перед запуском.",
+                  f"Review the pending schema for {device_id} before running.", device_id)
+
+    for device_id in sorted(command_targets):
+        if device_configuration_is_pending(device_id):
+            issue("warning", "configuration_applying",
+                  f"Дождитесь подтверждения аппаратной конфигурации устройства {device_id}.",
+                  f"Wait for {device_id} to confirm its hardware configuration.", device_id)
+        if not device_is_connected(device_id):
+            issue("warning", "target_offline",
+                  f"Целевое устройство {device_id} отключено.",
+                  f"Target device {device_id} is offline.", device_id)
+
+    for device_id, parameter in sorted(parameter_reads):
+        if device_id not in valid_schema_devices:
+            continue
+        if device_configuration_is_pending(device_id):
+            issue("warning", "configuration_applying",
+                  f"Дождитесь подтверждения аппаратной конфигурации устройства {device_id}.",
+                  f"Wait for {device_id} to confirm its hardware configuration.", device_id)
+        metadata = metadata_by_id.get(device_id) or {}
+        definition = metadata.get("schema", {}).get("parameters", {}).get(parameter)
+        if definition is None:
+            issue("error", "parameter_missing",
+                  f"Параметр {device_id}.{parameter} отсутствует в принятой Schema.",
+                  f"Parameter {device_id}.{parameter} is missing from the accepted schema.",
+                  device_id, parameter)
+            continue
+        values = device_states.get(device_id, {})
+        current = values.get(parameter)
+        if (
+            not parameter_value_is_fresh(device_id, parameter)
+            or parameter not in values
+            or not is_schema_value(current, definition)
+            or not value_within_schema_limits(current, definition)
+        ):
+            issue("warning", "parameter_stale",
+                  f"Нет актуального значения {device_id}.{parameter} для вычисления условия.",
+                  f"No current value of {device_id}.{parameter} is available for this expression.",
+                  device_id, parameter)
+    return issues, not issues
+
+
 def save_automation(automation_id, config, enabled=True):
     error = validate_automation_config(config)
     if error:
@@ -4191,12 +4526,29 @@ class AutomationStoppedError(AutomationExecutionError):
 
 
 def device_is_connected(device_id):
-    heartbeat = last_device_heartbeat.get(device_id)
-    return (
-        device_id in devices
-        and heartbeat is not None
-        and asyncio.get_running_loop().time() - heartbeat <= DEVICE_STALE_SECONDS
-    )
+    return device_id in devices
+
+
+def record_device_telemetry(device_id, parameters):
+    if not parameters:
+        return
+    now = asyncio.get_running_loop().time()
+    last_device_telemetry[device_id] = now
+    timestamps = last_parameter_telemetry.setdefault(device_id, {})
+    for parameter in parameters:
+        timestamps[parameter] = now
+    fresh_device_parameters.setdefault(device_id, set()).update(parameters)
+
+
+def parameter_value_is_fresh(device_id, parameter):
+    timestamp = last_parameter_telemetry.get(device_id, {}).get(parameter)
+    if (
+        not device_is_connected(device_id)
+        or parameter not in fresh_device_parameters.get(device_id, set())
+        or timestamp is None
+    ):
+        return False
+    return 0 <= asyncio.get_running_loop().time() - timestamp <= DEVICE_STALE_SECONDS
 
 
 def evaluate_automation_expression(expression):
@@ -4209,9 +4561,11 @@ def evaluate_automation_expression(expression):
         device_id = expression["device"]
         if not device_is_connected(device_id):
             raise AutomationExecutionError(f"Устройство {device_id} отключено.")
+        if device_configuration_is_pending(device_id):
+            raise AutomationExecutionError(f"Ожидается подтверждение аппаратной конфигурации {device_id}.")
         parameter = expression["parameter"]
-        if parameter not in fresh_device_parameters.get(device_id, set()):
-            raise AutomationExecutionError(f"Значение {device_id}.{parameter} ещё не обновлялось в этой сессии Gateway.")
+        if not parameter_value_is_fresh(device_id, parameter):
+            raise AutomationExecutionError(f"Значение {device_id}.{parameter} устарело или ещё не обновлялось в этой сессии Gateway.")
         if parameter not in device_states.get(device_id, {}):
             raise AutomationExecutionError(f"Нет актуального значения параметра {device_id}.{parameter}.")
         value = device_states[device_id][parameter]
@@ -4543,7 +4897,7 @@ def fire_automation_event(event_type, device_id=None, parameter=None, value=None
 
 
 async def evaluate_automations(device_id, previous_parameters, current_parameters):
-    if database_restore_in_progress:
+    if database_restore_in_progress or device_configuration_is_pending(device_id):
         return
     changed_parameters = {
         key for key, value in current_parameters.items()
@@ -4674,7 +5028,7 @@ async def wait_for_stable_automation_trigger(
                 current_trigger = saved_config["program"]["trigger"]
             except (TypeError, KeyError, json.JSONDecodeError):
                 return
-            if current_trigger != trigger or not device_is_connected(device_id):
+            if current_trigger != trigger or not parameter_value_is_fresh(device_id, parameter):
                 return
 
             current_parameters = device_states.get(device_id, {})
@@ -4747,6 +5101,12 @@ async def restore_database_backup(backup_id):
     restored = False
     restore_started = False
     try:
+        applying_tasks = [
+            cancel_configuration_apply(device_id, pending=True)
+            for device_id in list(configuration_apply_tasks)
+        ]
+        if applying_tasks:
+            await asyncio.gather(*applying_tasks, return_exceptions=True)
         trigger_tasks = list(automation_trigger_tasks.values())
         for automation_id in list(automation_trigger_tasks):
             cancel_pending_automation_trigger(automation_id)
@@ -4788,8 +5148,12 @@ async def restore_database_backup(backup_id):
         device_sockets = list(devices.values())
         active_device_tasks = list(device_handler_tasks)
         devices.clear()
+        configuration_confirmed_devices.clear()
         device_wire_ids.clear()
         last_device_heartbeat.clear()
+        last_device_telemetry.clear()
+        last_parameter_telemetry.clear()
+        last_device_probe.clear()
         fresh_device_parameters.clear()
         device_states.clear()
         device_metadata.clear()
@@ -4853,6 +5217,39 @@ async def handle_browser_message(websocket, message):
         await send_json(websocket, {
             "type": "error",
             "message": "Gateway database is being restored. Try again shortly."
+        })
+        return
+
+    if action == "check_automation":
+        automation_id = message.get("automation_id")
+        success = True
+        if "config" in message:
+            config = message.get("config")
+        elif isinstance(automation_id, str):
+            with database_connection() as conn:
+                row = conn.execute(
+                    "SELECT config_json FROM automations WHERE automation_id = ?",
+                    (automation_id,)
+                ).fetchone()
+            try:
+                config = json.loads(row[0]) if row else None
+            except (TypeError, json.JSONDecodeError):
+                config = None
+            success = row is not None
+        else:
+            config = None
+            success = False
+        issues, ready = automation_diagnostics(config)
+        if not success:
+            issues = [{
+                "severity": "error", "code": "automation_missing",
+                "message": "Сценарий не найден.", "message_en": "Scenario was not found."
+            }]
+            ready = False
+        await send_json(websocket, {
+            "type": "automation_diagnostics", "request_id": message.get("request_id"),
+            "automation_id": automation_id, "success": success,
+            "issues": issues, "ready": ready, "checked_at": current_time()
         })
         return
 
@@ -5125,9 +5522,13 @@ async def handle_browser_message(websocket, message):
                 device_id, "deny", request["metadata"].get("name")
             )
             cancel_pending_automation_triggers_for_device(device_id)
+            cancel_configuration_apply(device_id, pending=True)
             active_socket = devices.pop(device_id, None)
             device_wire_ids.pop(device_id, None)
             last_device_heartbeat.pop(device_id, None)
+            last_device_telemetry.pop(device_id, None)
+            last_parameter_telemetry.pop(device_id, None)
+            last_device_probe.pop(device_id, None)
             pending_device_schemas.pop(device_id, None)
             deferred_device_schemas.pop(device_id, None)
             await finish_pending_commands_for_device(
@@ -5204,9 +5605,13 @@ async def handle_browser_message(websocket, message):
 
         set_device_trust_policy(device_id, "forgotten")
         cancel_pending_automation_triggers_for_device(device_id)
+        cancel_configuration_apply(device_id, pending=True)
         active_socket = devices.pop(device_id, None)
         device_wire_ids.pop(device_id, None)
         last_device_heartbeat.pop(device_id, None)
+        last_device_telemetry.pop(device_id, None)
+        last_parameter_telemetry.pop(device_id, None)
+        last_device_probe.pop(device_id, None)
         pending_device_schemas.pop(device_id, None)
         deferred_device_schemas.pop(device_id, None)
         await finish_pending_commands_for_device(
@@ -5399,6 +5804,62 @@ async def handle_browser_message(websocket, message):
         await send_device_list(websocket)
         return
 
+    if action == "validate_device_configuration":
+        device_id = message.get("device")
+        normalized, schema, preferences, errors = validate_device_configuration_request(
+            device_id, message.get("configuration"), message.get("ui_preferences")
+        )
+        response = {
+            "type": "device_configuration_validation", "device": device_id,
+            "request_id": message.get("request_id"), "success": not errors,
+            "errors": errors
+        }
+        if not errors:
+            response["schema"] = schema
+            response["summary"] = {
+                "component_count": len(normalized["components"]),
+                "parameter_count": len(schema["parameters"]),
+                "writable_parameter_count": sum(
+                    definition["access"] == "read_write" for definition in schema["parameters"].values()
+                ),
+                "has_identify": "identify" in schema["actions"],
+                "configuration_bytes": len(json.dumps(
+                    normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"))
+            }
+        await send_json(websocket, response)
+        return
+
+    if action == "retry_device_configuration":
+        device_id = message.get("device")
+        metadata = automation_device_metadata(device_id)
+        record = load_device_configuration(device_id) if metadata is not None else None
+        success = False
+        status = None
+        result_message = "Сохранённая аппаратная конфигурация устройства не найдена."
+        if metadata is not None and metadata.get("device_profile") == "universal" and record is not None:
+            if device_id in devices:
+                await send_device_configuration(device_id)
+            else:
+                cancel_configuration_apply(device_id)
+                update_device_configuration_status(device_id, "pending")
+            status = load_device_configuration(device_id)["status"]
+            write_device_configuration_export(device_id)
+            success = True
+            result_message = (
+                "Сохранённая конфигурация повторно отправлена устройству."
+                if status in {"applying", "applied"} else "Конфигурация будет отправлена при подключении устройства."
+            )
+        await send_json(websocket, {
+            "type": "device_configuration_retry_result", "device": device_id,
+            "request_id": message.get("request_id"), "success": success,
+            "status": status, "config_version": record["config_version"] if record else None,
+            "message": result_message
+        })
+        if success:
+            await send_device_list()
+        return
+
     if action == "save_device_configuration":
         device_id = message.get("device")
         configuration = message.get("configuration")
@@ -5437,10 +5898,14 @@ async def handle_browser_message(websocket, message):
                     if saved["unchanged"]:
                         update_device_configuration_status(device_id, status)
                     if device_id in devices:
-                        status = "applying" if await send_device_configuration(device_id) else "pending"
+                        await send_device_configuration(device_id)
+                        status = load_device_configuration(device_id)["status"]
                     export_written = write_device_configuration_export(device_id)
                     success = True
                     result_message = (
+                        "Конфигурация сохранена и подтверждена устройством."
+                        if status == "applied"
+                        else
                         "Конфигурация уже была сохранена; Gateway повторно отправляет её устройству."
                         if saved["unchanged"] and status == "applying"
                         else "Конфигурация сохранена и отправлена устройству."
@@ -5465,6 +5930,7 @@ async def handle_browser_message(websocket, message):
 
         await send_json(websocket, {
             "type": "device_configuration_save_result",
+            "request_id": message.get("request_id"),
             "success": success,
             "device": device_id,
             "config_version": version,
@@ -5609,7 +6075,6 @@ async def handle_browser_message(websocket, message):
                 "schema",
                 f"Принята версия Schema {version or 'без номера'}"
             )
-            await deliver_queued_commands(device_id)
             message_text = f"Новая Schema устройства {device_id} принята."
         else:
             pending_device_schemas.pop(device_id, None)
@@ -5619,7 +6084,6 @@ async def handle_browser_message(websocket, message):
                 "schema",
                 f"Оставлена текущая Schema; предложение версии {version or 'без номера'} отклонено"
             )
-            await deliver_queued_commands(device_id)
             message_text = f"Текущая Schema устройства {device_id} оставлена. При следующем подключении Gateway снова предложит это изменение, если Schema всё ещё отличается."
 
         await send_json(websocket, {
@@ -5635,9 +6099,13 @@ async def handle_browser_message(websocket, message):
         await send_event_history()
         await send_command_queue_state()
         should_fire_connected = device_id in deferred_connection_automations
-        deferred_connection_automations.discard(device_id)
-        if should_fire_connected and device_is_connected(device_id):
-            fire_automation_event("device_connected", device_id)
+        if should_fire_connected and device_metadata.get(device_id, {}).get("device_profile") == "universal":
+            await send_device_configuration(device_id)
+        else:
+            await deliver_queued_commands(device_id)
+            deferred_connection_automations.discard(device_id)
+            if should_fire_connected and device_is_connected(device_id):
+                fire_automation_event("device_connected", device_id)
         return
 
     if action == "command":
@@ -5674,6 +6142,8 @@ async def handle_client(websocket):
     client_type = None
     device_id = None
     wire_device_id = None
+    connection_started_at = asyncio.get_running_loop().time()
+    close_error = None
 
     remote = getattr(websocket, "remote_address", None)
     print(f"[ПОДКЛЮЧЕНИЕ] Новое соединение: {remote}")
@@ -5682,7 +6152,7 @@ async def handle_client(websocket):
         async for raw_message in websocket:
             try:
                 message = json.loads(raw_message)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 await send_json(websocket, {
                     "type": "error",
                     "message": "Получен некорректный JSON."
@@ -5706,6 +6176,8 @@ async def handle_client(websocket):
                 break
 
             message_type = message.get("type")
+            if client_type == "device":
+                last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
 
             if database_restore_in_progress and client_type != "browser":
                 await websocket.close(
@@ -5981,6 +6453,9 @@ async def handle_client(websocket):
                     device_handler_tasks.add(current_device_task)
 
                 old_connection = devices.get(device_id)
+                configuration_confirmed_devices.discard(device_id)
+                if old_connection is not None:
+                    cancel_configuration_apply(device_id, pending=True)
 
                 if device_id not in device_states:
                     with database_connection() as conn:
@@ -6001,6 +6476,9 @@ async def handle_client(websocket):
                 devices[device_id] = websocket
                 device_wire_ids[device_id] = wire_device_id
                 last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
+                last_device_telemetry[device_id] = None
+                last_parameter_telemetry[device_id] = {}
+                last_device_probe[device_id] = last_device_heartbeat[device_id]
                 fresh_device_parameters[device_id] = set()
                 previous_metadata = load_device_metadata(device_id)
                 if (
@@ -6058,9 +6536,11 @@ async def handle_client(websocket):
                 await send_event_history()
                 if schema_status != "pending":
                     if metadata.get("device_profile") == "universal":
+                        deferred_connection_automations.add(device_id)
                         await send_device_configuration(device_id, websocket)
-                    await deliver_queued_commands(device_id)
-                    fire_automation_event("device_connected", device_id)
+                    else:
+                        await deliver_queued_commands(device_id)
+                        fire_automation_event("device_connected", device_id)
                 else:
                     deferred_connection_automations.add(device_id)
                 await send_command_queue_state()
@@ -6198,14 +6678,11 @@ async def handle_client(websocket):
                         **previous_parameters,
                         parameter: value
                     }
-                    fresh_device_parameters.setdefault(device_id, set()).add(parameter)
+                    record_device_telemetry(device_id, {parameter: value})
                     last_seen, _, _, _ = save_device_state(
                         device_id,
                         {parameter: value},
                         record_changes=False
-                    )
-                    last_device_heartbeat[device_id] = (
-                        asyncio.get_running_loop().time()
                     )
                     await broadcast({
                         "type": "device_state",
@@ -6218,7 +6695,7 @@ async def handle_client(websocket):
                             previous_parameters,
                             dict(device_states[device_id])
                         )
-                        if pending.get("automation_id") and status == "succeeded":
+                        if is_automation_command(command_id, pending.get("automation_id")) and status in ("succeeded", "failed"):
                             pending["automation_state_change"] = {
                                 "parameter": parameter,
                                 "value": value
@@ -6253,10 +6730,6 @@ async def handle_client(websocket):
                         "message": "Device telemetry parameters must be an object."
                     })
                     continue
-
-                # A schema mismatch must not be mistaken for a dead WebSocket.
-                # Track valid device traffic separately from accepted state values.
-                last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
 
                 metadata = device_metadata.get(
                     device_id, {"schema": default_legacy_schema()}
@@ -6324,7 +6797,7 @@ async def handle_client(websocket):
                     **device_states.get(device_id, {}),
                     **accepted_parameters
                 }
-                fresh_device_parameters.setdefault(device_id, set()).update(accepted_parameters)
+                record_device_telemetry(device_id, accepted_parameters)
 
                 pending_state_echoes = {}
                 for pending in pending_commands.values():
@@ -6364,6 +6837,12 @@ async def handle_client(websocket):
 
                 await broadcast(state_message)
 
+                if (
+                    device_id in deferred_connection_automations
+                    and device_metadata.get(device_id, {}).get("device_profile") == "universal"
+                ):
+                    await resume_device_configuration(device_id)
+
                 if telemetry_changed:
                     await evaluate_automations(
                         device_id, previous_parameters, device_states[device_id]
@@ -6393,14 +6872,33 @@ async def handle_client(websocket):
                 f"{message}"
             )
 
-    except ConnectionClosed:
-        pass
+    except ConnectionClosed as error:
+        close_error = error
 
     except Exception as error:
         print(f"[ОШИБКА] Обработка соединения: {error}")
 
     finally:
         browser_clients.discard(websocket)
+
+        if device_id:
+            close_frame = (
+                getattr(close_error, "rcvd", None)
+                or getattr(close_error, "sent", None)
+            )
+            code = getattr(websocket, "close_code", None) or getattr(close_frame, "code", None)
+            reason = getattr(websocket, "close_reason", None) or getattr(close_frame, "reason", "")
+            now = asyncio.get_running_loop().time()
+            current_connection = devices.get(device_id) is websocket
+            activity = last_device_heartbeat.get(device_id) if current_connection else None
+            telemetry = last_device_telemetry.get(device_id) if current_connection else None
+            activity_age = f"{max(0, now - activity):.1f}s" if activity is not None else "unknown"
+            telemetry_age = f"{max(0, now - telemetry):.1f}s" if telemetry is not None else "none"
+            print(
+                f"[CLOSE] {device_id}: code={code or 'unknown'} reason={reason!r}; "
+                f"session={now - connection_started_at:.1f}s, "
+                f"last_message_age={activity_age}, last_data_age={telemetry_age}"
+            )
 
         if device_id:
             pending_access = pending_device_connections.get(device_id)
@@ -6419,9 +6917,13 @@ async def handle_client(websocket):
             and devices.get(device_id) is websocket
         ):
             cancel_pending_automation_triggers_for_device(device_id)
+            cancel_configuration_apply(device_id, pending=True)
             del devices[device_id]
             device_wire_ids.pop(device_id, None)
             last_device_heartbeat.pop(device_id, None)
+            last_device_telemetry.pop(device_id, None)
+            last_parameter_telemetry.pop(device_id, None)
+            last_device_probe.pop(device_id, None)
             fresh_device_parameters.pop(device_id, None)
             deferred_connection_automations.discard(device_id)
             deferred_device_schemas.pop(device_id, None)
@@ -6556,7 +7058,7 @@ async def console_loop():
                 continue
             try:
                 value = json.loads(parts[2])
-            except json.JSONDecodeError as error:
+            except (ValueError, RecursionError) as error:
                 print(f"Значение должно быть корректным JSON: {error}")
                 continue
             await dispatch_device_command(selected_device, parts[1], value)
@@ -6572,7 +7074,7 @@ async def console_loop():
             if len(parts) > 2:
                 try:
                     arguments = json.loads(parts[2])
-                except json.JSONDecodeError as error:
+                except (ValueError, RecursionError) as error:
                     print(f"Аргументы должны быть корректным JSON: {error}")
                     continue
             if not isinstance(arguments, dict):
@@ -6605,7 +7107,9 @@ async def console_loop():
             for row in rows:
                 try:
                     state = json.loads(row[3] or "{}")
-                except json.JSONDecodeError:
+                except (TypeError, ValueError, RecursionError):
+                    state = {}
+                if not isinstance(state, dict):
                     state = {}
                 if row[4] is not None:
                     state.setdefault("led", bool(row[4]))
@@ -6631,37 +7135,54 @@ async def console_loop():
 # ЗАПУСК GATEWAY
 # =========================
 
+def device_transport_probe_due(device_id, now):
+    last_activity = last_device_heartbeat.get(device_id, now)
+    last_probe = last_device_probe.get(device_id, last_activity)
+    return now - max(last_activity, last_probe) > DEVICE_TRANSPORT_IDLE_SECONDS
+
+
+async def probe_device_transport(device_id, websocket):
+    now = asyncio.get_running_loop().time()
+    if devices.get(device_id) is not websocket or not device_transport_probe_due(device_id, now):
+        return
+    last_device_probe[device_id] = now
+    try:
+        pong = await websocket.ping()
+        await asyncio.wait_for(pong, timeout=DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS)
+        print(f"[PRESENCE] {device_id}: WebSocket ping confirmed; application silence is not a disconnect.")
+        return
+    except ConnectionClosed:
+        return
+    except (asyncio.TimeoutError, OSError) as error:
+        if devices.get(device_id) is not websocket:
+            return
+        last_data = last_device_telemetry.get(device_id)
+        data_age = f"{now - last_data:.1f}s" if last_data is not None else "none"
+        print(
+            f"[ПРЕДУПРЕЖДЕНИЕ] {device_id}: transport ping failed "
+            f"({type(error).__name__}); last_data_age={data_age}; closing code=1011."
+        )
+        try:
+            await websocket.close(code=1011, reason="Device did not answer a WebSocket ping")
+        except (ConnectionClosed, OSError):
+            pass
+
+
 async def device_presence_watchdog():
     loop = asyncio.get_running_loop()
-
     while True:
         await asyncio.sleep(5)
         now = loop.time()
-
-        for device_id, last_seen in list(last_device_heartbeat.items()):
-            if now - last_seen <= DEVICE_STALE_SECONDS:
-                continue
-
-            # Старые прошивки без Schema не отправляют периодическое state;
-            # для них остаётся контроль WebSocket ping/pong.
-            if device_metadata.get(device_id, {}).get("schema_version") is None:
-                continue
-
-            websocket = devices.get(device_id)
-            if websocket is None:
-                continue
-
-            print(
-                f"[ПРЕДУПРЕЖДЕНИЕ] Нет телеметрии от {device_id} "
-                f"более {DEVICE_STALE_SECONDS} секунд; закрываем соединение."
-            )
-            try:
-                await websocket.close(
-                    code=1011,
-                    reason="Device telemetry timed out"
-                )
-            except Exception:
-                pass
+        probes = [
+            probe_device_transport(device_id, websocket)
+            for device_id, websocket in list(devices.items())
+            if device_transport_probe_due(device_id, now)
+        ]
+        if probes:
+            results = await asyncio.gather(*probes, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"[PRESENCE] Could not probe device transport: {result}")
 
 async def main():
     init_db()
@@ -6695,6 +7216,12 @@ async def main():
                 print("Интерактивная консоль отключена; Gateway работает в служебном режиме.")
                 await asyncio.Event().wait()
         finally:
+            applying_tasks = [
+                cancel_configuration_apply(device_id, pending=True)
+                for device_id in list(configuration_apply_tasks)
+            ]
+            if applying_tasks:
+                await asyncio.gather(*applying_tasks, return_exceptions=True)
             watchdog_task.cancel()
             runtime_task.cancel()
             try:

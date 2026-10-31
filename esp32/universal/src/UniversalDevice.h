@@ -10,7 +10,7 @@
 class UniversalDevice {
 public:
     bool begin();
-    void loop(GatewayClient& gateway);
+    void loop(GatewayClient& gateway, bool registered);
     void handleMessage(JsonDocument& message, GatewayClient& gateway);
     void fillSchema(JsonObject schema) const;
     void sendState(GatewayClient& gateway, bool logMessage = false);

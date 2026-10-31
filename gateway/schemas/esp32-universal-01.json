@@ -1,7 +1,7 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-10-29T21:57:02+03:00",
+  "exported_at": "2026-10-30T21:53:44+03:00",
   "device_id": "esp32-universal-01",
   "schema_version": 1,
   "firmware_version": "1.0.0",
@@ -20,5 +20,8 @@
   "ui_preferences": {},
   "configuration_version": null,
   "configuration_hash": null,
-  "configuration_status": null
+  "configuration_status": null,
+  "configuration_applied_version": 0,
+  "configuration_updated_at": null,
+  "configuration_applied_at": null
 }

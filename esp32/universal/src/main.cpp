@@ -11,6 +11,7 @@ constexpr char FIRMWARE_VERSION[] = "1.0.0";
 
 GatewayClient gateway;
 UniversalDevice device;
+bool gatewayRegistered = false;
 
 void sendHello() {
     JsonDocument message;
@@ -43,8 +44,8 @@ void onGatewayEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
         case WStype_CONNECTED:
             Serial.println("[GATEWAY] connected");
+            gatewayRegistered = false;
             sendHello();
-            device.sendState(gateway);
             break;
         case WStype_TEXT: {
             JsonDocument message;
@@ -52,10 +53,16 @@ void onGatewayEvent(WStype_t type, uint8_t* payload, size_t length) {
                 Serial.println("[GATEWAY] ignored invalid JSON");
                 break;
             }
-            device.handleMessage(message, gateway);
+            if (message["type"] == "hello_ack") {
+                gatewayRegistered = true;
+                device.sendState(gateway);
+            } else if (gatewayRegistered) {
+                device.handleMessage(message, gateway);
+            }
             break;
         }
         case WStype_DISCONNECTED:
+            gatewayRegistered = false;
             Serial.println("[GATEWAY] disconnected");
             break;
         case WStype_ERROR:
@@ -69,6 +76,10 @@ void onGatewayEvent(WStype_t type, uint8_t* payload, size_t length) {
 
 void setup() {
     Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+    // Do not wait for USB/DTR: Gateway communication also works without a host.
+    Serial.setTxTimeoutMs(1);
+#endif
     delay(100);
     if (!device.begin()) {
         Serial.println("[CONFIG] Device started without applying invalid stored configuration.");
@@ -84,5 +95,5 @@ void setup() {
 
 void loop() {
     gateway.loop();
-    device.loop(gateway);
+    device.loop(gateway, gatewayRegistered);
 }
