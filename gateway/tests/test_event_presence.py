@@ -7,7 +7,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import main as gateway
+from main import gateway
+from errors import AutomationExecutionError
 
 
 class TestSocket:
@@ -229,7 +230,7 @@ class EventPresenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gateway.evaluate_automation_expression({
             "type": "parameter", "device": "sensor", "parameter": "a"
         }), 1)
-        with self.assertRaisesRegex(gateway.AutomationExecutionError, "устарело"):
+        with self.assertRaisesRegex(AutomationExecutionError, "устарело"):
             gateway.evaluate_automation_expression({
                 "type": "parameter", "device": "sensor", "parameter": "b"
             })

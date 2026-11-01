@@ -21,6 +21,13 @@ void buildDeviceSchema(JsonObject schema) {
     led["access"] = "read_write";
     led["control"] = "toggle";
 
+    // Explicit semantic mapping: Gateway does not guess an off operation from
+    // the parameter's ID or type. Users may override this mapping in Gateway.
+    JsonObject off = schema["common_commands"]["off"].to<JsonObject>();
+    off["kind"] = "parameter";
+    off["name"] = "led";
+    off["value"] = false;
+
     JsonObject actions = schema["actions"].to<JsonObject>();
 #if DEVICE_HAS_IDENTIFY_INDICATOR
     schema["capabilities"]["built_in_indicator"] = true;

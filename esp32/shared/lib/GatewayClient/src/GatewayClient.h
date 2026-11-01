@@ -23,6 +23,9 @@ public:
     bool isConnected();
     bool sendText(const String& message);
     bool sendJson(JsonDocument& document);
+    // Transport diagnostics stay outside Schema parameters and never affect
+    // the logical state consumed by automation.
+    void appendHealth(JsonObject health) const;
 
 private:
     static void dispatchWebSocketEvent(
@@ -40,10 +43,13 @@ private:
     unsigned long lastReceivedAt_ = 0;
     unsigned long lastSentAt_ = 0;
     std::atomic<bool> wifiLinkResetPending_{false};
+    std::atomic<uint32_t> pendingWiFiDisconnectReason_{0};
     bool wifiConnectionAnnounced_ = false;
     bool webSocketWasConnected_ = false;
     bool wifiEventsRegistered_ = false;
     bool gatewayPingAnnounced_ = false;
+    bool wifiResetInProgress_ = false;
+    String lastDisconnectReason_;
 
     static GatewayClient* activeClient_;
 };

@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import main as gateway
+from main import gateway
 from device_configuration import DRIVERS, validate_device_configuration
 
 

@@ -22,6 +22,7 @@
 
     const words = {
         ru: {
+            manual: "По нажатию кнопки", dashboard: "Кнопка на странице устройств",
             events: "События", conditions: "Условия", logic: "Логика", actions: "Действия", values: "Значения",
             parameterChanged: "Когда изменилось значение", triggerFilter: "Фильтр", anyChange: "любое изменение", changedTo: "стало равно", invalidTriggerValue: "Задайте корректное значение фильтра запуска.", stableFor: "Без новых изменений", cooldown: "Пауза после запуска", deviceConnected: "Когда устройство подключилось", deviceDisconnected: "Когда устройство отключилось", gatewayStarted: "При запуске Gateway",
             readParameter: "текущее значение параметра", readParameterHelp: "Подключите к сравнению или вычислению; сам по себе блок не запускает сценарий.", parameterValue: "значение параметра", equals: "равно", notEquals: "не равно", lessThan: "меньше", atMost: "не больше", greaterThan: "больше", atLeast: "не меньше",
@@ -33,6 +34,7 @@
             missingBlock: "Сценарий содержит неподдерживаемый или неполный блок.", invalidArgument: "Проверьте значение аргумента действия."
         },
         en: {
+            manual: "When a button is pressed", dashboard: "Show on Devices page",
             events: "Events", conditions: "Conditions", logic: "Logic", actions: "Actions", values: "Values",
             parameterChanged: "When a parameter changes", triggerFilter: "Filter", anyChange: "any change", changedTo: "changed to", invalidTriggerValue: "Enter a valid trigger filter value.", stableFor: "No further changes for", cooldown: "Cooldown", deviceConnected: "When a device connects", deviceDisconnected: "When a device disconnects", gatewayStarted: "When Gateway starts",
             readParameter: "current parameter value", readParameterHelp: "Connect this to a comparison or calculation; it does not start a scenario by itself.", parameterValue: "parameter value", equals: "equals", notEquals: "does not equal", lessThan: "is less than", atMost: "is at most", greaterThan: "is greater than", atLeast: "is at least",
@@ -379,6 +381,14 @@
                 this.setColour(210);
             }
         };
+        Blockly.Blocks.iot_when_manual = {
+            init() {
+                this.appendDummyInput().appendField(text("manual"));
+                this.appendDummyInput().appendField(new Blockly.FieldCheckbox("TRUE"), "DASHBOARD").appendField(text("dashboard"));
+                this.setNextStatement(true);
+                this.setColour(210);
+            }
+        };
         Blockly.Blocks.iot_device_parameter = {
             init() {
                 this.appendDummyInput()
@@ -522,7 +532,8 @@
                     { kind: "block", type: "iot_when_parameter_changes" },
                     { kind: "block", type: "iot_when_device_connects" },
                     { kind: "block", type: "iot_when_device_disconnects" },
-                    { kind: "block", type: "iot_when_gateway_starts" }
+                    { kind: "block", type: "iot_when_gateway_starts" },
+                    { kind: "block", type: "iot_when_manual" }
                 ] },
                 { kind: "category", name: text("conditions"), colour: "195", contents: [
                     { kind: "block", type: "controls_if" },
@@ -795,6 +806,8 @@
             trigger = { type: "device_disconnected", device: event.getFieldValue("DEVICE") };
         } else if (event.type === "iot_when_gateway_starts") {
             trigger = { type: "gateway_started" };
+        } else if (event.type === "iot_when_manual") {
+            trigger = { type: "manual", show_on_dashboard: event.getFieldValue("DASHBOARD") === "TRUE" };
         } else {
             throw new Error(text("invalidWorkspace"));
         }

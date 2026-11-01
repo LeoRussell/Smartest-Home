@@ -14,7 +14,11 @@ from device_configuration import (
     public_driver_catalog,
     validate_device_configuration,
 )
-from main import handle_http_request, validate_parameter_ui_preferences, validate_schema
+from main import gateway
+
+handle_http_request = gateway.handle_http_request
+validate_parameter_ui_preferences = gateway.validate_parameter_ui_preferences
+validate_schema = gateway.validate_schema
 
 
 DRIVER_IDS = list(DRIVERS)
@@ -168,7 +172,7 @@ class DeviceConfigurationTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             export_path = Path(directory) / "esp32-01.json"
             export_path.write_text('{"schema":{}}', encoding="utf-8")
-            with patch("main.DEVICE_CONFIGURATION_EXPORT_DIR", Path(directory)):
+            with patch.object(gateway, "DEVICE_CONFIGURATION_EXPORT_DIR", Path(directory)):
                 response = handle_http_request(
                     None,
                     Request("/gateway-schemas/esp32-01.json", Headers())

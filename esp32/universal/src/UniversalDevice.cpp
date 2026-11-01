@@ -836,6 +836,7 @@ void UniversalDevice::sendState(GatewayClient& gateway, bool logMessage) {
     message["type"] = "state";
     message["id"] = ++stateSequence_;
     message["device"] = UNIVERSAL_DEVICE_ID;
+    gateway.appendHealth(message["health"].to<JsonObject>());
     JsonObject parameters = message["data"]["parameters"].to<JsonObject>();
     for (uint8_t index = 0; index < componentCount_; ++index) {
         Component& component = components_[index];

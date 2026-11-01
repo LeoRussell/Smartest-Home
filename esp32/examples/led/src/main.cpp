@@ -165,14 +165,15 @@ void sendHello() {
     doc["name"] = DEVICE_NAME;
     doc["protocol_version"] = 2;
     doc["command_dedup"] = commandCacheReady;
-    doc["firmware_version"] = "1.5.0";
-    doc["schema_version"] = 7;
+    doc["firmware_version"] = "1.6.0";
+    doc["schema_version"] = 8;
+    gateway.appendHealth(doc["health"].to<JsonObject>());
 
     buildDeviceSchema(doc["schema"].to<JsonObject>());
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
-    doc["data"]["firmware"] = "1.5.0";
+    doc["data"]["firmware"] = "1.6.0";
     doc["data"]["protocol"] = 2;
 
     gateway.sendJson(doc);
@@ -184,6 +185,7 @@ void sendState(bool ledOn, bool logMessage = true) {
     doc["type"] = "state";
     doc["id"] = ++stateSequence;
     doc["device"] = DEVICE_ID;
+    gateway.appendHealth(doc["health"].to<JsonObject>());
     JsonObject parameters = doc["data"]["parameters"].to<JsonObject>();
     parameters["led"] = ledOn;
     appendRegisteredDeviceModeStates(parameters);

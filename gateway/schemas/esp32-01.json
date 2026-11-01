@@ -1,10 +1,10 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-10-30T21:49:47+03:00",
+  "exported_at": "2026-11-01T12:00:15+03:00",
   "device_id": "esp32-01",
-  "schema_version": 7,
-  "firmware_version": "1.5.0",
+  "schema_version": 8,
+  "firmware_version": "1.6.0",
   "schema": {
     "format_version": 1,
     "components": {
@@ -23,6 +23,13 @@
         "control": "toggle"
       }
     },
+    "common_commands": {
+      "off": {
+        "kind": "parameter",
+        "name": "led",
+        "value": false
+      }
+    },
     "actions": {
       "identify": {
         "label": "Найти устройство",
@@ -37,9 +44,7 @@
   "device_profile": null,
   "board_profile": null,
   "hardware_configuration": null,
-  "ui_preferences": {
-    "led": "toggle"
-  },
+  "ui_preferences": {},
   "configuration_version": null,
   "configuration_hash": null,
   "configuration_status": null,

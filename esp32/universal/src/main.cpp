@@ -7,7 +7,7 @@
 namespace {
 constexpr uint16_t GATEWAY_PORT = 8765;
 constexpr char BOARD_PROFILE[] = "esp32-s3-devkitc-1";
-constexpr char FIRMWARE_VERSION[] = "1.0.0";
+constexpr char FIRMWARE_VERSION[] = "1.0.1";
 
 GatewayClient gateway;
 UniversalDevice device;
@@ -26,6 +26,7 @@ void sendHello() {
     message["device_profile"] = "universal";
     message["board_profile"] = BOARD_PROFILE;
     message["firmware_version"] = FIRMWARE_VERSION;
+    gateway.appendHealth(message["health"].to<JsonObject>());
     JsonArray driverCatalog = message["driver_catalog"].to<JsonArray>();
     driverCatalog.add("gpio_output");
     driverCatalog.add("digital_input");

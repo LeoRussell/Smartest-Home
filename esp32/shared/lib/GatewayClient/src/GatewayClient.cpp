@@ -1,10 +1,32 @@
 #include "GatewayClient.h"
 
 #include <esp_system.h>
+#include <esp_timer.h>
 
 #ifndef GATEWAY_WIFI_POWER_SAVE
 #define GATEWAY_WIFI_POWER_SAVE 0
 #endif
+
+namespace {
+constexpr uint32_t WIFI_LOST_IP_REASON = 0x10000;
+constexpr uint32_t WIFI_STOPPED_REASON = 0x10001;
+
+const char* resetReasonName() {
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_EXT: return "external";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "unknown";
+    }
+}
+}  // namespace
 
 GatewayClient* GatewayClient::activeClient_ = nullptr;
 
@@ -68,6 +90,18 @@ bool GatewayClient::sendJson(JsonDocument& document) {
     return sendText(message);
 }
 
+void GatewayClient::appendHealth(JsonObject health) const {
+    health["wifi_rssi"] = WiFi.RSSI();
+    // Unlike millis(), the ESP timer does not wrap after roughly 49 days.
+    health["uptime_seconds"] = static_cast<uint64_t>(esp_timer_get_time()) / 1000000ULL;
+    health["reset_reason"] = resetReasonName();
+    if (lastDisconnectReason_.isEmpty()) {
+        health["last_disconnect_reason"] = nullptr;
+    } else {
+        health["last_disconnect_reason"] = lastDisconnectReason_;
+    }
+}
+
 void GatewayClient::dispatchWebSocketEvent(
     WStype_t type,
     uint8_t* payload,
@@ -93,6 +127,12 @@ void GatewayClient::dispatchWebSocketEvent(
             Serial.println("[NET] Gateway ping received; automatic pong processing.");
         }
     } else if (type == WStype_DISCONNECTED) {
+        // Keep the more useful Wi-Fi reason during the associated TCP teardown.
+        // Failed initial connection attempts are not an established-session loss.
+        if (client->webSocketWasConnected_ && !client->wifiResetInProgress_ &&
+            !client->wifiLinkResetPending_.load()) {
+            client->lastDisconnectReason_ = "websocket: closed";
+        }
         Serial.printf(
             "[NET] WebSocket disconnected connection=%lu ms wifi=%u rssi=%ld dBm last_rx=%lu ms last_app_tx=%lu ms peer_reason=%.*s\n",
             client->webSocketWasConnected_ ? now - client->webSocketConnectedAt_ : 0,
@@ -117,13 +157,18 @@ void GatewayClient::dispatchWebSocketEvent(
 void GatewayClient::dispatchWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (activeClient_ == nullptr) return;
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-        activeClient_->wifiLinkResetPending_.store(true);
         const uint8_t reason = info.wifi_sta_disconnected.reason;
+        activeClient_->pendingWiFiDisconnectReason_.store(reason);
+        activeClient_->wifiLinkResetPending_.store(true);
         Serial.printf("[NET] Wi-Fi disconnected at %lu ms reason=%u (%s); driver auto_reconnect=on\n",
                       millis(), static_cast<unsigned int>(reason),
                       WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(reason)));
     } else if (event == ARDUINO_EVENT_WIFI_STA_LOST_IP ||
                event == ARDUINO_EVENT_WIFI_STA_STOP) {
+        activeClient_->pendingWiFiDisconnectReason_.store(
+            event == ARDUINO_EVENT_WIFI_STA_LOST_IP
+                ? WIFI_LOST_IP_REASON : WIFI_STOPPED_REASON
+        );
         activeClient_->wifiLinkResetPending_.store(true);
         Serial.printf("[NET] Wi-Fi lost IP or stopped at %lu ms event=%u\n",
                       millis(), static_cast<unsigned int>(event));
@@ -134,7 +179,25 @@ bool GatewayClient::maintainWiFiConnection() {
     // Process even a brief disconnect that auto-reconnected between loop()
     // iterations: the old TCP connection must not survive onto the new link.
     if (wifiLinkResetPending_.exchange(false)) {
+        // Wi-Fi callbacks run on another task: only atomics cross that boundary.
+        // String formatting and the published reason belong to the main loop.
+        const uint32_t reason = pendingWiFiDisconnectReason_.load();
+        if (reason == WIFI_LOST_IP_REASON) {
+            lastDisconnectReason_ = "wifi: lost_ip";
+        } else if (reason == WIFI_STOPPED_REASON) {
+            lastDisconnectReason_ = "wifi: stopped";
+        } else {
+            lastDisconnectReason_ = "wifi: ";
+            lastDisconnectReason_ += WiFi.disconnectReasonName(
+                static_cast<wifi_err_reason_t>(reason)
+            );
+            lastDisconnectReason_ += " (";
+            lastDisconnectReason_ += reason;
+            lastDisconnectReason_ += ')';
+        }
+        wifiResetInProgress_ = true;
         webSocket_.disconnect();
+        wifiResetInProgress_ = false;
         wifiConnectionAnnounced_ = false;
     }
     if (WiFi.status() != WL_CONNECTED) {
