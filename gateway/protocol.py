@@ -206,11 +206,17 @@ class ProtocolMixin:
         if self.database_restore_in_progress:
             await self.send_json(websocket, {
                 "type": "error",
+                "code": "database_restoring",
+                "request_id": message.get("request_id") if isinstance(message.get("request_id"), str) and len(message["request_id"]) <= 128 else None,
+                "action": action if isinstance(action, str) and len(action) <= 80 else None,
                 "message": "Gateway database is being restored. Try again shortly."
             })
             return
 
         if await self.management.handle_browser_message(websocket, message):
+            return
+
+        if await self.history.handle_browser_message(websocket, message):
             return
 
         if action == "check_automation":
@@ -1127,6 +1133,9 @@ class ProtocolMixin:
 
         await self.send_json(websocket, {
             "type": "error",
+            "code": "unsupported_action",
+            "request_id": message.get("request_id") if isinstance(message.get("request_id"), str) and len(message["request_id"]) <= 128 else None,
+            "action": action if isinstance(action, str) and len(action) <= 80 else None,
             "message": f"Неизвестное действие: {action}"
         })
 
@@ -1196,6 +1205,11 @@ class ProtocolMixin:
 
                     print("[БРАУЗЕР] Подключён")
 
+                    await self.send_json(websocket, {
+                        "type": "gateway_capabilities",
+                        "protocol_version": 1,
+                        "features": ["parameter_history", "automation_progress"]
+                    })
                     await self.send_device_list(websocket)
                     await self.send_parameter_ui_preferences(websocket)
                     await self.send_device_access_state(websocket)
@@ -1205,6 +1219,9 @@ class ProtocolMixin:
                     await self.management.publish(websocket)
                     await self.send_json(websocket, {
                         "type": "gateway_settings", **self.management.settings()
+                    })
+                    await self.send_json(websocket, {
+                        "type": "history_settings", **self.history.settings()
                     })
                     continue
 
@@ -1687,6 +1704,7 @@ class ProtocolMixin:
                             {parameter: value},
                             record_changes=False
                         )
+                        self.history.record(device_id, {parameter: value})
                         await self.broadcast({
                             "type": "device_state",
                             "device": device_id,
@@ -1825,6 +1843,7 @@ class ProtocolMixin:
                         defer_parameters=set(pending_state_echoes),
                         record_telemetry=bool(accepted_parameters)
                     )
+                    self.history.record(device_id, accepted_parameters)
                     for state_event in deferred_events:
                         pending = pending_state_echoes.get(state_event["parameter"])
                         if pending is not None:

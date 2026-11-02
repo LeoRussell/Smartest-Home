@@ -97,6 +97,7 @@ let pendingEventFocusId = null;
 let pendingAutomationRunFocus = null;
 let activePage = "devices";
 let lastActivityMessage = "";
+let lastActivityOutcome = "info";
 let lastGatewayStatusMessage = "Нет соединения с Gateway";
 let gatewayIsConnectedState = false;
 let databaseStats = null;
@@ -151,6 +152,7 @@ const schemaHistoryRequests = new Set();
 const openSchemaHistoryDevices = new Set();
 const selectedSchemaHistorySnapshots = new Map();
 let commandSequence = 0;
+let dialogHeadingSequence = 0;
 
 function createCommandId() {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -328,14 +330,14 @@ function renderDatabaseBackups() {
             );
             if (!window.confirm(prompt)) return;
             databaseBackupActionPending = true;
-            databaseBackupFeedback.textContent = localized("Восстанавливаю базу…", "Restoring database…");
+            setFeedback(databaseBackupFeedback, localized("Восстанавливаю базу…", "Restoring database…"), "info");
             renderDatabaseBackups();
             if (!sendGatewayAction("restore_database_backup", { backup_id: backup.backup_id })) {
                 databaseBackupActionPending = false;
-                databaseBackupFeedback.textContent = localized(
+                setFeedback(databaseBackupFeedback, localized(
                     "Gateway не принял запрос на восстановление.",
                     "Gateway did not accept the restore request."
-                );
+                ), "error");
                 renderDatabaseBackups();
             }
         });
@@ -451,8 +453,10 @@ function applyLanguage() {
     if (window.AutomationInspector) window.AutomationInspector.refresh();
     else renderAutomations();
     updateAutomationEditorMode();
+    window.GatewayWorkspace?.languageChanged();
+    window.AutomationProgress?.refresh();
     setGatewayConnectionStatus(lastGatewayStatusMessage, gatewayIsConnectedState);
-    if (lastActivityMessage) setActivity(lastActivityMessage);
+    if (lastActivityMessage) setActivity(lastActivityMessage, lastActivityOutcome);
 }
 
 function setActivePage(page) {
@@ -468,6 +472,8 @@ function setActivePage(page) {
         button.tabIndex = active ? 0 : -1;
     }
     if (page === "automations") refreshAutomationEditor();
+    window.GatewayWorkspace?.pageChanged();
+    window.AutomationProgress?.refresh();
     if (page === "events" && events.length === 0 && !pendingEventFocusId && isGatewayConnected()) {
         requestEvents({ reset: true });
     }
@@ -629,10 +635,42 @@ function renderNotifications() {
     }
 }
 
-function closeNotificationPanel() {
+function closeNotificationPanel(restoreFocus = false) {
     if (!notificationPanel || !notificationButton) return;
+    const wasOpen = !notificationPanel.hidden;
     notificationPanel.hidden = true;
     notificationButton.setAttribute("aria-expanded", "false");
+    if (wasOpen && restoreFocus) notificationButton.focus({ preventScroll: true });
+}
+
+function openNotificationPanel(focusLast = false) {
+    if (!notificationPanel || !notificationButton) return;
+    notificationPanel.hidden = false;
+    notificationButton.setAttribute("aria-expanded", "true");
+    renderNotifications();
+    const buttons = [...notificationPanel.querySelectorAll("button:not(:disabled)")];
+    (focusLast ? buttons.at(-1) : buttons[0])?.focus({ preventScroll: true });
+}
+
+function navigationIsVertical() {
+    return uiSettings.navigation === "side" && !window.matchMedia("(max-width: 760px)").matches;
+}
+
+function labelDialog(dialog, heading) {
+    heading.id ||= `gateway-dialog-title-${++dialogHeadingSequence}`;
+    dialog.setAttribute("aria-labelledby", heading.id);
+    const opener = document.activeElement;
+    dialog.addEventListener("close", () => {
+        const active = document.activeElement;
+        if (active && active !== document.body && active !== opener && !dialog.contains(active) && !active.closest("[hidden]")) return;
+        if (opener?.isConnected && !opener.disabled && !opener.closest("[hidden]")) {
+            opener.focus({ preventScroll: true });
+            return;
+        }
+        const panel = [...document.querySelectorAll(".device-panel")]
+            .find(item => item.dataset.deviceId === dialog.dataset.deviceId && !item.closest("[hidden]"));
+        panel?.querySelector('[data-role="device-settings"]')?.focus({ preventScroll: true });
+    }, { once: true });
 }
 
 function markNotificationRead(eventId) {
@@ -689,7 +727,9 @@ function focusPendingEvent() {
         .find(item => item.dataset.eventId === pendingEventFocusId);
     if (row) {
         row.classList.add("event-focus");
+        row.tabIndex = -1;
         row.scrollIntoView({ behavior: "smooth", block: "center" });
+        row.focus({ preventScroll: true });
         pendingEventFocusId = null;
         return;
     }
@@ -701,6 +741,10 @@ function focusPendingEvent() {
 }
 
 function initializeInterface() {
+    // Keep the controls close to the top on phones; the native disclosure
+    // preserves all filter values when the user opens or closes it.
+    const deviceTools = document.querySelector(".device-tools-window");
+    if (deviceTools) deviceTools.open = !window.matchMedia("(max-width: 760px)").matches;
     window.AutomationInspector?.initialize({
         translate: localized,
         language: () => uiSettings.language,
@@ -733,7 +777,7 @@ function initializeInterface() {
     }
     if (settingImportantOnly) settingImportantOnly.checked = uiSettings.importantOnly;
     document.body.classList.toggle("nav-side", uiSettings.navigation === "side");
-    navigation?.setAttribute("aria-orientation", uiSettings.navigation === "side" ? "vertical" : "horizontal");
+    navigation?.setAttribute("aria-orientation", navigationIsVertical() ? "vertical" : "horizontal");
     applyLanguage();
     setActivePage(activePage);
 
@@ -786,7 +830,7 @@ function initializeInterface() {
         window.AutomationBlockly?.clear();
         document.getElementById("automation-editor-title").textContent = localized("Новый сценарий", "New scenario");
         updateAutomationEditorMode();
-        if (automationFeedback) automationFeedback.textContent = "";
+        if (automationFeedback) setFeedback(automationFeedback, "", "info");
         window.AutomationInspector?.clearDraft();
     });
     automationClearButton?.addEventListener("click", () => window.AutomationBlockly?.clear());
@@ -795,12 +839,22 @@ function initializeInterface() {
         setActivePage("devices");
     });
     navigation?.addEventListener("keydown", event => {
-        if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+        const arrows = navigationIsVertical() ? ["ArrowUp", "ArrowDown"] : ["ArrowLeft", "ArrowRight"];
+        if (![...arrows, "Home", "End"].includes(event.key)) return;
         const buttons = [...navigation.querySelectorAll("[data-page]")];
-        const currentIndex = buttons.findIndex(button => button.classList.contains("is-active"));
+        const focused = event.target.closest("[data-page]");
+        const currentIndex = Math.max(0, buttons.indexOf(focused));
         const delta = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
-        buttons[(currentIndex + delta + buttons.length) % buttons.length]?.focus();
+        const nextIndex = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+            : (currentIndex + delta + buttons.length) % buttons.length;
+        const next = buttons[nextIndex];
+        if (!next) return;
+        setActivePage(next.dataset.page);
+        next.focus({ preventScroll: true });
         event.preventDefault();
+    });
+    window.matchMedia("(max-width: 760px)").addEventListener("change", () => {
+        navigation?.setAttribute("aria-orientation", navigationIsVertical() ? "vertical" : "horizontal");
     });
     for (const button of document.querySelectorAll('[data-action="refresh-events"]')) {
         button.addEventListener("click", () => requestEvents({ reset: true }));
@@ -808,7 +862,7 @@ function initializeInterface() {
     settingNavigation?.addEventListener("change", () => {
         uiSettings.navigation = settingNavigation.value === "side" ? "side" : "top";
         document.body.classList.toggle("nav-side", uiSettings.navigation === "side");
-        navigation?.setAttribute("aria-orientation", uiSettings.navigation === "side" ? "vertical" : "horizontal");
+        navigation?.setAttribute("aria-orientation", navigationIsVertical() ? "vertical" : "horizontal");
         saveUiSettings();
         showSettingsSaved();
     });
@@ -840,25 +894,37 @@ function initializeInterface() {
         saveUiSettings();
         showSettingsSaved();
     });
-    notificationButton?.addEventListener("click", () => {
+    notificationButton?.addEventListener("click", event => {
         const open = notificationPanel.hidden;
         notificationPanel.hidden = !open;
         notificationButton.setAttribute("aria-expanded", String(open));
         if (open) renderNotifications();
+        if (open && event.detail === 0) openNotificationPanel();
+    });
+    notificationButton?.addEventListener("keydown", event => {
+        if (!["ArrowDown", "ArrowUp"].includes(event.key)) return;
+        openNotificationPanel(event.key === "ArrowUp");
+        event.preventDefault();
     });
     markNotificationsReadButton?.addEventListener("click", markAllNotificationsRead);
     document.addEventListener("click", event => {
         if (!event.target.closest(".notification-area")) closeNotificationPanel();
     });
     document.addEventListener("keydown", event => {
-        if (event.key === "Escape") closeNotificationPanel();
+        if (event.key === "Escape" && notificationPanel && !notificationPanel.hidden) {
+            closeNotificationPanel(true);
+            event.preventDefault();
+        }
+    });
+    document.addEventListener("focusin", event => {
+        if (notificationPanel && !notificationPanel.hidden && !event.target.closest(".notification-area")) closeNotificationPanel();
     });
 }
 
 let settingsSavedTimer = null;
 function showSettingsSaved() {
     if (!settingsSavedMessage) return;
-    settingsSavedMessage.textContent = localized("Настройки сохранены", "Settings saved");
+    setFeedback(settingsSavedMessage, localized("Настройки сохранены", "Settings saved"), "success");
     clearTimeout(settingsSavedTimer);
     settingsSavedTimer = setTimeout(() => {
         settingsSavedMessage.textContent = "";
@@ -869,15 +935,22 @@ function showSettingsSaved() {
 // СТАТУС ПОДКЛЮЧЕНИЯ
 // =========================
 
-function setActivity(message) {
+function setFeedback(element, text, outcome = "info") {
+    if (!element) return;
+    element.textContent = text || "";
+    element.dataset.state = outcome === true ? "success" : outcome === false ? "error" : outcome;
+}
+
+function setActivity(message, outcome = "info") {
     message = typeof message === "string" ? message : String(message ?? "");
     lastActivityMessage = message;
+    lastActivityOutcome = outcome;
     const displayedMessage = localizeActivityMessage(message);
     if (activityMessage) {
-        activityMessage.textContent = displayedMessage;
+        setFeedback(activityMessage, displayedMessage, outcome);
     }
     if (actionFeedback) {
-        actionFeedback.textContent = displayedMessage;
+        setFeedback(actionFeedback, displayedMessage, outcome);
         actionFeedback.hidden = !displayedMessage;
     }
 }
@@ -891,12 +964,17 @@ function setGatewayConnectionStatus(message, connected) {
         pendingManualRuns.clear();
     }
     window.DeviceManagement?.setConnected(connected);
+    window.DeviceViews?.refresh();
+    if (wasConnected !== connected) {
+        window.GatewayWorkspace?.connectionChanged();
+        window.AutomationProgress?.connectionChanged();
+    }
     if (!connected && wasConnected) {
         if ((databaseBackupRefreshPending || databaseBackupActionPending) && databaseBackupFeedback) {
-            databaseBackupFeedback.textContent = localized(
+            setFeedback(databaseBackupFeedback, localized(
                 "Соединение с Gateway потеряно. После подключения обновите список и проверьте результат операции.",
                 "Gateway connection was lost. Reconnect and refresh the list to check the operation result."
-            );
+            ), "warning");
         }
         databaseBackupRefreshPending = false;
         databaseBackupActionPending = false;
@@ -1086,7 +1164,7 @@ function refreshAutomationEditor(config = null) {
             } catch (error) {
                 editingAutomationId = null;
                 pendingAutomationWorkspaceState = null;
-                automationFeedback.textContent = error.message || localized("Не удалось открыть сценарий.", "Could not open the scenario.");
+                setFeedback(automationFeedback, error.message || localized("Не удалось открыть сценарий.", "Could not open the scenario."), "error");
                 updateAutomationEditorMode();
                 return;
             }
@@ -1112,7 +1190,8 @@ function refreshAutomationEditor(config = null) {
 }
 
 function manualScenarioIsBusy(item) {
-    return item.run_status === "running" || pendingManualRuns.has(item.automation_id);
+    return item.run_status === "running" || pendingManualRuns.has(item.automation_id) ||
+        window.AutomationProgress?.isRunning(item.automation_id) === true;
 }
 
 function setAutomationStatus(text, success = null) {
@@ -1190,6 +1269,7 @@ function renderAutomations() {
     for (const item of visibleAutomations) {
         const card = document.createElement("article");
         card.className = `automation-card${item.enabled ? "" : " is-disabled"}`;
+        card.dataset.automationId = item.automation_id;
         const copy = document.createElement("div");
         copy.className = "automation-card-copy";
         const title = document.createElement("h3");
@@ -1288,9 +1368,13 @@ function renderAutomations() {
         card.append(copy, actions);
         const diagnostics = window.AutomationInspector?.createPanel(item.automation_id);
         if (diagnostics) card.append(diagnostics);
+        const progress = window.AutomationProgress?.createPanel(item.automation_id);
+        if (progress) card.append(progress);
         card.append(history);
         automationList.append(card);
     }
+    window.AutomationProgress?.refresh();
+    window.GatewayWorkspace?.refresh();
 }
 
 function requestAutomationRunHistory(automationId) {
@@ -1619,7 +1703,7 @@ function submitAutomation(event) {
     try {
         config = buildAutomationConfig();
     } catch (error) {
-        automationFeedback.textContent = error.message || localized("Проверьте структуру блоков.", "Check the block structure.");
+        setFeedback(automationFeedback, error.message || localized("Проверьте структуру блоков.", "Check the block structure."), "error");
         return;
     }
     const existing = automations.find(item => item.automation_id === editingAutomationId);
@@ -1628,7 +1712,7 @@ function submitAutomation(event) {
         enabled: existing?.enabled ?? true,
         config
     })) {
-        automationFeedback.textContent = localized("Проверяю и сохраняю…", "Validating and saving…");
+        setFeedback(automationFeedback, localized("Проверяю и сохраняю…", "Validating and saving…"), "info");
     }
 }
 
@@ -1643,6 +1727,7 @@ function updateAutomationEditorMode() {
             ? localized("Сохранить изменения", "Save changes")
             : localized("Сохранить сценарий", "Save scenario");
     }
+    window.AutomationProgress?.refresh();
 }
 
 function requestDeviceSchemaHistory(deviceId) {
@@ -1695,6 +1780,7 @@ function connectGateway() {
         requestEvents({ reset: true });
         sendGatewayAction("get_automations");
         window.DeviceManagement?.connected();
+        window.GatewayWorkspace?.connected();
     });
 
     gatewaySocket.addEventListener("message", (event) => {
@@ -1753,6 +1839,11 @@ function connectGateway() {
 // =========================
 
 function handleGatewayMessage(message) {
+    if (window.GatewayWorkspace?.handleMessage(message)) return;
+    if (window.AutomationProgress?.handleMessage(message)) {
+        window.GatewayWorkspace?.refresh();
+        return;
+    }
     if (window.DeviceManagement?.handleMessage(message)) return;
     switch (message.type) {
         case "automation_list": {
@@ -1875,7 +1966,7 @@ function handleGatewayMessage(message) {
             const text = message.success
                 ? localized("Готово.", "Done.")
                 : (message.message || localized("Не удалось изменить сценарий.", "Could not update the scenario."));
-            if (message.type === "automation_save_result") automationFeedback.textContent = text;
+            if (message.type === "automation_save_result") setFeedback(automationFeedback, text, message.success);
             else setAutomationStatus(text, message.success);
             if (message.success && message.type === "automation_delete_result" && message.automation_id === editingAutomationId) {
                 editingAutomationId = null;
@@ -1902,7 +1993,7 @@ function handleGatewayMessage(message) {
             pendingManualRuns.delete(message.automation_id);
             const text = message.message || (message.success ? localized("Сценарий запущен.", "Scenario started.") : localized("Не удалось запустить сценарий.", "Could not start the scenario."));
             setAutomationStatus(text, message.success);
-            setActivity(text);
+            setActivity(text, message.success);
             sendGatewayAction("get_automations");
             renderAutomations();
             break;
@@ -1933,7 +2024,7 @@ function handleGatewayMessage(message) {
         case "blocked_device_result":
         case "schema_restore_result":
         case "schema_history_delete_result": {
-            setActivity(message.message || "Запрос обработан.");
+            setActivity(message.message || "Запрос обработан.", message.success);
             if (message.type === "schema_restore_result" && message.success) {
                 schemaHistoryByDevice.delete(message.device);
                 requestDevices();
@@ -2017,6 +2108,9 @@ function handleGatewayMessage(message) {
                 receivedStats[key] = value;
             }
             if (Object.keys(receivedStats).length === statKeys.length) {
+                if (Number.isFinite(Number(message.history_sample_count)) && Number(message.history_sample_count) >= 0) {
+                    receivedStats.history_sample_count = Number(message.history_sample_count);
+                }
                 databaseStats = receivedStats;
                 databaseStatsReceivedAt = performance.now() / 1000;
                 databaseStatsFrozenElapsed = gatewayIsConnectedState ? null : 0;
@@ -2030,10 +2124,10 @@ function handleGatewayMessage(message) {
             if (databaseBackupRefreshPending) {
                 databaseBackupRefreshPending = false;
                 if (databaseBackupFeedback) {
-                    databaseBackupFeedback.textContent = localized(
+                    setFeedback(databaseBackupFeedback, localized(
                         "Список резервных копий обновлён.",
                         "Backup list updated."
-                    );
+                    ), "success");
                 }
             }
             renderDatabaseBackups();
@@ -2042,12 +2136,12 @@ function handleGatewayMessage(message) {
         case "database_backup_result":
             databaseBackupActionPending = false;
             if (databaseBackupFeedback) {
-                databaseBackupFeedback.textContent = message.success
+                setFeedback(databaseBackupFeedback, message.success
                     ? localized("Резервная копия создана на Gateway.", "Backup created on the Gateway.")
                     : localized(
                         `Не удалось создать копию: ${message.message || "ошибка"}`,
                         `Could not create the backup: ${message.message || "unknown error"}`
-                    );
+                    ), message.success);
             }
             renderDatabaseBackups();
             break;
@@ -2055,7 +2149,7 @@ function handleGatewayMessage(message) {
         case "database_backup_restore_result":
             databaseBackupActionPending = false;
             if (databaseBackupFeedback) {
-                databaseBackupFeedback.textContent = message.success
+                setFeedback(databaseBackupFeedback, message.success
                     ? localized(
                         "База восстановлена. Устройства отключены и могут подключиться снова.",
                         "Database restored. Devices are disconnected and can reconnect."
@@ -2063,7 +2157,7 @@ function handleGatewayMessage(message) {
                     : localized(
                         `Не удалось восстановить базу: ${message.message || "ошибка"}`,
                         `Could not restore the database: ${message.message || "unknown error"}`
-                    );
+                    ), message.success);
             }
             renderDatabaseBackups();
             break;
@@ -2119,7 +2213,7 @@ function handleGatewayMessage(message) {
             if (dialog && dialog.dataset.deviceId === message.device) {
                 dialog.configurationEditor?.applyResult(message);
             }
-            if (message.message) setActivity(message.message);
+            if (message.message) setActivity(message.message, message.success);
             requestDevices();
             break;
         }
@@ -2135,9 +2229,9 @@ function handleGatewayMessage(message) {
 
         case "parameter_ui_preference_result": {
             if (message.success) {
-                setActivity(message.message || localized("Вид элемента сохранён.", "Control style saved."));
+                setActivity(message.message || localized("Вид элемента сохранён.", "Control style saved."), message.success);
             } else {
-                setActivity(message.message || localized("Не удалось сохранить вид элемента.", "Could not save the control style."));
+                setActivity(message.message || localized("Не удалось сохранить вид элемента.", "Could not save the control style."), message.success);
                 renderDevices();
             }
             break;
@@ -2180,7 +2274,7 @@ function handleGatewayMessage(message) {
                     }
                 }
             }
-            setActivity(message.message || localized("Идентификаторы устройства обновлены.", "Device identity updated."));
+            setActivity(message.message || localized("Идентификаторы устройства обновлены.", "Device identity updated."), message.success);
             break;
         }
 
@@ -2442,7 +2536,7 @@ function handleGatewayMessage(message) {
                     requestDeviceSchemaHistory(message.device);
                 }
             }
-            setActivity(message.message || "Решение по Schema обработано.");
+            setActivity(message.message || "Решение по Schema обработано.", message.success);
             if (message.success !== true) requestDevices();
             break;
         }
@@ -2476,6 +2570,7 @@ function handleGatewayMessage(message) {
             console.log("Сообщение от Gateway:", message);
         }
     }
+    window.GatewayWorkspace?.refresh();
 }
 
 // =========================
@@ -2610,10 +2705,9 @@ function createDeviceModeControls(device) {
     status.dataset.role = "mode-status";
 
     if (!entries.length) {
-        select.disabled = true;
-        select.setAttribute("aria-label", localized("Нет объявленных режимов", "No registered modes"));
-        status.textContent = localized("У этого устройства нет зарегистрированных режимов.", "This device has no registered modes.");
-        section.append(heading, label, actions, status);
+        section.classList.add("is-empty");
+        status.textContent = localized("Режимы не объявлены прошивкой", "No modes declared by firmware");
+        section.append(heading, status);
         return section;
     }
 
@@ -2812,6 +2906,7 @@ function renderDeviceAccessDialog() {
 
     const heading = document.createElement("h2");
     heading.textContent = localized("Разрешить подключение устройства?", "Allow this device to connect?");
+    labelDialog(dialog, heading);
 
     const intro = document.createElement("p");
     intro.textContent = localized(
@@ -3264,12 +3359,40 @@ function getVisibleDevices() {
     return filtered;
 }
 
+function preserveDeviceControlFocus() {
+    const focused = document.activeElement;
+    const previousPanel = focused?.closest(".device-panel");
+    if (!previousPanel || !deviceCard?.contains(previousPanel)) return () => {};
+    const keys = ["role", "parameterId", "actionId", "modeId", "modeOperation"];
+    const parameterId = focused.closest("[data-parameter-id]")?.dataset.parameterId;
+    return () => {
+        if (focused.isConnected || document.activeElement !== document.body) return;
+        const panel = [...deviceCard.querySelectorAll(".device-panel")]
+            .find(item => item.dataset.deviceId === previousPanel.dataset.deviceId);
+        const replacement = [...(panel?.querySelectorAll("button, input, select, textarea, summary, [tabindex]") || [])]
+            .find(item => item.tagName === focused.tagName && (focused.dataset.role || item.className === focused.className) &&
+                keys.every(key => item.dataset[key] === focused.dataset[key]) &&
+                item.closest("[data-parameter-id]")?.dataset.parameterId === parameterId);
+        if (replacement && !replacement.disabled && !replacement.closest("[hidden]")) {
+            for (let details = replacement.closest("details"); details && panel.contains(details); details = details.parentElement?.closest("details")) {
+                details.open = true;
+            }
+            replacement.focus({ preventScroll: true });
+        } else {
+            const fallback = deviceCard.querySelector(".device-filter-empty button") ||
+                document.querySelector(".device-tools-titlebar") || document.getElementById("tab-devices");
+            fallback?.focus({ preventScroll: true });
+        }
+    };
+}
+
 function renderDevices() {
     if (!deviceCard) {
         console.error("Не найден элемент .device-card");
         return;
     }
 
+    const restoreFocus = preserveDeviceControlFocus();
     for (const input of deviceCard.querySelectorAll('[data-role="parameter-input"][data-dirty="true"]')) {
         deviceDrafts.set(`${input.dataset.deviceId}\u0000${input.dataset.parameterId}`, input.value);
     }
@@ -3288,6 +3411,9 @@ function renderDevices() {
 
         deviceCard.appendChild(empty);
         renderOverview();
+        window.DeviceViews?.arrange(deviceCard, []);
+        window.GatewayWorkspace?.refresh();
+        restoreFocus();
         return;
     }
 
@@ -3326,6 +3452,9 @@ function renderDevices() {
         empty.append(message, reset);
         deviceCard.appendChild(empty);
         renderOverview();
+        window.DeviceViews?.arrange(deviceCard, []);
+        window.GatewayWorkspace?.refresh();
+        restoreFocus();
         return;
     }
 
@@ -3801,11 +3930,15 @@ function renderDevices() {
         hint.dataset.role = "device-hint";
         panel.appendChild(hint);
 
+        window.GatewayWorkspace?.attachDevice(device, panel);
         deviceCard.appendChild(panel);
-        updateDevicePanel(device);
+        updateDevicePanel(device, true);
     }
 
     renderOverview();
+    window.DeviceViews?.arrange(deviceCard, visibleDevices);
+    window.GatewayWorkspace?.refresh();
+    restoreFocus();
 }
 
 function deviceTelemetryFreshness(device) {
@@ -3859,7 +3992,7 @@ function updateDeviceFreshnessHints() {
     }
 }
 
-function updateDevicePanel(device) {
+function updateDevicePanel(device, deferViews = false) {
     const panel = [...(deviceCard?.querySelectorAll(".device-panel") || [])]
         .find(item => item.dataset.deviceId === device.device);
     if (!panel) return;
@@ -4018,7 +4151,11 @@ function updateDevicePanel(device) {
 
     updateDeviceHint(device, panel);
     window.DeviceManagement?.updateHealth(device, panel);
-    renderOverview();
+    if (!deferViews) {
+        window.DeviceViews?.refresh();
+        window.GatewayWorkspace?.refresh();
+        renderOverview();
+    }
 }
 
 function renderOverview() {
@@ -5024,12 +5161,14 @@ function openDeviceConfigurationDialog(device) {
     }
     const dialog = document.createElement("dialog");
     dialog.className = "action-dialog device-config-dialog";
+    dialog.dataset.deviceId = device.device;
     const form = document.createElement("form");
     form.className = "action-dialog-form device-config-form";
     form.addEventListener("submit", event => event.preventDefault());
 
     const heading = document.createElement("h3");
     heading.textContent = localized("Конфигурация оборудования", "Hardware configuration");
+    labelDialog(dialog, heading);
     const intro = document.createElement("p");
     intro.textContent = localized(
         "Выбирайте только драйверы и GPIO, объявленные прошивкой. Конфигурация хранится в Gateway и применяется после подтверждения ESP32.",
@@ -5880,7 +6019,7 @@ function openDeviceConfigurationDialog(device) {
                 if (validationRequestId !== requestId) return;
                 validationRequestId = null;
                 saveAfterValidation = null;
-                feedback.textContent = localized("Gateway не ответил на проверку. Повторите сохранение после восстановления связи.", "Gateway did not respond to validation. Retry saving when the connection is available.");
+                setFeedback(feedback, localized("Gateway не ответил на проверку. Повторите сохранение после восстановления связи.", "Gateway did not respond to validation. Retry saving when the connection is available."), "error");
                 refreshSavedState();
                 renderValidation();
             }, 8000);
@@ -5909,9 +6048,9 @@ function openDeviceConfigurationDialog(device) {
         savingRequestId = createCommandId();
         savingSignature = draftSignature();
         saveAfterValidation = null;
-        feedback.textContent = currentDevice().connected
+        setFeedback(feedback, currentDevice().connected
             ? localized("Сохраняю и отправляю конфигурацию…", "Saving and sending the configuration…")
-            : localized("Сохраняю конфигурацию; она будет отправлена при подключении устройства.", "Saving the configuration; it will be sent when the device connects.");
+            : localized("Сохраняю конфигурацию; она будет отправлена при подключении устройства.", "Saving the configuration; it will be sent when the device connects."), "info");
         if (!sendGatewayAction("save_device_configuration", {
             device: device.device,
             configuration: configurationFromDraft(),
@@ -5929,7 +6068,7 @@ function openDeviceConfigurationDialog(device) {
             if (savingRequestId !== requestId && retryRequestId !== requestId) return;
             savingRequestId = null;
             retryRequestId = null;
-            feedback.textContent = localized("Ответ Gateway не получен. Черновик остаётся в окне; проверьте сохранённую и подтверждённую версии перед повторной отправкой.", "No Gateway response was received. Your draft remains in this window; check the saved and confirmed versions before resending.");
+            setFeedback(feedback, localized("Ответ Gateway не получен. Черновик остаётся в окне; проверьте сохранённую и подтверждённую версии перед повторной отправкой.", "No Gateway response was received. Your draft remains in this window; check the saved and confirmed versions before resending."), "error");
             requestDevices();
             refreshSavedState();
             renderValidation();
@@ -5945,17 +6084,17 @@ function openDeviceConfigurationDialog(device) {
             !Number.isInteger(version) || version < 1 ||
             canonicalJson(configurationFromDraft()) !== canonicalJson(savedConfiguration)
         ) {
-            feedback.textContent = localized(
+            setFeedback(feedback, localized(
                 "Сначала сохраните эту конфигурацию в Gateway. После этого скачайте файл для прошивки.",
                 "Save this configuration on Gateway first, then download the firmware file."
-            );
+            ), "info");
             return;
         }
         downloadEmbeddedDeviceConfiguration(savedConfiguration, version);
-        feedback.textContent = localized(
+        setFeedback(feedback, localized(
             "Скопируйте файл в esp32/universal/include/device_configuration.generated.h и соберите прошивку. Gateway продолжит хранить основную копию конфигурации.",
             "Copy the file to esp32/universal/include/device_configuration.generated.h and build the firmware. Gateway remains the primary configuration store."
-        );
+        ), "info");
     });
 
     add.addEventListener("click", () => {
@@ -5983,7 +6122,7 @@ function openDeviceConfigurationDialog(device) {
     retry.addEventListener("click", () => {
         if (retry.disabled || savingRequestId || saveAfterValidation) return;
         retryRequestId = createCommandId();
-        feedback.textContent = localized("Повторно отправляю сохранённую конфигурацию. Черновик не меняется.", "Resending the saved configuration. Your draft is unchanged.");
+        setFeedback(feedback, localized("Повторно отправляю сохранённую конфигурацию. Черновик не меняется.", "Resending the saved configuration. Your draft is unchanged."), "info");
         if (!sendGatewayAction("retry_device_configuration", { device: device.device, request_id: retryRequestId })) retryRequestId = null;
         else startOperationTimeout(retryRequestId);
         refreshSavedState();
@@ -6062,9 +6201,9 @@ function openDeviceConfigurationDialog(device) {
                 component.ui_control = importedPreferences[component.parameter_id] || "schema";
             }
             renderComponents();
-            feedback.textContent = localized("Конфигурация загружена. Нажмите «Сохранить и применить».", "Configuration loaded. Select Save and apply to continue.");
+            setFeedback(feedback, localized("Конфигурация загружена. Нажмите «Сохранить и применить».", "Configuration loaded. Select Save and apply to continue."), "info");
         } catch (error) {
-            feedback.textContent = error.message || localized("Не удалось прочитать JSON.", "Could not read the JSON file.");
+            setFeedback(feedback, error.message || localized("Не удалось прочитать JSON.", "Could not read the JSON file."), "error");
         } finally {
             importInput.value = "";
         }
@@ -6092,7 +6231,7 @@ function openDeviceConfigurationDialog(device) {
             if (message.success) baselineSignature = savingSignature;
             savingRequestId = null;
             savingSignature = null;
-            feedback.textContent = message.message || localized("Запрос сохранения обработан.", "Save request processed.");
+            setFeedback(feedback, message.message || localized("Запрос сохранения обработан.", "Save request processed."), message.success);
             if (!message.success && Array.isArray(message.errors)) serverErrors = message.errors;
             refreshSavedState();
             renderValidation();
@@ -6101,12 +6240,12 @@ function openDeviceConfigurationDialog(device) {
             if (message.request_id !== retryRequestId) return;
             window.clearTimeout(operationTimeout);
             retryRequestId = null;
-            feedback.textContent = message.message || localized("Запрос повторного применения обработан.", "Retry request processed.");
+            setFeedback(feedback, message.message || localized("Запрос повторного применения обработан.", "Retry request processed."), message.success);
             refreshSavedState();
             renderValidation();
         },
         applyResult(message) {
-            feedback.textContent = message.message || "";
+            setFeedback(feedback, message.message || "", message.success);
             refreshSavedState();
         },
         connectionChanged(connected) {
@@ -6119,7 +6258,7 @@ function openDeviceConfigurationDialog(device) {
                 saveAfterValidation = null;
                 savingRequestId = null;
                 retryRequestId = null;
-                feedback.textContent = localized("Соединение с Gateway потеряно. Черновик сохранён в этом окне; после подключения проверьте версии.", "Gateway connection was lost. Your draft remains in this window; check the versions after reconnecting.");
+                setFeedback(feedback, localized("Соединение с Gateway потеряно. Черновик сохранён в этом окне; после подключения проверьте версии.", "Gateway connection was lost. Your draft remains in this window; check the versions after reconnecting."), "warning");
             } else requestValidation();
             refreshSavedState();
             renderValidation();
@@ -6162,11 +6301,13 @@ function openDeviceConfigurationDialog(device) {
 function openActionDialog(deviceId, actionId, definition) {
     const dialog = document.createElement("dialog");
     dialog.className = "action-dialog";
+    dialog.dataset.deviceId = deviceId;
     const form = document.createElement("form");
     form.className = "action-dialog-form";
 
     const heading = document.createElement("h3");
     heading.textContent = definition.label || actionId;
+    labelDialog(dialog, heading);
     form.appendChild(heading);
 
     if (definition.description) {
@@ -6432,19 +6573,19 @@ databaseBackupCreateButton?.addEventListener("click", () => {
     if (databaseBackupActionPending) return;
     databaseBackupActionPending = true;
     if (databaseBackupFeedback) {
-        databaseBackupFeedback.textContent = localized(
+        setFeedback(databaseBackupFeedback, localized(
             "Создаю согласованную копию базы…",
             "Creating a consistent database snapshot…"
-        );
+        ), "info");
     }
     renderDatabaseBackups();
     if (!sendGatewayAction("create_database_backup")) {
         databaseBackupActionPending = false;
         if (databaseBackupFeedback) {
-            databaseBackupFeedback.textContent = localized(
+            setFeedback(databaseBackupFeedback, localized(
                 "Gateway не принял запрос на создание копии.",
                 "Gateway did not accept the backup request."
-            );
+            ), "error");
         }
         renderDatabaseBackups();
     }
@@ -6453,14 +6594,14 @@ databaseBackupCreateButton?.addEventListener("click", () => {
 databaseBackupRefreshButton?.addEventListener("click", () => {
     if (databaseBackupActionPending || databaseBackupRefreshPending) return;
     databaseBackupRefreshPending = true;
-    databaseBackupFeedback.textContent = localized("Обновляю список…", "Refreshing backup list…");
+    setFeedback(databaseBackupFeedback, localized("Обновляю список…", "Refreshing backup list…"), "info");
     renderDatabaseBackups();
     if (!sendGatewayAction("get_database_backups")) {
         databaseBackupRefreshPending = false;
-        databaseBackupFeedback.textContent = localized(
+        setFeedback(databaseBackupFeedback, localized(
             "Gateway не принял запрос на обновление списка.",
             "Gateway did not accept the refresh request."
-        );
+        ), "error");
         renderDatabaseBackups();
     }
 });
@@ -6482,6 +6623,45 @@ window.DeviceManagement?.initialize({
     eventsChanged: () => {
         requestEvents({ reset: true });
         requestDatabaseStats();
+    }
+});
+window.DeviceViews?.initialize({
+    localized, getDevices: () => devices, renderDevices,
+    isConnected: isGatewayConnected,
+    executeOff: groupId => window.DeviceManagement?.executeOff(groupId)
+});
+window.AutomationProgress?.init({
+    translate: localized, language: () => uiSettings.language,
+    getAutomations: () => automations, getDevices: () => devices,
+    getEditingId: () => editingAutomationId, isConnected: isGatewayConnected
+});
+window.GatewayWorkspace?.initialize({
+    localized, language: () => uiSettings.language, timezone: () => uiSettings.timezone,
+    getDevices: () => devices, getAutomations: () => automations,
+    isConnected: isGatewayConnected, activePage: () => activePage, setActivePage,
+    send: sendGatewayAction, labelDialog,
+    formatValue: formatDisplayedParameterValue, formatTime: formatEventTime,
+    command: sendParameterCommand, commandBusy: hasPendingParameterCommand,
+    actionBusy: (device, action) => Boolean(findPendingCommand(device, "actionId", action)),
+    canControl: device => device.connected && isGatewayConnected() && !device.pending_schema && !isDeviceConfigurationBusy(device),
+    callAction(deviceId, actionId) {
+        const device = devices.find(item => item.device === deviceId);
+        const definition = device?.schema?.actions?.[actionId];
+        if (!definition) return;
+        if (Object.keys(definition.arguments || {}).length) openActionDialog(deviceId, actionId, definition);
+        else sendDeviceAction(deviceId, actionId);
+    },
+    runScenario: launchManualScenario, scenarioBusy: manualScenarioIsBusy,
+    openDevice(deviceId) {
+        deviceFilter = "all";
+        if (deviceSearchInput) deviceSearchInput.value = "";
+        window.DeviceManagement?.resetGroupFilter();
+        setActivePage("devices"); renderDevices();
+        window.DeviceViews?.revealDevice(deviceId);
+        const panel = [...deviceCard.querySelectorAll(".device-panel")].find(item => item.dataset.deviceId === deviceId);
+        if (!panel) return;
+        for (let details = panel.closest("details"); details; details = details.parentElement?.closest("details")) details.open = true;
+        panel.tabIndex = -1; panel.scrollIntoView({ block: "start", behavior: "smooth" }); panel.focus({ preventScroll: true });
     }
 });
 initializeInterface();

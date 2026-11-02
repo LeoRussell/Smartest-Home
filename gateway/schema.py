@@ -6,6 +6,7 @@ import math
 import re
 from device_management import validate_schema_common_commands
 from device_configuration import validate_device_configuration
+from history import valid_history_definition
 
 
 class SchemaMixin:
@@ -296,7 +297,7 @@ class SchemaMixin:
         supported_types = {"boolean", "integer", "number", "string", "enum", "json"}
         allowed_parameter_fields = {
             "label", "description", "component", "type", "access", "unit",
-            "precision", "min", "max", "step", "options", "control"
+            "precision", "min", "max", "step", "options", "control", "history"
         }
         for key, definition in parameters.items():
             parameter_type = definition.get("type") if isinstance(definition, dict) else None
@@ -314,6 +315,9 @@ class SchemaMixin:
                 return False
 
             if parameter_type == "json" and access != "read_only":
+                return False
+
+            if not valid_history_definition(definition):
                 return False
 
             if "control" in definition:

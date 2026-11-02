@@ -778,6 +778,7 @@
             } else {
                 throw new Error(text("missingBlock"));
             }
+            statements[statements.length - 1].block_id = block.id;
             block = block.getNextBlock();
         }
         return statements;
@@ -814,6 +815,24 @@
         const body = parseStatements(event.getNextBlock());
         if (!body.length) throw new Error(text("emptyBody"));
         return { version: 1, trigger, body };
+    }
+
+    function programTag() {
+        const numberBytes = new DataView(new ArrayBuffer(8));
+        function canonical(value) {
+            if (value === null) return "z";
+            if (typeof value === "boolean") return value ? "t" : "f";
+            if (typeof value === "number") {
+                numberBytes.setFloat64(0, value);
+                return "n" + [...new Uint8Array(numberBytes.buffer)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+            }
+            if (typeof value === "string") return "s" + JSON.stringify(value);
+            if (Array.isArray(value)) return `a[${value.map(canonical).join(",")}]`;
+            return `o{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+        }
+        let hash = 2166136261;
+        for (const byte of new TextEncoder().encode(canonical(compile()))) hash = Math.imul(hash ^ byte, 16777619) >>> 0;
+        return hash.toString(16).padStart(8, "0");
     }
 
     function load(state) {
@@ -926,6 +945,7 @@
         load,
         loadLegacy,
         compile,
+        programTag,
         getState: () => workspace ? Blockly.serialization.workspaces.save(workspace) : null,
         clear() {
             workspace?.clear();
@@ -940,6 +960,10 @@
             announceHistoryState();
         },
         resize,
+        highlightBlock(blockId) {
+            if (!workspace) return;
+            workspace.highlightBlock(blockId && workspace.getBlockById(blockId) ? blockId : null);
+        },
         replaceDeviceId(oldId, newId) {
             if (typeof oldId !== "string" || typeof newId !== "string" || oldId === newId) return;
             if (workspace) stateBeforeDeviceRefresh = Blockly.serialization.workspaces.save(workspace);

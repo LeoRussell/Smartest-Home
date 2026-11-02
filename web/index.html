@@ -6,8 +6,12 @@
     <meta name="theme-color" content="#008080">
     <title>IoT Gateway</title>
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="desktop.css">
+    <link rel="stylesheet" href="workspace.css">
+    <link rel="stylesheet" href="device-views.css">
 </head>
 <body>
+    <a class="skip-link" href="#main-content" data-ru="Перейти к содержимому" data-en="Skip to content">Перейти к содержимому</a>
     <header class="topbar">
         <a class="brand" href="#devices-page" aria-label="IoT Gateway — устройства">
             <span class="brand-mark" aria-hidden="true">
@@ -62,8 +66,12 @@
                 <span class="navigation-icon" aria-hidden="true">▦</span><span class="navigation-label" data-ru="Устройства" data-en="Devices">Устройства</span>
             </button>
             <button class="navigation-item" type="button" role="tab" aria-selected="false"
+                    id="tab-overview" data-page="overview" aria-controls="overview-page">
+                <span class="navigation-icon" aria-hidden="true">▣</span><span class="navigation-label" data-ru="Обзор" data-en="Overview">Обзор</span>
+            </button>
+            <button class="navigation-item" type="button" role="tab" aria-selected="false"
                     id="tab-automations" data-page="automations" aria-controls="automations-page">
-                <span class="navigation-icon" aria-hidden="true">⚡</span><span class="navigation-label" data-ru="Автоматизация" data-en="Automation">Автоматизация</span>
+                <span class="navigation-icon" aria-hidden="true">⚡</span><span class="navigation-label" data-ru="Автоматизация" data-en="Automation">Автоматизация</span><span class="navigation-label-short" aria-hidden="true" data-ru="Сценарии" data-en="Automation">Сценарии</span>
             </button>
             <button class="navigation-item" type="button" role="tab" aria-selected="false"
                     id="tab-events" data-page="events" aria-controls="events-page">
@@ -76,7 +84,19 @@
         </nav>
 
         <div class="page-content">
-            <main>
+            <main id="main-content" tabindex="-1">
+                <section id="overview-page" class="page-panel" data-page-panel="overview" role="tabpanel" aria-labelledby="tab-overview" hidden>
+                    <section class="section-heading">
+                        <div>
+                            <h1 data-ru="Обзор" data-en="Overview">Обзор</h1>
+                            <p data-ru="Нужные показания, команды и история датчиков" data-en="Your readings, commands and sensor history">Нужные показания, команды и история датчиков</p>
+                        </div>
+                        <button id="workspace-customize" type="button" data-ru="Настроить" data-en="Customize">Настроить</button>
+                    </section>
+                    <p class="workspace-note" data-ru="Состав панели сохраняется в этом браузере. Настройте её под свои устройства." data-en="This dashboard is saved in this browser. Customize it for your devices.">Состав панели сохраняется в этом браузере. Настройте её под свои устройства.</p>
+                    <div id="workspace-tiles" class="workspace-tiles"></div>
+                    <section id="parameter-history-panel" class="history-panel" aria-labelledby="history-title"></section>
+                </section>
                 <section id="devices-page" class="page-panel" data-page-panel="devices" role="tabpanel" aria-labelledby="tab-devices">
                     <section class="section-heading">
                         <div>
@@ -92,11 +112,10 @@
                     <p id="action-feedback" class="action-feedback" aria-live="polite" hidden></p>
 
                     <section id="dashboard-overview" class="dashboard-overview" aria-label="Сводка устройств"></section>
-                    <section class="device-tools-window" aria-label="Инструменты списка устройств">
-                        <div class="device-tools-titlebar">
+                    <details class="device-tools-window" open>
+                        <summary class="device-tools-titlebar">
                             <strong data-ru="Проводник устройств" data-en="Device Explorer">Проводник устройств</strong>
-                            <span class="window-controls" aria-hidden="true">_ □ ×</span>
-                        </div>
+                        </summary>
                         <div class="device-tools-controls">
                             <label class="device-search-control">
                                 <span data-ru="Найти устройство" data-en="Find a device">Найти устройство</span>
@@ -110,31 +129,31 @@
                                     <option value="status" data-ru="Сначала на связи" data-en="Online first">Сначала на связи</option>
                                 </select>
                             </label>
+                            <label class="management-field"><span data-ru="Группа" data-en="Group">Группа</span><select id="device-group-filter"><option value="all">Все группы</option></select></label>
                             <button id="device-filter-reset" class="device-filter-reset" type="button" data-ru="Сбросить фильтры" data-en="Reset filters">Сбросить фильтры</button>
                         </div>
-                        <div class="device-tools-status" role="status" aria-live="polite">
-                            <span id="device-result-count"></span>
-                            <span data-ru="Закреплённые устройства будут сверху" data-en="Pinned devices stay at the top">Закреплённые устройства будут сверху</span>
-                        </div>
                         <div class="device-group-tools">
-                            <label class="management-field"><span data-ru="Группа" data-en="Group">Группа</span><select id="device-group-filter"><option value="all">Все группы</option></select></label>
                             <button id="device-groups-manage" type="button" data-ru="Управлять группами…" data-en="Manage groups…">Управлять группами…</button>
                             <span class="device-group-tools-spacer"></span>
                             <button id="common-off-group" type="button" disabled data-ru="Выключить группу" data-en="Turn group off">Выключить группу</button>
                             <button id="common-off-all" class="management-off-button" type="button" disabled data-ru="Выключить все…" data-en="Turn all off…">Выключить все…</button>
+                        </div>
+                        <div class="device-tools-status" role="status" aria-live="polite">
+                            <span id="device-result-count"></span>
+                            <span data-ru="Закреплённые устройства будут сверху" data-en="Pinned devices stay at the top">Закреплённые устройства будут сверху</span>
                         </div>
                         <details id="common-command-results" class="common-command-results" hidden>
                             <summary id="common-command-summary"></summary>
                             <p id="common-command-note"></p>
                             <ul id="common-command-result-list"></ul>
                         </details>
-                    </section>
+                    </details>
                     <section class="manual-scenario-panel" id="manual-scenario-panel" hidden aria-labelledby="manual-scenario-title">
                         <h2 id="manual-scenario-title" data-ru="Быстрые сценарии" data-en="Quick scenarios">Быстрые сценарии</h2>
                         <p data-ru="Сохранённые сценарии, запускаемые кнопкой" data-en="Saved scenarios started with a button">Сохранённые сценарии, запускаемые кнопкой</p>
                         <div id="manual-scenario-buttons" class="manual-scenario-buttons"></div>
                     </section>
-                    <section class="device-card" aria-live="polite"></section>
+                    <section class="device-card"></section>
 
                     <details id="blocked-devices" class="blocked-devices" hidden>
                         <summary>
@@ -304,6 +323,7 @@
                             <div class="database-stat"><dt data-ru="Подключалось устройств" data-en="Devices ever connected">Подключалось устройств</dt><dd data-db-stat="ever_connected_device_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Подключено сейчас" data-en="Connected now">Подключено сейчас</dt><dd data-db-stat="connected_device_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Событий" data-en="Events">Событий</dt><dd data-db-stat="event_count">—</dd></div>
+                            <div class="database-stat"><dt data-ru="Замеров в истории" data-en="History samples">Замеров в истории</dt><dd data-db-stat="history_sample_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Снимков Schema" data-en="Schema snapshots">Снимков Schema</dt><dd data-db-stat="schema_snapshot_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Аппаратных конфигураций" data-en="Hardware configurations">Аппаратных конфигураций</dt><dd data-db-stat="device_configuration_count">—</dd></div>
                             <div class="database-stat"><dt data-ru="Версий конфигурации" data-en="Configuration versions">Версий конфигурации</dt><dd data-db-stat="device_configuration_history_count">—</dd></div>
@@ -348,6 +368,9 @@
     <script src="automation-blockly.js"></script>
     <script src="automation-diagnostics.js"></script>
     <script src="device-management.js"></script>
+    <script src="device-views.js"></script>
+    <script src="automation-progress.js"></script>
+    <script src="workspace.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

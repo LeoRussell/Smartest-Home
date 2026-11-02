@@ -15,9 +15,15 @@
     let retentionDirty = false;
     let retentionPending = false;
     let retentionTimer = null;
+    let dialogSequence = 0;
     const healthBaselines = new Map();
     const byId = id => document.getElementById(id);
     const t = (ru, en) => context?.localized(ru, en) || ru;
+    function setFeedback(element, text, outcome = "info") {
+        if (!element) return;
+        element.textContent = text || "";
+        element.dataset.state = outcome === true ? "success" : outcome === false ? "error" : outcome;
+    }
     const node = (tag, text, className) => {
         const result = document.createElement(tag);
         if (text != null) result.textContent = text;
@@ -52,13 +58,33 @@
 
     function dialog(title) {
         const result = node("dialog", null, "management-dialog");
+        const opener = document.activeElement;
         result.setAttribute("aria-label", title);
-        result.append(node("h2", title, "management-dialog-title"));
+        const heading = node("h2", title, "management-dialog-title");
+        heading.id = `management-dialog-title-${++dialogSequence}`;
+        result.setAttribute("aria-labelledby", heading.id);
+        result.append(heading);
         const body = node("div", null, "management-dialog-body");
         result.append(body);
         document.body.append(result);
-        result.addEventListener("close", () => result.remove());
+        result.addEventListener("close", () => {
+            result.remove();
+            const active = document.activeElement;
+            if (active && active !== document.body && active !== opener && !active.closest("[hidden]")) return;
+            if (opener?.isConnected && !opener.disabled && !opener.closest("[hidden]")) {
+                opener.focus({ preventScroll: true });
+                return;
+            }
+            const panel = [...document.querySelectorAll(".device-panel")]
+                .find(item => item.dataset.deviceId === result.dataset.deviceId && !item.closest("[hidden]"));
+            panel?.querySelector('[data-role="device-settings"]')?.focus({ preventScroll: true });
+        });
         result.showModal();
+        queueMicrotask(() => {
+            if (result.open && document.activeElement === result) {
+                result.querySelector("input:not(:disabled), select:not(:disabled), button:not(:disabled)")?.focus({ preventScroll: true });
+            }
+        });
         return { root: result, body };
     }
 
@@ -96,6 +122,7 @@
         renderRetention();
         renderBulk();
         refreshDeviceSettings();
+        window.DeviceViews?.refresh();
     }
 
     function scopeDevices(groupId) {
@@ -185,7 +212,7 @@
             if (!name || !online) return;
             if (context.send("save_device_group", { name })) {
                 add.disabled = true;
-                feedback.textContent = t("Сохраняю…", "Saving…");
+                setFeedback(feedback, t("Сохраняю…", "Saving…"), "info");
             }
         });
         groupDialog.render = () => {
@@ -205,11 +232,17 @@
                 name.setAttribute("aria-label", t("Название группы", "Group name"));
                 const save = button(t("Переименовать", "Rename"), () => {
                     if (!name.value.trim()) return;
-                    if (context.send("save_device_group", { group_id: group.group_id, name: name.value.trim() })) save.disabled = true;
+                    if (context.send("save_device_group", { group_id: group.group_id, name: name.value.trim() })) {
+                        save.disabled = true;
+                        setFeedback(feedback, t("Сохраняю…", "Saving…"));
+                    }
                 });
                 const remove = button(t("Удалить", "Delete"), () => {
                     if (!window.confirm(t(`Удалить группу «${group.name}»? Устройства останутся без группы.`, `Delete group “${group.name}”? Its devices will become ungrouped.`))) return;
-                    if (context.send("delete_device_group", { group_id: group.group_id })) remove.disabled = true;
+                    if (context.send("delete_device_group", { group_id: group.group_id })) {
+                        remove.disabled = true;
+                        setFeedback(feedback, t("Удаляю…", "Deleting…"));
+                    }
                 });
                 save.disabled = remove.disabled = !online;
                 row.append(name, node("small", `${getDevices().filter(device => device.group_id === group.group_id).length}`), save, remove);
@@ -342,12 +375,12 @@
         };
         name.addEventListener("input", () => {
             view.identityState.nameDirty = name.value !== view.identityState.savedName;
-            feedback.textContent = "";
+            setFeedback(feedback, "", "info");
         });
         id.addEventListener("input", () => {
             id.setCustomValidity("");
             view.identityState.idDirty = id.value !== view.identityState.savedId;
-            feedback.textContent = "";
+            setFeedback(feedback, "", "info");
         });
         form.addEventListener("submit", event => {
             event.preventDefault();
@@ -367,7 +400,7 @@
             const payload = { device: current.device, new_device_id: nextId, display_name: name.value.trim() };
             if (context.send("update_device_identity", payload)) {
                 view.identityState.pending = payload;
-                feedback.textContent = t("Сохраняю…", "Saving…");
+                setFeedback(feedback, t("Сохраняю…", "Saving…"), "info");
                 refreshIdentityEditor(current);
             }
         });
@@ -399,7 +432,7 @@
         const state = view.identityState;
         const pending = state.pending;
         state.pending = null;
-        state.feedback.textContent = message.message || (message.success ? t("Имя и ID сохранены.", "Name and ID saved.") : t("Не удалось сохранить имя и ID.", "Could not save the name and ID."));
+        setFeedback(state.feedback, message.message || (message.success ? t("Имя и ID сохранены.", "Name and ID saved.") : t("Не удалось сохранить имя и ID.", "Could not save the name and ID.")), message.success);
         if (message.success) {
             const current = getDevices().find(item => item.device === message.device);
             const nextId = message.new_device_id || pending?.new_device_id || message.device;
@@ -564,10 +597,10 @@
                 if (context.send("save_common_command", fields)) {
                     deviceSettingsDialog.savePending = true;
                     save.disabled = true;
-                    feedback.textContent = t("Сохраняю…", "Saving…");
+                    setFeedback(feedback, t("Сохраняю…", "Saving…"), "info");
                 }
             } catch (error) {
-                feedback.textContent = error.message;
+                setFeedback(feedback, error.message, "error");
             }
         });
         for (const event of ["input", "change"]) form.addEventListener(event, () => {
@@ -639,12 +672,12 @@
         if (value > 0 && !window.confirm(t(`Сохранять события за последние ${value} дней? Более старые события будут удалены без возможности отмены. Резервные копии остаются отдельно.`, `Keep events for the last ${value} days? Older events will be permanently deleted. Backups are kept separately.`))) return;
         if (!context.send("set_gateway_settings", { event_retention_days: value, request_id: requestId() })) return;
         retentionPending = true;
-        byId("event-retention-feedback").textContent = t("Сохраняю настройку…", "Saving setting…");
+        setFeedback(byId("event-retention-feedback"), t("Сохраняю настройку…", "Saving setting…"), "info");
         clearTimeout(retentionTimer);
         retentionTimer = setTimeout(() => {
             if (!retentionPending) return;
             retentionPending = false;
-            byId("event-retention-feedback").textContent = t("Ответ не получен. Переподключитесь и проверьте сохранённое значение.", "No response received. Reconnect and check the saved value.");
+            setFeedback(byId("event-retention-feedback"), t("Ответ не получен. Переподключитесь и проверьте сохранённое значение.", "No response received. Reconnect and check the saved value."), "error");
             renderRetention();
         }, 20000);
         renderRetention();
@@ -653,13 +686,13 @@
     function setConnected(connected) {
         if (online && !connected) {
             const notice = t("Соединение потеряно. После подключения проверьте сохранённые изменения.", "Connection lost. Check the saved changes after reconnecting.");
-            if (groupDialog?.root.open) groupDialog.feedback.textContent = notice;
+            if (groupDialog?.root.open) setFeedback(groupDialog.feedback, notice, "warning");
             if (deviceSettingsDialog?.root.open) {
-                deviceSettingsDialog.notice.textContent = notice;
+                setFeedback(deviceSettingsDialog.notice, notice, "warning");
                 deviceSettingsDialog.savePending = false;
                 if (deviceSettingsDialog.identityState) {
                     deviceSettingsDialog.identityState.pending = null;
-                    deviceSettingsDialog.identityState.feedback.textContent = notice;
+                    setFeedback(deviceSettingsDialog.identityState.feedback, notice, "warning");
                 }
             }
             if (activeBulk) {
@@ -670,7 +703,7 @@
             if (retentionPending) {
                 clearTimeout(retentionTimer);
                 retentionPending = false;
-                byId("event-retention-feedback").textContent = t("Связь потеряна. После подключения проверьте сохранённое значение.", "Connection lost. Check the saved value after reconnecting.");
+                setFeedback(byId("event-retention-feedback"), t("Связь потеряна. После подключения проверьте сохранённое значение.", "Connection lost. Check the saved value after reconnecting."), "warning");
             }
         }
         online = connected;
@@ -693,15 +726,15 @@
                 return true;
             case "group_update_result":
                 if (deviceSettingsDialog?.root.open && deviceSettingsDialog.device === message.device) {
-                    deviceSettingsDialog.notice.textContent = message.message || t("Группа обновлена.", "Group updated.");
+                    setFeedback(deviceSettingsDialog.notice, message.message || t("Группа обновлена.", "Group updated."), message.success);
                     deviceSettingsDialog.groupSignature = null;
                 }
                 if (groupDialog?.root.open) {
-                    groupDialog.feedback.textContent = message.message || (message.success ? t("Сохранено.", "Saved.") : t("Не удалось сохранить.", "Could not save."));
+                    setFeedback(groupDialog.feedback, message.message || (message.success ? t("Сохранено.", "Saved.") : t("Не удалось сохранить.", "Could not save.")), message.success);
                     if (message.success) groupDialog.clearDrafts();
                     groupDialog.render();
                 }
-                else context.feedback(message.message || (message.success ? t("Группа обновлена.", "Group updated.") : t("Не удалось изменить группу.", "Could not update group.")));
+                else context.feedback(message.message || (message.success ? t("Группа обновлена.", "Group updated.") : t("Не удалось изменить группу.", "Could not update group.")), message.success);
                 requestGroups();
                 context.send("get_devices");
                 refresh();
@@ -710,11 +743,11 @@
                 if (deviceSettingsDialog?.root.open && (!message.device || deviceSettingsDialog.device === message.device)) {
                     deviceSettingsDialog.savePending = false;
                     deviceSettingsDialog.formDirty = message.success ? false : deviceSettingsDialog.formDirty;
-                    deviceSettingsDialog.feedback.textContent = message.message || (message.success ? t("Назначение сохранено.", "Assignment saved.") : t("Не удалось сохранить назначение.", "Could not save assignment."));
-                    deviceSettingsDialog.notice.textContent = deviceSettingsDialog.feedback.textContent;
+                    setFeedback(deviceSettingsDialog.feedback, message.message || (message.success ? t("Назначение сохранено.", "Assignment saved.") : t("Не удалось сохранить назначение.", "Could not save assignment.")), message.success);
+                    setFeedback(deviceSettingsDialog.notice, deviceSettingsDialog.feedback.textContent, message.success);
                     refreshDeviceSettings();
                 }
-                context.feedback(message.message || (message.success ? t("Назначение сохранено.", "Assignment saved.") : t("Ошибка назначения.", "Assignment failed.")));
+                context.feedback(message.message || (message.success ? t("Назначение сохранено.", "Assignment saved.") : t("Ошибка назначения.", "Assignment failed.")), message.success);
                 context.send("get_devices");
                 return true;
             case "common_command_result":
@@ -740,7 +773,7 @@
                     context.send("get_gateway_settings");
                     context.eventsChanged?.();
                 }
-                byId("event-retention-feedback").textContent = message.message || (message.success ? t("Срок хранения сохранён.", "Retention saved.") : t("Не удалось сохранить настройку.", "Could not save setting."));
+                setFeedback(byId("event-retention-feedback"), message.message || (message.success ? t("Срок хранения сохранён.", "Retention saved.") : t("Не удалось сохранить настройку.", "Could not save setting.")), message.success);
                 renderRetention();
                 return true;
             case "device_health": {
@@ -773,9 +806,16 @@
         connected() { requestGroups(); context?.send("get_gateway_settings"); },
         setConnected, refresh, handleMessage, appendDeviceExtras, updateHealth,
         openDeviceSettings, refreshDeviceSettings,
+        executeOff,
+        getGroupName(id) { return groups.find(group => group.group_id === id)?.name || null; },
+        getGroups() { return groups.map(group => ({ ...group })); },
+        canExecuteOff(id) {
+            return online && !activeBulk && groups.some(group => group.group_id === id) &&
+                scopeDevices(id).some(offOperation);
+        },
         settingsResult(message) {
             if (deviceSettingsDialog?.root.open && deviceSettingsDialog.device === message.device) {
-                deviceSettingsDialog.notice.textContent = message.message || "";
+                setFeedback(deviceSettingsDialog.notice, message.message || "", message.success);
                 refreshDeviceSettings();
             }
         },

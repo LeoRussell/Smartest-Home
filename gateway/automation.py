@@ -5,12 +5,85 @@ import json
 import math
 import re
 import sqlite3
+import struct
+import time
 import uuid
 from datetime import datetime, timezone
 from errors import AutomationExecutionError, AutomationStoppedError
 
 
 class AutomationMixin:
+    @staticmethod
+    def automation_program_tag(program):
+        """Correlate a live run with the editor's program, without trusting block IDs alone."""
+        def canonical(value):
+            if value is None:
+                return "z"
+            if isinstance(value, bool):
+                return "t" if value else "f"
+            if isinstance(value, (int, float)):
+                if isinstance(value, int) and abs(value) > 9007199254740991:
+                    return f"i{value};"
+                if not math.isfinite(value):
+                    raise ValueError("Non-finite program value")
+                # IEEE bytes avoid Python/JavaScript differences in 1e-7 formatting.
+                return "n" + struct.pack(">d", value).hex()
+            if isinstance(value, str):
+                return "s" + json.dumps(value, ensure_ascii=False)
+            if isinstance(value, list):
+                return "a[" + ",".join(canonical(item) for item in value) + "]"
+            if isinstance(value, dict):
+                return "o{" + ",".join(json.dumps(key, ensure_ascii=False) + ":" + canonical(value[key]) for key in sorted(value)) + "}"
+            raise TypeError("Unsupported program value")
+
+        try:
+            encoded = canonical(program).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError, OverflowError):
+            return None
+        # A small UI correlation tag, never an authorisation or integrity check.
+        result = 2166136261
+        for byte in encoded:
+            result = ((result ^ byte) * 16777619) & 0xffffffff
+        return f"{result:08x}"
+
+    def automation_progress_snapshot(self, automation_id):
+        state = getattr(self, "_automation_progress", {}).get(automation_id)
+        if state is None:
+            return None
+        snapshot = {key: value for key, value in state.items() if not key.startswith("_")}
+        snapshot["server_time"] = self.current_time()
+        if state.get("stage") == "wait":
+            snapshot["remaining_seconds"] = max(0, state["_wait_deadline"] - time.monotonic())
+        return snapshot
+
+    async def publish_automation_progress(self, automation_id, run_id, stage, *,
+                                          step_type=None, details=None, block_id=None,
+                                          status="running", error=None, wait_deadline=None):
+        states = getattr(self, "_automation_progress", {})
+        previous = states.get(automation_id)
+        # A cancelled old run can finish after its replacement has started.
+        if previous is None or previous["run_id"] != run_id:
+            return
+        state = dict(previous)
+        state.update(stage=stage, status=status, step_type=step_type,
+                     details=dict(details or {}), block_id=block_id, error=error)
+        state["sequence"] = previous.get("sequence", 0) + 1
+        if stage not in {"starting", "acknowledgment", "finished"}:
+            state["step_number"] += 1
+        if stage == "wait":
+            state["_wait_deadline"] = wait_deadline if wait_deadline is not None else time.monotonic() + details["seconds"]
+        else:
+            state.pop("_wait_deadline", None)
+        states[automation_id] = state
+        try:
+            await self.broadcast({"type": "automation_progress", **self.automation_progress_snapshot(automation_id)})
+        except Exception as progress_error:
+            # UI telemetry must not interrupt a device command or its acknowledgement.
+            print(f"[АВТОМАТИЗАЦИЯ] Не удалось отправить ход запуска: {progress_error}")
+        finally:
+            if status != "running" and states.get(automation_id) is state:
+                states.pop(automation_id, None)
+
     def get_automations(self):
         with self.database_connection() as conn:
             rows = conn.execute("""
@@ -34,7 +107,8 @@ class AutomationMixin:
                 "last_triggered_at": triggered,
                 "run_status": run_status,
                 "last_run_status": last_run_status,
-                "last_error": last_error
+                "last_error": last_error,
+                "active_progress": self.automation_progress_snapshot(automation_id)
             })
         return result
 
@@ -393,9 +467,18 @@ class AutomationMixin:
                 count_node(depth)
                 if not isinstance(statement, dict):
                     raise ValueError("Некорректный блок действия.")
+                if "block_id" in statement and (
+                    not isinstance(statement["block_id"], str)
+                    or not 1 <= len(statement["block_id"]) <= 128
+                    or any(ord(character) < 32 for character in statement["block_id"])
+                ):
+                    raise ValueError("Некорректный идентификатор блока.")
+                # Source IDs identify the corresponding Blockly block. They never
+                # affect evaluation or authorise any additional device operation.
+                statement_keys = set(statement) - {"block_id"}
                 kind = statement.get("type")
                 if kind == "set_parameter":
-                    if set(statement) != {"type", "device", "parameter", "value"}:
+                    if statement_keys != {"type", "device", "parameter", "value"}:
                         raise ValueError("Некорректный блок установки параметра.")
                     metadata = metadata_for(statement.get("device"))
                     definition = metadata.get("schema", {}).get("parameters", {}).get(statement.get("parameter")) if metadata else None
@@ -411,7 +494,7 @@ class AutomationMixin:
                         if definition.get("type") != "enum" or value_type not in {"enum", "string", "integer", "number", "boolean"}:
                             raise ValueError("Тип значения команды не совпадает со Schema параметра.")
                 elif kind == "invoke_action":
-                    if set(statement) != {"type", "device", "action", "arguments"}:
+                    if statement_keys != {"type", "device", "action", "arguments"}:
                         raise ValueError("Некорректный блок вызова действия.")
                     metadata = metadata_for(statement.get("device"))
                     definition = metadata.get("schema", {}).get("actions", {}).get(statement.get("action")) if metadata else None
@@ -421,14 +504,14 @@ class AutomationMixin:
                 elif kind == "wait":
                     seconds = statement.get("seconds")
                     if (
-                        set(statement) != {"type", "seconds"}
+                        statement_keys != {"type", "seconds"}
                         or type(seconds) not in (int, float)
                         or not 0 <= seconds <= 3600
                         or not math.isfinite(seconds)
                     ):
                         raise ValueError("Пауза должна быть числом от 0 до 3600 секунд.")
                 elif kind == "if":
-                    if set(statement) != {"type", "branches", "else"}:
+                    if statement_keys != {"type", "branches", "else"}:
                         raise ValueError("Некорректный блок ЕСЛИ.")
                     branches = statement.get("branches")
                     if not isinstance(branches, list) or not 1 <= len(branches) <= 6:
@@ -765,6 +848,10 @@ class AutomationMixin:
             if statement["type"] == "if":
                 branch_taken = False
                 for index, branch in enumerate(statement["branches"], start=1):
+                    await self.publish_automation_progress(
+                        automation_id, run_id, "condition", step_type="condition",
+                        details={"branch": index}, block_id=statement.get("block_id")
+                    )
                     step_id = self.start_automation_run_step(
                         run_id, "condition", {"branch": index}
                     )
@@ -789,6 +876,10 @@ class AutomationMixin:
                 if not branch_taken:
                     otherwise = statement["else"]
                     if otherwise:
+                        await self.publish_automation_progress(
+                            automation_id, run_id, "otherwise", step_type="otherwise",
+                            block_id=statement.get("block_id")
+                        )
                         step_id = self.start_automation_run_step(run_id, "otherwise")
                         try:
                             await self.execute_automation_statements(
@@ -809,6 +900,12 @@ class AutomationMixin:
 
             if statement["type"] == "wait":
                 seconds = statement["seconds"]
+                deadline = time.monotonic() + seconds
+                await self.publish_automation_progress(
+                    automation_id, run_id, "wait", step_type="wait",
+                    details={"seconds": seconds}, block_id=statement.get("block_id"),
+                    wait_deadline=deadline
+                )
                 step_id = self.start_automation_run_step(
                     run_id, "wait", {"seconds": seconds}
                 )
@@ -816,13 +913,12 @@ class AutomationMixin:
                 if current_task is not None:
                     self.automation_waiting_tasks.add(current_task)
                 try:
-                    deadline = asyncio.get_running_loop().time() + seconds
                     while True:
                         if automation_id in self.automation_stop_requests:
                             raise AutomationStoppedError(
                                 "Остановлено пользователем во время паузы."
                             )
-                        remaining = deadline - asyncio.get_running_loop().time()
+                        remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
                         await asyncio.sleep(min(remaining, 0.25))
@@ -851,6 +947,10 @@ class AutomationMixin:
             elif step_type == "invoke_action":
                 step_details["action"] = statement["action"]
                 step_details["arguments"] = statement["arguments"]
+            await self.publish_automation_progress(
+                automation_id, run_id, "sending", step_type=step_type,
+                details=step_details, block_id=statement.get("block_id")
+            )
             step_id = self.start_automation_run_step(run_id, step_type, step_details)
             try:
                 if not self.device_is_connected(device_id):
@@ -881,6 +981,10 @@ class AutomationMixin:
                     raise AutomationExecutionError(
                         f"Gateway не смог отправить команду устройству {device_id}."
                     )
+                await self.publish_automation_progress(
+                    automation_id, run_id, "acknowledgment", step_type=step_type,
+                    details=step_details, block_id=statement.get("block_id")
+                )
                 result = await asyncio.wait_for(
                     result_future,
                     timeout=self.COMMAND_TIMEOUT_SECONDS * (self.COMMAND_RETRY_LIMIT + 2)
@@ -968,6 +1072,15 @@ class AutomationMixin:
             self.automation_stop_requests.discard(automation_id)
             existing_task.cancel()
 
+        if not hasattr(self, "_automation_progress"):
+            self._automation_progress = {}
+        self._automation_progress[automation_id] = {
+            "automation_id": automation_id, "run_id": run_id, "status": "running",
+            "stage": "starting", "step_number": 0, "step_type": None,
+            "details": {}, "block_id": None, "sequence": 0,
+            "started_at": self.current_time(),
+            "program_tag": self.automation_program_tag(config.get("program"))
+        }
         new_task = asyncio.create_task(
             self.execute_automation_run(automation_id, config, reason, run_id)
         )
@@ -980,6 +1093,7 @@ class AutomationMixin:
         error_text = None
         status = "succeeded"
         try:
+            await self.publish_automation_progress(automation_id, run_id, "starting")
             validation_error = self.validate_automation_config(config)
             if validation_error:
                 raise AutomationExecutionError(f"Schema изменилась: {validation_error}")
@@ -1037,6 +1151,9 @@ class AutomationMixin:
                 self.automation_tasks.pop(automation_id, None)
                 self.automation_stop_requests.discard(automation_id)
             try:
+                await self.publish_automation_progress(
+                    automation_id, run_id, "finished", status=status, error=error_text
+                )
                 await self.publish_automation_list()
             except asyncio.CancelledError:
                 pass
