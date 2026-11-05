@@ -131,6 +131,21 @@ class ParameterHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["unit"], "°F")
         self.assertEqual([point["value"] for point in response["points"]], [68])
 
+    def test_boolean_bucket_uses_latest_timestamp_after_clock_moves_backwards(self):
+        self.history.save_settings({"enabled": True, "retention_days": 30, "interval_seconds": 1})
+        self.history.record("sensor", {"enabled": False}, sampled_at=self.now - 20)
+        self.history.record("sensor", {"enabled": True}, sampled_at=self.now - 5)
+        # A later insertion can carry an earlier timestamp after a clock correction.
+        self.history.record("sensor", {"enabled": False}, sampled_at=self.now - 15)
+        request = {"device": "sensor", "parameter": "enabled", "range": "hour", "max_points": 10}
+        point = self.history.query(request)["points"][-1]
+        self.assertEqual(point["timestamp"], self.history.iso(self.now - 5))
+        self.assertEqual((point["value"], point["min"], point["max"], point["count"]), (1, 0, 1, 3))
+        # For an equal timestamp the later observation wins deterministically.
+        self.history.record("sensor", {"enabled": False}, sampled_at=self.now - 5)
+        point = self.history.query(request)["points"][-1]
+        self.assertEqual((point["value"], point["count"]), (0, 4))
+
     def test_extreme_finite_values_do_not_produce_invalid_json_averages(self):
         self.history.record("sensor", {"temperature": 1e308}, sampled_at=self.now - 60)
         self.history.record("sensor", {"temperature": 1e308}, sampled_at=self.now - 30)

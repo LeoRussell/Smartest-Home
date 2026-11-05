@@ -55,6 +55,7 @@ void onGatewayEvent(WStype_t type, uint8_t* payload, size_t length) {
                 break;
             }
             if (message["type"] == "hello_ack") {
+                gateway.setGatewayDeviceId(message["device"]);
                 gatewayRegistered = true;
                 device.sendState(gateway);
             } else if (gatewayRegistered) {

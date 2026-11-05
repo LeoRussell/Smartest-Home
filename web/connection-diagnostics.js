@@ -60,6 +60,28 @@
         view.live = false;
     }
 
+    function downloadReport() {
+        if (!view?.data || !view.sessions.length || view.pending) return;
+        const report = {
+            format: "smartest-home-connection-report", version: 1,
+            exported_at: new Date().toISOString(), received_at: view.data.received_at || null,
+            device: { id: view.device, name: deviceName(view.device) },
+            gateway_connected: context.isConnected(),
+            scope: "loaded_sessions", loaded_session_count: view.sessions.length,
+            has_more: Boolean(view.data.has_more), retention_days: view.data.retention_days,
+            summary: view.data.summary,
+            sessions: view.sessions.map(session => {
+                const { receivedAt, ...fields } = session;
+                return { ...fields, duration_seconds: duration(session) };
+            })
+        };
+        const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json;charset=utf-8" }));
+        const link = node("a"); link.href = url;
+        link.download = `${view.device.replace(/[^A-Za-z0-9_.-]/g, "_")}-connections-${new Date().toISOString().slice(0, 10)}.json`;
+        link.hidden = true; document.body.append(link); link.click(); link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
     function request(append = false) {
         if (!view || view.pending || view.unsupported || !context.isConnected()) return;
         const requestId = `connections-${Date.now()}-${++sequence}`;
@@ -81,6 +103,9 @@
         if (!view) return;
         view.heading.textContent = t(`История соединений · ${deviceName(view.device)}`, `Connection history · ${deviceName(view.device)}`);
         view.refresh.textContent = t("Обновить", "Refresh");
+        view.download.textContent = t("Скачать отчёт", "Download report");
+        view.download.title = t("JSON с загруженными сессиями и измерениями. Для полной истории сначала загрузите более ранние подключения.", "JSON containing loaded sessions and measurements. Load older connections first to include more history.");
+        view.download.disabled = !view.sessions.length || Boolean(view.pending);
         view.more.textContent = t("Более ранние подключения", "Older connections");
         view.close.textContent = t("Закрыть", "Close");
         view.explanation.textContent = help();
@@ -158,15 +183,16 @@
         const body = node("div", null, "management-dialog-body");
         const tools = node("div", null, "connection-history-tools");
         const refresh = button("", () => request());
+        const download = button("", downloadReport); download.dataset.role = "connection-report";
         const summary = node("p", "", "management-help");
         const status = node("p", "", "management-feedback"); status.setAttribute("role", "status");
         const list = node("div", null, "connection-session-list");
         const more = button("", () => request(true));
         const explanation = node("p", help(), "management-help");
         const actions = node("div", null, "management-dialog-actions"); const close = button("", () => root.close());
-        tools.append(refresh); actions.append(close); body.append(tools, summary, status, list, more, explanation, actions); root.append(heading, body);
+        tools.append(download, refresh); actions.append(close); body.append(tools, summary, status, list, more, explanation, actions); root.append(heading, body);
         const data = cache.get(deviceId) || null;
-        const current = { root, heading, body, refresh, more, close, summary, status, list, explanation, device: deviceId, pending: null, timeout: null, sessions: (data?.sessions || []).map(session => ({ ...session })), data, live: false, paged: false, notice: "", noticeState: "info", unsupported: false };
+        const current = { root, heading, body, refresh, download, more, close, summary, status, list, explanation, device: deviceId, pending: null, timeout: null, sessions: (data?.sessions || []).map(session => ({ ...session })), data, live: false, paged: false, notice: "", noticeState: "info", unsupported: false };
         view = current;
         root.addEventListener("close", () => {
             if (view === current) { freezeDurations(); remember(); view = null; }
@@ -199,7 +225,7 @@
                 const combined = new Map((append ? view.sessions : []).map(item => [item.session_id, item]));
                 for (const session of incoming) combined.set(session.session_id, session);
                 view.sessions = [...combined.values()].sort((a, b) => b.session_id - a.session_id).slice(0, 100);
-                view.data = message; view.live = true; view.paged = append; view.notice = ""; view.noticeState = "info";
+                view.data = { ...message, received_at: new Date().toISOString() }; view.live = true; view.paged = append; view.notice = ""; view.noticeState = "info";
                 remember(); renderSessions(); return true;
             }
             if (message.type === "error" && view?.pending) {

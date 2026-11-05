@@ -106,6 +106,7 @@ let databaseStatsFrozenElapsed = null;
 let databaseBackups = [];
 let databaseBackupActionPending = false;
 let databaseBackupRefreshPending = false;
+let databaseBackupRequest = null;
 let automations = [];
 let editingAutomationId = null;
 let pendingAutomationWorkspaceState = null;
@@ -266,6 +267,44 @@ function databaseBackupDownloadUrl(backupId) {
     return `${protocol}//${host}:8765/gateway-backups/${encodeURIComponent(backupId)}`;
 }
 
+function finishDatabaseBackupRequest() {
+    if (databaseBackupRequest) window.clearTimeout(databaseBackupRequest.timer);
+    databaseBackupRequest = null;
+    databaseBackupActionPending = false;
+    databaseBackupRefreshPending = false;
+}
+
+function requestDatabaseBackup(action, fields = {}) {
+    if (databaseBackupRequest || databaseBackupActionPending || databaseBackupRefreshPending) return false;
+    const request = { action, id: createCommandId(), timer: null };
+    databaseBackupRequest = request;
+    databaseBackupRefreshPending = action === "get_database_backups";
+    databaseBackupActionPending = !databaseBackupRefreshPending;
+    const waiting = action === "get_database_backups"
+        ? localized("Обновляю список…", "Refreshing backup list…")
+        : action === "create_database_backup"
+            ? localized("Создаю согласованную копию базы…", "Creating a consistent database snapshot…")
+            : localized("Восстанавливаю базу…", "Restoring database…");
+    setFeedback(databaseBackupFeedback, waiting, "info");
+    renderDatabaseBackups();
+    if (!sendGatewayAction(action, { ...fields, request_id: request.id })) {
+        finishDatabaseBackupRequest();
+        setFeedback(databaseBackupFeedback, localized("Gateway не принял запрос. Проверьте соединение.", "The Gateway did not accept the request. Check the connection."), "error");
+        renderDatabaseBackups();
+        return false;
+    }
+    const timeout = action === "get_database_backups" ? 15000 : action === "create_database_backup" ? 30000 : 90000;
+    request.timer = window.setTimeout(() => {
+        if (databaseBackupRequest !== request) return;
+        finishDatabaseBackupRequest();
+        setFeedback(databaseBackupFeedback, action === "get_database_backups"
+            ? localized("Ответ со списком не получен. Проверьте связь и обновите список ещё раз.", "No backup list received. Check the connection and refresh the list again.")
+            : localized("Подтверждение операции не получено. Она могла завершиться на Gateway: проверьте список и состояние шлюза перед повторением.", "No operation confirmation received. It may have completed on the Gateway: check the list and Gateway state before repeating it."), "warning");
+        renderDatabaseBackups();
+    }, timeout);
+    return true;
+}
+
 function deviceConfigurationExportUrl(deviceId) {
     const host = window.location.hostname || "localhost";
     const protocol = window.location.protocol === "https:" ? "https:" : "http:";
@@ -329,17 +368,7 @@ function renderDatabaseBackups() {
                 `Restore the database from the backup created ${formatEventTime(backup.created_at)}? The current database will be saved separately. Gateway will stop scenarios and disconnect devices, which can reconnect afterward. Data created after this backup will be replaced.`
             );
             if (!window.confirm(prompt)) return;
-            databaseBackupActionPending = true;
-            setFeedback(databaseBackupFeedback, localized("Восстанавливаю базу…", "Restoring database…"), "info");
-            renderDatabaseBackups();
-            if (!sendGatewayAction("restore_database_backup", { backup_id: backup.backup_id })) {
-                databaseBackupActionPending = false;
-                setFeedback(databaseBackupFeedback, localized(
-                    "Gateway не принял запрос на восстановление.",
-                    "Gateway did not accept the restore request."
-                ), "error");
-                renderDatabaseBackups();
-            }
+            requestDatabaseBackup("restore_database_backup", { backup_id: backup.backup_id });
         });
 
         actions.append(download, restore);
@@ -606,7 +635,14 @@ function renderNotifications() {
             : localized("Новых событий нет", "No new events");
     }
 
-    notificationList.replaceChildren();
+    const focused = document.activeElement;
+    const focusWasInside = notificationList.contains(focused);
+    const oldItems = new Map([...notificationList.querySelectorAll("[data-notification-id]")]
+        .map(item => [item.dataset.notificationId, item]));
+    const ids = new Set(unreadNotifications.map(event => String(event.id)));
+    for (const child of [...notificationList.children]) {
+        if (!ids.has(child.dataset.notificationId)) child.remove();
+    }
     if (count === 0) {
         const empty = document.createElement("p");
         empty.className = "notification-empty";
@@ -615,25 +651,37 @@ function renderNotifications() {
             "New Gateway events will appear here."
         );
         notificationList.appendChild(empty);
+        if (focusWasInside) (markNotificationsReadButton || notificationButton)?.focus({ preventScroll: true });
         return;
     }
 
-    for (const event of unreadNotifications) {
-        const item = document.createElement("button");
-        item.type = "button";
-        item.className = "notification-item";
-        const title = document.createElement("span");
-        title.className = "notification-item-title";
+    for (const [index, event] of unreadNotifications.entries()) {
+        const id = String(event.id);
+        let item = oldItems.get(id);
+        if (!item) {
+            item = document.createElement("button");
+            item.type = "button";
+            item.className = "notification-item";
+            item.dataset.notificationId = id;
+            for (const className of ["notification-item-title", "notification-item-description", "notification-item-time"]) {
+                const element = document.createElement("span"); element.className = className; item.append(element);
+            }
+            item.addEventListener("click", () => {
+                const current = unreadNotifications.find(candidate => String(candidate.id) === id);
+                if (current) openNotificationEvent(current);
+            });
+        }
+        const title = item.querySelector(".notification-item-title");
         title.textContent = `${event.device_id || localized("Устройство", "Device")} · ${eventKindLabel(event)}`;
-        const description = document.createElement("span");
-        description.className = "notification-item-description";
+        const description = item.querySelector(".notification-item-description");
         description.textContent = getEventDescription(event);
-        const timestamp = document.createElement("span");
-        timestamp.className = "notification-item-time";
+        const timestamp = item.querySelector(".notification-item-time");
         timestamp.textContent = formatEventTime(event.timestamp);
-        item.append(title, description, timestamp);
-        item.addEventListener("click", () => openNotificationEvent(event));
-        notificationList.appendChild(item);
+        if (notificationList.children[index] !== item) notificationList.insertBefore(item, notificationList.children[index] || null);
+    }
+    if (focusWasInside && document.activeElement !== focused) {
+        const target = focused.isConnected ? focused : notificationList.querySelector(".notification-item") || markNotificationsReadButton || notificationButton;
+        target?.focus({ preventScroll: true });
     }
 }
 
@@ -982,8 +1030,7 @@ function setGatewayConnectionStatus(message, connected) {
                 "Gateway connection was lost. Reconnect and refresh the list to check the operation result."
             ), "warning");
         }
-        databaseBackupRefreshPending = false;
-        databaseBackupActionPending = false;
+        finishDatabaseBackupRequest();
         const configurationSave = deviceConfigurationDialog?.querySelector(".device-config-save");
         if (configurationSave) configurationSave.disabled = false;
     }
@@ -1450,6 +1497,28 @@ function renderAutomations() {
         edit.addEventListener("click", () => refreshAutomationEditor({
             ...item.config, automation_id: item.automation_id
         }));
+        const copyScenario = document.createElement("button");
+        copyScenario.type = "button";
+        copyScenario.className = "automation-action-button is-copy";
+        copyScenario.dataset.role = "copy-automation";
+        copyScenario.textContent = localized("Копировать", "Copy");
+        copyScenario.title = localized("Открыть копию блоков как новый несохранённый сценарий", "Open a copy of the blocks as a new, unsaved scenario");
+        copyScenario.addEventListener("click", () => {
+            const current = automations.find(candidate => candidate.automation_id === item.automation_id);
+            if (!current) return;
+            const config = JSON.parse(JSON.stringify(current.config));
+            const suffix = localized(" — копия", " — copy");
+            let number = 1, copyName;
+            do {
+                const ending = suffix + (number === 1 ? "" : ` ${number}`);
+                copyName = config.name.slice(0, 80 - ending.length) + ending;
+                number += 1;
+            } while (automations.some(candidate => candidate.config?.name === copyName));
+            config.name = copyName;
+            editingAutomationId = null;
+            refreshAutomationEditor(config);
+            setAutomationStatus(localized("Открыта копия сценария. Проверьте блоки и сохраните её под новым именем.", "A scenario copy is open. Review the blocks and save it with a new name."), true);
+        });
         const check = document.createElement("button");
         check.type = "button";
         check.className = "automation-action-button automation-check-button";
@@ -1479,7 +1548,7 @@ function renderAutomations() {
         simulate.title = localized("Проверить выполнение с виртуальными показаниями", "Test execution with virtual readings");
         simulate.disabled = !isGatewayConnected();
         simulate.addEventListener("click", () => window.AutomationSimulator?.request(item.automation_id));
-        actions.append(toggle, check, simulate, edit, remove);
+        actions.append(toggle, check, simulate, edit, copyScenario, remove);
         card.append(copy, actions);
         const diagnostics = window.AutomationInspector?.createPanel(item.automation_id);
         if (diagnostics) card.append(diagnostics);
@@ -2242,9 +2311,10 @@ function handleGatewayMessage(message) {
         }
 
         case "database_backups":
+            if (message.request_id && (message.request_id !== databaseBackupRequest?.id || databaseBackupRequest?.action !== "get_database_backups")) break;
             databaseBackups = Array.isArray(message.backups) ? message.backups : [];
             if (databaseBackupRefreshPending) {
-                databaseBackupRefreshPending = false;
+                finishDatabaseBackupRequest();
                 if (databaseBackupFeedback) {
                     setFeedback(databaseBackupFeedback, localized(
                         "Список резервных копий обновлён.",
@@ -2256,7 +2326,8 @@ function handleGatewayMessage(message) {
             break;
 
         case "database_backup_result":
-            databaseBackupActionPending = false;
+            if ((message.request_id && message.request_id !== databaseBackupRequest?.id) || (databaseBackupRequest && databaseBackupRequest.action !== "create_database_backup")) break;
+            finishDatabaseBackupRequest();
             if (databaseBackupFeedback) {
                 setFeedback(databaseBackupFeedback, message.success
                     ? localized("Резервная копия создана на Gateway.", "Backup created on the Gateway.")
@@ -2269,7 +2340,8 @@ function handleGatewayMessage(message) {
             break;
 
         case "database_backup_restore_result":
-            databaseBackupActionPending = false;
+            if ((message.request_id && message.request_id !== databaseBackupRequest?.id) || (databaseBackupRequest && databaseBackupRequest.action !== "restore_database_backup")) break;
+            finishDatabaseBackupRequest();
             if (databaseBackupFeedback) {
                 setFeedback(databaseBackupFeedback, message.success
                     ? localized(
@@ -2664,6 +2736,14 @@ function handleGatewayMessage(message) {
         }
 
         case "error": {
+            if (databaseBackupRequest && (
+                message.request_id === databaseBackupRequest.id ||
+                !message.request_id && message.action === databaseBackupRequest.action
+            )) {
+                finishDatabaseBackupRequest();
+                setFeedback(databaseBackupFeedback, message.message || localized("Не удалось выполнить операцию с резервной копией.", "Could not complete the backup operation."), "error");
+                renderDatabaseBackups();
+            }
             if (
                 message.request_id &&
                 activeEventRequest &&
@@ -4717,6 +4797,9 @@ function renderEvents() {
 
     const searchWasFocused = document.activeElement?.classList.contains("event-search-input");
     const oldSearchInput = document.activeElement;
+    const eventFocusWasInside = activityCard.querySelector(".event-history")?.contains(oldSearchInput);
+    const focusedControl = oldSearchInput?.dataset.eventControl;
+    const focusedRowId = oldSearchInput?.closest("[data-event-id]")?.dataset.eventId;
     const searchSelectionStart = searchWasFocused ? oldSearchInput.selectionStart : null;
     const searchSelectionEnd = searchWasFocused ? oldSearchInput.selectionEnd : null;
 
@@ -4747,6 +4830,7 @@ function renderEvents() {
     const searchInput = document.createElement("input");
     searchInput.type = "search";
     searchInput.className = "event-search-input";
+    searchInput.dataset.eventControl = "search";
     searchInput.maxLength = 120;
     searchInput.value = eventSearchQuery;
     searchInput.placeholder = localized(
@@ -4774,6 +4858,7 @@ function renderEvents() {
     const clearSearch = document.createElement("button");
     clearSearch.type = "button";
     clearSearch.className = "event-tool-button";
+    clearSearch.dataset.eventControl = "clear-search";
     clearSearch.textContent = localized("Очистить поиск", "Clear search");
     clearSearch.disabled = !eventSearchQuery.trim();
     clearSearch.addEventListener("click", () => {
@@ -4789,6 +4874,7 @@ function renderEvents() {
     const exportButton = document.createElement("button");
     exportButton.type = "button";
     exportButton.className = "event-tool-button";
+    exportButton.dataset.eventControl = "export";
     exportButton.textContent = localized("Экспорт CSV", "Export CSV");
     exportButton.disabled = events.length === 0;
     exportButton.title = localized(
@@ -4805,6 +4891,7 @@ function renderEvents() {
 
     const deviceFilter = document.createElement("select");
     deviceFilter.className = "event-device-filter";
+    deviceFilter.dataset.eventControl = "device";
 
     const allDevicesOption = document.createElement("option");
     allDevicesOption.value = "all";
@@ -4850,6 +4937,7 @@ function renderEvents() {
 
         button.type = "button";
         button.className = "event-filter";
+        button.dataset.eventControl = `filter:${option.value}`;
         button.textContent = option.label;
         if (option.value === "configuration") button.title = localized(
             "Сохранение, применение и ошибки настроек GPIO и драйверов универсальной ESP32",
@@ -4933,9 +5021,15 @@ function renderEvents() {
     exportButton.disabled = filteredEvents.length === 0;
     exportButton.addEventListener("click", () => exportEventsCsv(filteredEvents));
 
-    const restoreSearchFocus = () => {
-        if (!searchWasFocused) return;
-        searchInput.focus({ preventScroll: true });
+    const restoreEventFocus = () => {
+        if (!eventFocusWasInside) return;
+        const scope = focusedRowId
+            ? [...container.querySelectorAll("[data-event-id]")].find(row => row.dataset.eventId === focusedRowId)
+            : container;
+        let target = [...(scope?.querySelectorAll("[data-event-control]") || [])]
+            .find(element => element.dataset.eventControl === focusedControl && !element.disabled);
+        if (!target && focusedRowId && !focusedControl && scope) { scope.tabIndex = -1; target = scope; }
+        (target || searchInput).focus({ preventScroll: true });
         if (Number.isInteger(searchSelectionStart) && Number.isInteger(searchSelectionEnd)) {
             searchInput.setSelectionRange(searchSelectionStart, searchSelectionEnd);
         }
@@ -4951,7 +5045,7 @@ function renderEvents() {
 
         container.appendChild(empty);
         renderLoadMoreButton(container);
-        restoreSearchFocus();
+        restoreEventFocus();
         return;
     }
 
@@ -5030,6 +5124,7 @@ function renderEvents() {
             const openRun = document.createElement("button");
             openRun.type = "button";
             openRun.className = "event-automation-link";
+            openRun.dataset.eventControl = "run";
             const openRunLabel = scenario?.config?.name
                 ? localized(
                     `Открыть запуск «${scenario.config.name}»`,
@@ -5054,6 +5149,7 @@ function renderEvents() {
             const undo = document.createElement("button");
             undo.type = "button";
             undo.className = "event-action-button";
+            undo.dataset.eventControl = "unblock";
             undo.textContent = localized("Снять постоянный запрет", "Remove permanent block");
             undo.disabled = !isGatewayConnected();
             undo.addEventListener("click", () => {
@@ -5068,7 +5164,7 @@ function renderEvents() {
 
     container.appendChild(list);
     renderLoadMoreButton(container);
-    restoreSearchFocus();
+    restoreEventFocus();
 }
 
 function renderLoadMoreButton(container) {
@@ -5079,6 +5175,7 @@ function renderLoadMoreButton(container) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "event-load-more";
+    button.dataset.eventControl = "more";
     button.disabled = eventsLoading;
     button.textContent = eventsLoading
         ? localized("Загрузка...", "Loading...")
@@ -6694,40 +6791,11 @@ if (refreshButton) {
 }
 
 databaseBackupCreateButton?.addEventListener("click", () => {
-    if (databaseBackupActionPending) return;
-    databaseBackupActionPending = true;
-    if (databaseBackupFeedback) {
-        setFeedback(databaseBackupFeedback, localized(
-            "Создаю согласованную копию базы…",
-            "Creating a consistent database snapshot…"
-        ), "info");
-    }
-    renderDatabaseBackups();
-    if (!sendGatewayAction("create_database_backup")) {
-        databaseBackupActionPending = false;
-        if (databaseBackupFeedback) {
-            setFeedback(databaseBackupFeedback, localized(
-                "Gateway не принял запрос на создание копии.",
-                "Gateway did not accept the backup request."
-            ), "error");
-        }
-        renderDatabaseBackups();
-    }
+    requestDatabaseBackup("create_database_backup");
 });
 
 databaseBackupRefreshButton?.addEventListener("click", () => {
-    if (databaseBackupActionPending || databaseBackupRefreshPending) return;
-    databaseBackupRefreshPending = true;
-    setFeedback(databaseBackupFeedback, localized("Обновляю список…", "Refreshing backup list…"), "info");
-    renderDatabaseBackups();
-    if (!sendGatewayAction("get_database_backups")) {
-        databaseBackupRefreshPending = false;
-        setFeedback(databaseBackupFeedback, localized(
-            "Gateway не принял запрос на обновление списка.",
-            "Gateway did not accept the refresh request."
-        ), "error");
-        renderDatabaseBackups();
-    }
+    requestDatabaseBackup("get_database_backups");
 });
 
 // =========================

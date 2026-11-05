@@ -777,6 +777,9 @@ class AutomationMixin:
                     VALUES (?, ?, ?, ?, ?)
                 """, (automation_id, json.dumps(config, ensure_ascii=False, allow_nan=False),
                       int(enabled), now, now))
+        # Invalidate the previous stability/cooldown wait before any caller can
+        # yield while acknowledging the save to a slow browser.
+        self.cancel_pending_automation_trigger(automation_id)
         return True, "Сценарий сохранён."
 
 
@@ -1321,10 +1324,9 @@ class AutomationMixin:
                     return
                 try:
                     saved_config = json.loads(row[1])
-                    current_trigger = saved_config["program"]["trigger"]
-                except (TypeError, KeyError, json.JSONDecodeError):
+                except (TypeError, json.JSONDecodeError):
                     return
-                if current_trigger != trigger or not self.parameter_value_is_fresh(device_id, parameter):
+                if saved_config != config or not self.parameter_value_is_fresh(device_id, parameter):
                     return
 
                 current_parameters = self.device_states.get(device_id, {})

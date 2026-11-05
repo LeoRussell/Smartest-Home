@@ -4,6 +4,7 @@
 .workspace-empty { padding: 16px; border: 2px inset #fff; background: #ffffe1; color: #222; }
 .workspace-tile { min-width: 0; display: flex; flex-direction: column; align-items: stretch; padding: 14px; border: 2px outset #fff; background: #d4d0c8; }
 .workspace-tile-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 12px; }
+.workspace-tile-tools { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
 .workspace-type { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: #000080; font-size: 12px; font-weight: 700; }
 .workspace-type svg { flex: 0 0 24px; width: 24px; height: 24px; padding: 2px; border: 1px solid #808080; background: #fff; fill: none; stroke: currentColor; stroke-width: 1.5; shape-rendering: crispEdges; }
 .workspace-type-command { color: #3b2800; }
@@ -91,8 +92,13 @@
 .history-table-scroll :is(th, td):first-child { text-align: left; }
 .history-table-scroll caption { padding: 8px; text-align: left; white-space: normal; }
 .device-parameter-name { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.device-parameter-label { overflow-wrap: anywhere; }
 .device-parameter-name .device-parameter-description { flex-basis: 100%; order: 1; }
-.device-parameter-name .history-open-button { flex: 0 0 auto; width: auto; min-height: 28px; padding: 2px 8px; color: #000080; font-size: 12px; }
+.device-parameter-reading { display: flex; justify-content: end; align-items: center; gap: 10px; min-width: 0; }
+.device-parameter-reading .device-parameter-value { min-width: 0; overflow-wrap: anywhere; }
+.gateway-icon-button { display: inline-grid; place-items: center; flex: 0 0 36px; width: 36px; height: 36px; min-width: 36px; min-height: 36px; padding: 5px; color: #000080; }
+.gateway-icon-button svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.gateway-icon-button:hover:not(:disabled) { background: #fff4c9; color: #000080; }
 .history-settings-form { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; gap: 12px; min-width: 0; }
 .history-settings-form .management-feedback { grid-column: 1 / -1; }
 .history-settings-form .management-feedback[data-state="success"] { color: #005000; }
@@ -125,8 +131,16 @@
     .history-tools > label:first-child { grid-column: 1 / -1; }
     .history-tools > button:last-child { grid-column: 1 / -1; }
     .history-tools button { min-width: 0; }
-    .device-parameter-name .history-open-button { min-height: 36px; }
+    .gateway-icon-button { flex-basis: 40px; width: 40px; height: 40px; min-width: 40px; min-height: 40px; }
     .history-settings-form { grid-template-columns: minmax(0, 1fr); }
     .history-chart svg { min-height: 155px; }
     .automation-editor-card { scroll-margin-top: 210px; }
+}
+
+@media (max-width: 480px) {
+    .device-parameter.has-history { grid-template-columns: minmax(0, 1fr) 40px; gap: 8px 12px; }
+    .device-parameter.has-history > .device-parameter-name { grid-column: 1; grid-row: 1; }
+    .device-parameter.has-history > .device-parameter-reading { display: contents; }
+    .device-parameter.has-history > .device-parameter-reading > .device-parameter-value { grid-column: 1 / -1; grid-row: 2; text-align: left; }
+    .device-parameter.has-history > .device-parameter-reading > .history-open-button { grid-column: 2; grid-row: 1; justify-self: end; }
 }

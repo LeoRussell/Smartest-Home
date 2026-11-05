@@ -245,12 +245,13 @@
                 const title = node("h2"), subtitle = node("p", "", "workspace-tile-subtitle"), value = node("strong", "", "workspace-tile-value"), status = node("p", "", "workspace-tile-status");
                 const controls = node("div", null, "workspace-tile-controls");
                 const header = node("div", null, "workspace-tile-header");
-                const handle = dragHandle(item, card); header.append(typeBadge(item), handle);
+                const tools = node("div", null, "workspace-tile-tools");
+                const handle = dragHandle(item, card); tools.append(handle); header.append(typeBadge(item), tools);
                 handle.dataset.workspaceControl = "move";
                 const available = choices().find(candidate => key(candidate) === key(item));
                 title.textContent = available?.title || item.id;
                 subtitle.textContent = item.device || t("Автоматизация Gateway", "Gateway automation");
-                const record = { item, card, title, subtitle, value, status, controls, dragHandle: handle };
+                const record = { item, card, title, subtitle, value, status, controls, tools, dragHandle: handle };
                 if (item.kind === "parameter") {
                     buildParameterTile(record);
                     const draft = drafts.get(key(item));
@@ -345,8 +346,9 @@
             }
         }
         if (scalar(definition)) {
-            const history = button(t("График", "Chart"), () => openHistory(item.device, item.id), "history-open-button");
-            history.dataset.workspaceControl = "history"; controls.append(history);
+            const history = window.GatewayIcons.button("chart", `${t("График показаний", "Readings chart")} · ${definition.label || item.id} · ${name(device)}`,
+                () => openHistory(item.device, item.id), "history-open-button");
+            history.dataset.workspaceControl = "history"; record.tools.prepend(history);
         }
         const open = button(t("К устройству", "Open device"), () => context.openDevice(item.device), "workspace-device-link");
         open.dataset.workspaceControl = "device"; controls.append(open);
@@ -791,10 +793,15 @@
             for (const row of panel.querySelectorAll(".device-parameter")) {
                 const parameter = row.dataset.parameterId;
                 if (!scalar(device.schema?.parameters?.[parameter])) continue;
-                const open = button(t("График", "Chart"), () => openHistory(device.device, parameter), "history-open-button");
+                if (row.querySelector('[data-role="parameter-history"]')) continue;
+                const open = window.GatewayIcons.button("chart", `${t("График показаний", "Readings chart")} · ${device.schema.parameters[parameter].label || parameter} · ${name(device)}`,
+                    () => openHistory(device.device, parameter), "history-open-button");
                 open.dataset.role = "parameter-history"; open.dataset.parameterId = parameter;
-                open.setAttribute("aria-label", `${t("История", "History")} · ${device.schema.parameters[parameter].label || parameter} · ${name(device)}`);
-                row.querySelector(".device-parameter-name")?.append(open);
+                const value = row.querySelector('[data-role="parameter-value"]');
+                if (!value) continue;
+                row.classList.add("has-history");
+                const reading = node("div", null, "device-parameter-reading");
+                value.replaceWith(reading); reading.append(value, open);
             }
         },
         refresh, openHistory

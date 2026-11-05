@@ -626,7 +626,8 @@
         health.dataset.role = "device-health";
         health.setAttribute("aria-live", "off");
         const content = node("div"); content.dataset.role = "device-health-content";
-        const history = button(t("История соединений", "Connection history"), () => window.ConnectionDiagnostics?.open(device.device), "device-connection-link");
+        const history = window.GatewayIcons.button("list", `${t("История соединений", "Connection history")} · ${deviceName(device)}`,
+            () => window.ConnectionDiagnostics?.open(device.device), "device-connection-link");
         history.dataset.role = "connection-history";
         health.append(content, history);
         panel.append(health);
@@ -637,17 +638,24 @@
         const wrapper = panel.querySelector('[data-role="device-health"]');
         const target = wrapper?.querySelector('[data-role="device-health-content"]') || wrapper;
         if (!target) return;
+        const history = wrapper.querySelector('[data-role="connection-history"]');
+        if (history) window.GatewayIcons.label(history, `${t("История соединений", "Connection history")} · ${deviceName(device)}`);
         const health = device.health || {};
         const hasRssi = Number.isInteger(health.wifi_rssi) && health.wifi_rssi <= 0 && health.wifi_rssi >= -127;
         const hasUptime = Number.isFinite(health.uptime_seconds) && health.uptime_seconds >= 0;
         let seconds = hasUptime ? health.uptime_seconds : null;
-        const baselineKey = `${health.updated_at || ""}/${health.uptime_seconds}/${Boolean(device.connected && online)}`;
+        const active = Boolean(device.connected && online);
+        const now = performance.now();
+        const baselineKey = `${health.updated_at || ""}/${health.uptime_seconds}`;
         let baseline = healthBaselines.get(device.device);
         if (!baseline || baseline.key !== baselineKey) {
-            baseline = { key: baselineKey, at: performance.now() };
+            baseline = { key: baselineKey, at: now, seconds: seconds || 0, active };
             healthBaselines.set(device.device, baseline);
+        } else if (baseline.active !== active) {
+            if (baseline.active) baseline.seconds += Math.max(0, (now - baseline.at) / 1000);
+            baseline.at = now; baseline.active = active;
         }
-        if (hasUptime && device.connected && online) seconds += Math.max(0, (performance.now() - baseline.at) / 1000);
+        if (hasUptime) seconds = baseline.seconds + (active ? Math.max(0, (now - baseline.at) / 1000) : 0);
         const stats = node("dl", null, "device-health-stats");
         function stat(caption, value, className = "") {
             const row = node("div", null, className);
@@ -655,7 +663,7 @@
             stats.append(row);
         }
         const signal = !hasRssi ? "—" : `${health.wifi_rssi} dBm · ` + (health.wifi_rssi >= -60 ? t("отлично", "excellent") : health.wifi_rssi >= -70 ? t("хорошо", "good") : health.wifi_rssi >= -80 ? t("слабо", "weak") : t("очень слабо", "very weak"));
-        stat(device.connected ? "Wi-Fi" : t("Последний Wi-Fi", "Last Wi-Fi"), signal, hasRssi && health.wifi_rssi < -75 ? "is-weak" : "");
+        stat(active ? "Wi-Fi" : t("Последний Wi-Fi", "Last Wi-Fi"), signal, hasRssi && health.wifi_rssi < -75 ? "is-weak" : "");
         stat(t("Время работы ESP32", "ESP32 uptime"), seconds == null ? "—" : context.formatDuration(seconds));
         if (health.reset_reason) stat(t("Запуск", "Boot"), health.reset_reason);
         const reason = health.last_disconnect_reason || health.device_disconnect_reason;

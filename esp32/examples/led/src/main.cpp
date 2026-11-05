@@ -289,6 +289,7 @@ void onWebSocketEvent(
 
             const char* typeName = doc["type"] | "";
             if (strcmp(typeName, "hello_ack") == 0) {
+                gateway.setGatewayDeviceId(doc["device"]);
                 gatewayRegistered = true;
                 sendState(ledState);
                 lastStateSentAt = millis();
@@ -297,6 +298,10 @@ void onWebSocketEvent(
             if (!gatewayRegistered) break;
 
             if (strcmp(typeName, "command") == 0) {
+                if (!gateway.targetsDevice(doc["device"], DEVICE_ID)) {
+                    Serial.println("[COMMAND] Ignored command addressed to another device.");
+                    break;
+                }
                 const char* commandName = doc["data"]["command"] | "set";
                 const char* commandId =
                     doc["data"]["command_id"] | "";

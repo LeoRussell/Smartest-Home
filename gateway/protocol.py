@@ -143,12 +143,25 @@ class ProtocolMixin:
             await self.broadcast(message)
 
 
-    async def send_database_backups(self, websocket=None):
+    async def send_database_backups(self, websocket=None, request_id=None):
+        try:
+            backups = self.list_database_backups()
+        except (OSError, sqlite3.Error) as error:
+            print(f"[BACKUP] Could not list database backups: {error}")
+            if websocket is not None:
+                await self.send_json(websocket, {
+                    "type": "error", "action": "get_database_backups",
+                    "request_id": request_id,
+                    "message": f"Could not list backups: {error}",
+                })
+            return
         message = {
             "type": "database_backups",
-            "backups": self.list_database_backups(),
+            "backups": backups,
             "retention_limit": self.DATABASE_BACKUP_LIMIT
         }
+        if request_id is not None:
+            message["request_id"] = request_id
         if websocket is not None:
             await self.send_json(websocket, message)
         else:
@@ -407,7 +420,6 @@ class ProtocolMixin:
                 "automation_id": automation_id, "message": message_text
             })
             if success:
-                self.cancel_pending_automation_trigger(automation_id)
                 await self.publish_automation_list()
             return
 
@@ -958,8 +970,17 @@ class ProtocolMixin:
             await self.send_database_stats(websocket)
             return
 
+        if action in ("get_database_backups", "create_database_backup", "restore_database_backup"):
+            request_id = message.get("request_id")
+            if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
+                await self.send_json(websocket, {
+                    "type": "error", "action": action, "code": "invalid_request_id",
+                    "message": "Invalid backup request identifier.",
+                })
+                return
+
         if action == "get_database_backups":
-            await self.send_database_backups(websocket)
+            await self.send_database_backups(websocket, request_id=request_id)
             return
 
         if action == "create_database_backup":
@@ -967,6 +988,7 @@ class ProtocolMixin:
                 backup = self.create_database_backup()
                 await self.send_json(websocket, {
                     "type": "database_backup_result",
+                    "request_id": request_id,
                     "success": True,
                     "backup": backup,
                     "message": "Backup created."
@@ -976,6 +998,7 @@ class ProtocolMixin:
                 print(f"[BACKUP] Could not create a database backup: {error}")
                 await self.send_json(websocket, {
                     "type": "database_backup_result",
+                    "request_id": request_id,
                     "success": False,
                     "message": f"Could not create a backup: {error}"
                 })
@@ -987,6 +1010,7 @@ class ProtocolMixin:
             )
             await self.send_json(websocket, {
                 "type": "database_backup_restore_result",
+                "request_id": request_id,
                 "success": success,
                 "backup_id": message.get("backup_id"),
                 "message": message_text

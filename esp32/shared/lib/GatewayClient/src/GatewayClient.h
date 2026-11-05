@@ -23,6 +23,10 @@ public:
     bool isConnected();
     bool sendText(const String& message);
     bool sendJson(JsonDocument& document);
+    // Keep the acknowledged Gateway alias separate from the immutable ID sent
+    // by firmware. Legacy commands may omit a target; explicit targets must match.
+    void setGatewayDeviceId(JsonVariantConst deviceId);
+    bool targetsDevice(JsonVariantConst target, const char* firmwareDeviceId) const;
     // Transport diagnostics stay outside Schema parameters and never affect
     // the logical state consumed by automation.
     void appendHealth(JsonObject health) const;
@@ -50,6 +54,7 @@ private:
     bool gatewayPingAnnounced_ = false;
     bool wifiResetInProgress_ = false;
     String lastDisconnectReason_;
+    String gatewayDeviceId_;
 
     static GatewayClient* activeClient_;
 };

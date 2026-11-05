@@ -612,13 +612,20 @@ bool UniversalDevice::applyConfiguration(
         identifyPulsesRemaining_ = 0;
     }
     const IdentifyIndicator previousIdentify = identifyIndicator_;
+    bool retainedPwmRoutes[MAX_COMPONENTS] = {};
     for (uint8_t oldIndex = 0; oldIndex < componentCount_; ++oldIndex) {
         const Component& oldComponent = components_[oldIndex];
         // PWM channels belong to component slots, not GPIOs. Release the old
         // route before reusing a pin or slot for another component/driver.
         if (oldComponent.driver == Driver::PwmOutput) {
-            writePwm(oldIndex, 0);
-            detachPwm(oldComponent.pin);
+            const bool retained = oldIndex < parsedCount &&
+                parsed[oldIndex].driver == Driver::PwmOutput &&
+                parsed[oldIndex].pin == oldComponent.pin;
+            retainedPwmRoutes[oldIndex] = retained;
+            if (!retained) {
+                writePwm(oldIndex, 0);
+                detachPwm(oldComponent.pin);
+            }
         }
         bool pinRetained = false;
         for (uint8_t newIndex = 0; newIndex < parsedCount; ++newIndex) {
@@ -667,11 +674,11 @@ bool UniversalDevice::applyConfiguration(
     configurationVersion_ = version;
     configurationHash_ = hash;
     configured_ = true;
-    configurePins();
+    configurePins(retainedPwmRoutes);
     return true;
 }
 
-void UniversalDevice::configurePins() {
+void UniversalDevice::configurePins(const bool* retainedPwmRoutes) {
     for (uint8_t index = 0; index < componentCount_; ++index) {
         Component& component = components_[index];
         switch (component.driver) {
@@ -698,8 +705,14 @@ void UniversalDevice::configurePins() {
                 component.hasValue = true;
                 break;
             case Driver::PwmOutput:
-                pinMode(component.pin, OUTPUT);
-                configurePwm(component.pin, index, component.integerValue);
+                if (retainedPwmRoutes != nullptr && retainedPwmRoutes[index]) {
+                    // A label/range edit must not briefly drop an unchanged
+                    // hardware route to zero or restart its PWM timer.
+                    writePwm(index, component.integerValue);
+                } else {
+                    pinMode(component.pin, OUTPUT);
+                    configurePwm(component.pin, index, component.integerValue);
+                }
                 break;
         }
         component.lastPollAt = millis();
@@ -999,11 +1012,10 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
         return;
     }
     if (strcmp(messageType, "device_config_apply") == 0) {
-        const char* target = message["device"] | "";
         const uint32_t version = readConfigurationVersion(message["config_version"]);
         const char* hash = message["config_hash"] | "";
         String error;
-        const bool targetMatches = target[0] == '\0' || strcmp(target, UNIVERSAL_DEVICE_ID) == 0;
+        const bool targetMatches = gateway.targetsDevice(message["device"], UNIVERSAL_DEVICE_ID);
         const bool success = targetMatches &&
             applyConfiguration(message["configuration"], version, hash, error);
         if (!targetMatches) error = "configuration is addressed to another device";
@@ -1019,6 +1031,10 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
         return;
     }
     if (strcmp(messageType, "command") != 0) return;
+    if (!gateway.targetsDevice(message["device"], UNIVERSAL_DEVICE_ID)) {
+        Serial.println("[COMMAND] Ignored command addressed to another device.");
+        return;
+    }
 
     const char* commandId = message["data"]["command_id"] | "";
     const char* commandName = message["data"]["command"] | "";

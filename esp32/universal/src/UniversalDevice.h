@@ -77,7 +77,7 @@ private:
                       JsonVariant& applied, String& error);
     int32_t scaleAnalogValue(const Component& component, int32_t rawValue) const;
     bool readComponent(Component& component);
-    void configurePins();
+    void configurePins(const bool* retainedPwmRoutes = nullptr);
     bool startIdentify(String& error);
     void updateIdentify();
     void setIdentifyIndicator(bool enabled);

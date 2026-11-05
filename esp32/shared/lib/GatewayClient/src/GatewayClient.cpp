@@ -90,6 +90,24 @@ bool GatewayClient::sendJson(JsonDocument& document) {
     return sendText(message);
 }
 
+void GatewayClient::setGatewayDeviceId(JsonVariantConst deviceId) {
+    gatewayDeviceId_ = "";
+    if (!deviceId.is<const char*>()) return;
+    const JsonString value = deviceId.as<JsonString>();
+    if (value.size() == 0 || value.size() > 256 ||
+        value.size() != strlen(value.c_str())) return;
+    gatewayDeviceId_ = value.c_str();
+}
+
+bool GatewayClient::targetsDevice(JsonVariantConst target, const char* firmwareDeviceId) const {
+    if (target.isUnbound()) return true;  // Compatibility with older Gateway frames.
+    if (!target.is<const char*>()) return false;
+    const JsonString value = target.as<JsonString>();
+    if (value.size() == 0 || value.size() != strlen(value.c_str())) return false;
+    return (firmwareDeviceId != nullptr && strcmp(value.c_str(), firmwareDeviceId) == 0) ||
+           (!gatewayDeviceId_.isEmpty() && gatewayDeviceId_ == value.c_str());
+}
+
 void GatewayClient::appendHealth(JsonObject health) const {
     health["wifi_rssi"] = WiFi.RSSI();
     // Unlike millis(), the ESP timer does not wrap after roughly 49 days.
@@ -111,6 +129,7 @@ void GatewayClient::dispatchWebSocketEvent(
     if (client == nullptr) return;
     const unsigned long now = millis();
     if (type == WStype_CONNECTED) {
+        client->gatewayDeviceId_ = "";
         client->webSocketWasConnected_ = true;
         client->webSocketConnectedAt_ = now;
         client->lastReceivedAt_ = now;
@@ -127,6 +146,7 @@ void GatewayClient::dispatchWebSocketEvent(
             Serial.println("[NET] Gateway ping received; automatic pong processing.");
         }
     } else if (type == WStype_DISCONNECTED) {
+        client->gatewayDeviceId_ = "";
         // Keep the more useful Wi-Fi reason during the associated TCP teardown.
         // Failed initial connection attempts are not an established-session loss.
         if (client->webSocketWasConnected_ && !client->wifiResetInProgress_ &&

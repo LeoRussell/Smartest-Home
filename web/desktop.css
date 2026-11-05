@@ -2238,7 +2238,8 @@ body.nav-side .main-navigation {
 .device-group-tools button:active:not(:disabled), .device-membership-tools button:active:not(:disabled), .management-dialog button:active:not(:disabled), .event-retention-form button:active:not(:disabled) { border-style: inset; box-shadow: none; }
 .device-group-tools button:disabled, .device-membership-tools button:disabled, .management-dialog button:disabled, .event-retention-form button:disabled { background: #c0c0c0; color: #555; box-shadow: none; cursor: default; }
 .device-group-tools .management-off-button:not(:disabled) { background: #800000; color: #fff; }
-.device-health { margin: 0 0 9px; padding: 7px 9px; border: 1px inset #dfdfdf; background: #e4e2dc; color: #111; font-size: 12px; }
+.device-health { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 10px; margin: 0 0 9px; padding: 7px 9px; border: 1px inset #dfdfdf; background: #e4e2dc; color: #111; font-size: 12px; }
+.device-health > [data-role="device-health-content"] { min-width: 0; }
 .device-health-stats { display: flex; flex-wrap: wrap; gap: 5px 22px; margin: 0; }
 .device-health-stats > div { display: flex; flex-wrap: wrap; gap: 5px; }
 .device-health-stats dt { color: #333; font-weight: 400; }
@@ -2379,6 +2380,7 @@ body.nav-side .main-navigation {
     min-height: var(--control-height);
     font-size: 12px;
 }
+.automation-card-actions .is-copy { background: #e1ecec; color: #00474b; }
 .manual-scenario-item button,
 .device-boolean-switch, .device-boolean-switch:hover:not(:disabled),
 .device-boolean-switch:active:not(:disabled) { min-height: var(--control-height); }

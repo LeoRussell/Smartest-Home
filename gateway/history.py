@@ -228,15 +228,22 @@ class ParameterHistory:
                 FROM (
                     SELECT MAX(sampled_at) AS sampled_at, AVG(value) AS average_value,
                            MIN(value) AS minimum, MAX(value) AS maximum,
-                           COUNT(*) AS samples, MAX(id) AS last_id,
+                           COUNT(*) AS samples,
                            MIN(?, CAST((sampled_at - ?) / ? AS INTEGER)) AS bucket_id
                     FROM parameter_history
                     WHERE device_id = ? AND parameter_id = ? AND sampled_at >= ? AND sampled_at <= ?
                       AND value_type = ? AND unit = ?
                     GROUP BY bucket_id
-                ) bins JOIN parameter_history last ON last.id = bins.last_id
+                ) bins JOIN parameter_history last ON last.id = (
+                    SELECT observation.id FROM parameter_history observation
+                    WHERE observation.device_id = ? AND observation.parameter_id = ?
+                      AND observation.sampled_at = bins.sampled_at
+                      AND observation.value_type = ? AND observation.unit = ?
+                    ORDER BY observation.id DESC LIMIT 1
+                )
                 ORDER BY bins.sampled_at
-            """, (maximum - 1, start, bucket, device_id, parameter_id, query_start, end, value_type, unit)).fetchall()
+            """, (maximum - 1, start, bucket, device_id, parameter_id, query_start, end, value_type, unit,
+                  device_id, parameter_id, value_type, unit)).fetchall()
             points = []
             for row in rows:
                 value = row[5] if value_type == "boolean" else row[1]
