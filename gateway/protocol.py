@@ -9,6 +9,7 @@ from websockets.datastructures import Headers
 from websockets.http11 import Response
 from websockets.exceptions import ConnectionClosed
 from device_configuration import DRIVERS, validate_device_configuration
+from simulation import handle_simulation_message
 
 
 class ProtocolMixin:
@@ -217,6 +218,10 @@ class ProtocolMixin:
             return
 
         if await self.history.handle_browser_message(websocket, message):
+            return
+        if await self.connections.handle_browser_message(websocket, message):
+            return
+        if await handle_simulation_message(self, websocket, message):
             return
 
         if action == "check_automation":
@@ -525,6 +530,7 @@ class ProtocolMixin:
                 active_socket = self.devices.pop(device_id, None)
                 if active_socket is not None:
                     self.management.record_disconnect(device_id, 4003, "Device blocked by user")
+                    self.connections.finish(device_id, active_socket, code=4003, reason="Device blocked by user", category="user_blocked")
                 self.device_wire_ids.pop(device_id, None)
                 self.last_device_heartbeat.pop(device_id, None)
                 self.last_device_telemetry.pop(device_id, None)
@@ -610,6 +616,7 @@ class ProtocolMixin:
             active_socket = self.devices.pop(device_id, None)
             if active_socket is not None:
                 self.management.record_disconnect(device_id, 4002, "Device forgotten by user")
+                self.connections.finish(device_id, active_socket, code=4002, reason="Device forgotten by user", category="forgotten")
             self.device_wire_ids.pop(device_id, None)
             self.last_device_heartbeat.pop(device_id, None)
             self.last_device_telemetry.pop(device_id, None)
@@ -1180,6 +1187,7 @@ class ProtocolMixin:
                 message_type = message.get("type")
                 if client_type == "device":
                     self.last_device_heartbeat[device_id] = asyncio.get_running_loop().time()
+                    self.connections.touch(device_id, websocket)
 
                 if self.database_restore_in_progress and client_type != "browser":
                     await websocket.close(
@@ -1208,7 +1216,7 @@ class ProtocolMixin:
                     await self.send_json(websocket, {
                         "type": "gateway_capabilities",
                         "protocol_version": 1,
-                        "features": ["parameter_history", "automation_progress"]
+                        "features": ["parameter_history", "automation_progress", "connection_history", "automation_simulation"]
                     })
                     await self.send_device_list(websocket)
                     await self.send_parameter_ui_preferences(websocket)
@@ -1462,6 +1470,7 @@ class ProtocolMixin:
                         break
 
                     client_type = "device"
+                    await self.configure_device_keepalive(websocket)
                     current_device_task = asyncio.current_task()
                     if current_device_task is not None:
                         self.device_handler_tasks.add(current_device_task)
@@ -1529,6 +1538,7 @@ class ProtocolMixin:
                             device_id, 1000, "Connection replaced by a new session with the same device ID"
                         )
                     self.management.clear_live_health(device_id)
+                    self.connections.start(device_id, websocket)
                     self.management.record_health(device_id, message.get("health"))
 
                     # Закрываем предыдущее соединение с тем же ID.
@@ -1699,6 +1709,7 @@ class ProtocolMixin:
                             parameter: value
                         }
                         self.record_device_telemetry(device_id, {parameter: value})
+                        self.connections.touch(device_id, websocket, data=True)
                         last_seen, _, _, _ = self.save_device_state(
                             device_id,
                             {parameter: value},
@@ -1825,6 +1836,8 @@ class ProtocolMixin:
                         **accepted_parameters
                     }
                     self.record_device_telemetry(device_id, accepted_parameters)
+                    if accepted_parameters:
+                        self.connections.touch(device_id, websocket, data=True)
 
                     pending_state_echoes = {}
                     for pending in self.pending_commands.values():
@@ -1926,6 +1939,10 @@ class ProtocolMixin:
                     f"[CLOSE] {device_id}: code={code or 'unknown'} reason={reason!r}; "
                     f"session={now - connection_started_at:.1f}s, "
                     f"last_message_age={activity_age}, last_data_age={telemetry_age}"
+                )
+                self.connections.finish(
+                    device_id, websocket, code=code, reason=reason,
+                    category="database_restore" if self.database_restore_in_progress else None
                 )
 
             if device_id:

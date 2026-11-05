@@ -226,13 +226,16 @@
             cleanDrag();
             const drafts = new Map();
             const focused = document.activeElement;
-            let focusedKey = null;
+            let focusedKey = null, focusedControl = null;
             for (const [tileId, record] of tiles) {
                 if (record.input && record.input.dataset.dirty === "true") drafts.set(tileId, {
                     value: record.input.value, signature: record.controlSignature,
                     start: record.input.selectionStart, end: record.input.selectionEnd
                 });
-                if (record.input === focused) focusedKey = tileId;
+                if (record.card.contains(focused)) {
+                    focusedKey = tileId;
+                    focusedControl = focused.dataset.workspaceControl;
+                }
             }
             tileKey = signature; tiles.clear(); host.replaceChildren();
             if (!items.length) host.append(node("p", t("Панель пока пуста. Нажмите «Настроить», чтобы добавить показания и команды.", "Your dashboard is empty. Choose Customize to add readings and commands."), "workspace-empty"));
@@ -243,6 +246,7 @@
                 const controls = node("div", null, "workspace-tile-controls");
                 const header = node("div", null, "workspace-tile-header");
                 const handle = dragHandle(item, card); header.append(typeBadge(item), handle);
+                handle.dataset.workspaceControl = "move";
                 const available = choices().find(candidate => key(candidate) === key(item));
                 title.textContent = available?.title || item.id;
                 subtitle.textContent = item.device || t("Автоматизация Gateway", "Gateway automation");
@@ -261,14 +265,33 @@
                         else context.callAction(item.device, item.id);
                         refresh();
                     }, "workspace-primary");
+                    record.run.dataset.workspaceControl = "run";
                     controls.append(record.run);
+                    if (item.kind === "scenario") {
+                        controls.classList.add("workspace-scenario-controls");
+                        record.edit = button(t("Изменить", "Edit"), () => context.editScenario(item.id), "workspace-scenario-edit");
+                        record.edit.dataset.workspaceControl = "edit";
+                        record.test = button(t("Тест", "Test"), () => context.testScenario(item.id), "workspace-scenario-test");
+                        record.test.dataset.workspaceControl = "test";
+                        controls.append(record.edit, record.test);
+                        record.lastRun = node("div", null, "workspace-scenario-last-run");
+                        record.lastResult = node("p", "", "workspace-scenario-last-result");
+                        record.lastError = node("p", "", "workspace-scenario-last-error");
+                        record.lastRun.append(record.lastResult, record.lastError);
+                    }
                 }
-                card.append(header, title, subtitle, value, controls, status); host.append(card); tiles.set(key(item), record);
+                card.append(header, title, subtitle, value);
+                if (record.lastRun) card.append(record.lastRun);
+                card.append(controls, status); host.append(card); tiles.set(key(item), record);
             }
             for (const record of tiles.values()) updateTile(record);
             if (focusedKey && document.activeElement === document.body) {
-                const replacement = tiles.get(focusedKey)?.input;
-                if (replacement && !replacement.disabled) replacement.focus({ preventScroll: true });
+                const record = tiles.get(focusedKey);
+                const replacement = [...(record?.card.querySelectorAll("[data-workspace-control]") || [])]
+                    .find(element => element.dataset.workspaceControl === focusedControl && !element.disabled)
+                    || (record?.edit && !record.edit.disabled ? record.edit : record?.dragHandle)
+                    || document.getElementById("workspace-customize");
+                replacement?.focus({ preventScroll: true });
             }
         }
         for (const record of tiles.values()) updateTile(record);
@@ -286,6 +309,7 @@
                     if (typeof current === "boolean") context.command(item.device, item.id, !current);
                     refresh();
                 }, "workspace-toggle");
+                record.toggle.dataset.workspaceControl = "toggle";
                 controls.append(record.toggle);
             } else if (["integer", "number", "enum", "string"].includes(definition.type)) {
                 const form = node("form", null, "workspace-inline-form");
@@ -305,7 +329,9 @@
                     if (input.type === "text") input.maxLength = 1024;
                 }
                 input.setAttribute("aria-label", `${definition.label || item.id} · ${name(device)}`);
+                input.dataset.workspaceControl = "value";
                 const apply = node("button", t("Применить", "Apply")); apply.type = "submit";
+                apply.dataset.workspaceControl = "apply";
                 form.append(input, apply); controls.append(form); record.input = input; record.apply = apply;
                 for (const eventName of ["input", "change"]) input.addEventListener(eventName, () => { input.dataset.dirty = "true"; });
                 form.addEventListener("submit", event => {
@@ -318,8 +344,12 @@
                 });
             }
         }
-        if (scalar(definition)) controls.append(button(t("График", "Chart"), () => openHistory(item.device, item.id), "history-open-button"));
-        controls.append(button(t("К устройству", "Open device"), () => context.openDevice(item.device), "workspace-device-link"));
+        if (scalar(definition)) {
+            const history = button(t("График", "Chart"), () => openHistory(item.device, item.id), "history-open-button");
+            history.dataset.workspaceControl = "history"; controls.append(history);
+        }
+        const open = button(t("К устройству", "Open device"), () => context.openDevice(item.device), "workspace-device-link");
+        open.dataset.workspaceControl = "device"; controls.append(open);
     }
 
     function updateTile(record) {
@@ -329,8 +359,38 @@
             const scenario = context.getAutomations().find(candidate => candidate.automation_id === item.id);
             const busy = scenario && context.scenarioBusy(scenario);
             const manual = scenario?.config?.program?.trigger?.type === "manual";
+            const focusedRun = document.activeElement === record.run;
             record.run.disabled = !connected() || !scenario?.enabled || !manual || busy;
+            record.run.textContent = busy && connected() ? t("Выполняется…", "Running…") : t("Запустить", "Run");
+            record.edit.disabled = !scenario;
+            record.test.disabled = !connected() || !scenario;
+            const scenarioName = scenario?.config?.name || item.id;
+            record.title.textContent = scenarioName;
+            record.run.setAttribute("aria-label", `${t("Запустить сценарий", "Run scenario")} «${scenarioName}»`);
+            record.edit.setAttribute("aria-label", `${t("Изменить сценарий", "Edit scenario")} «${scenarioName}»`);
+            record.test.setAttribute("aria-label", `${t("Тестировать сценарий", "Test scenario")} «${scenarioName}»`);
+            record.test.title = t("Симуляция с виртуальными значениями. Команды устройствам не отправляются.", "Simulate with virtual values. No commands are sent to devices.");
             record.status.textContent = !scenario ? t("Сценарий удалён", "Scenario removed") : !manual ? t("Сценарий больше не поддерживает ручной запуск", "This scenario no longer supports manual runs") : !connected() ? t("Нет связи с Gateway", "Gateway disconnected") : busy ? t("Выполняется…", "Running…") : scenario.enabled ? t("Готов к запуску", "Ready to run") : t("Сценарий отключён", "Scenario disabled");
+            record.card.dataset.scenarioState = !scenario ? "removed" : !connected() ? "offline" : busy ? "running" : scenario.enabled && manual ? "ready" : "disabled";
+            const started = scenario?.last_triggered_at ? context.formatTime(scenario.last_triggered_at) : "";
+            const lastStatus = scenario?.last_run_status;
+            record.lastRun.hidden = !scenario;
+            if (busy) {
+                record.lastResult.textContent = !connected()
+                    ? t("Связь потеряна во время запуска. Итог будет известен после подключения.", "Connection lost during execution. Reconnect to check the outcome.")
+                    : started && scenario.run_status === "running"
+                        ? t(`Начало текущего запуска: ${started}`, `Current run started: ${started}`)
+                        : t("Ожидается запуск на Gateway…", "Waiting for the Gateway to start…");
+            } else {
+                const parts = [started, lastStatus ? context.scenarioStatusLabel(lastStatus) : ""].filter(Boolean);
+                record.lastResult.textContent = parts.length
+                    ? t(`Последний запуск: ${parts.join(" · ")}`, `Last run: ${parts.join(" · ")}`)
+                    : t("Ещё не запускался", "Not run yet");
+            }
+            record.lastRun.dataset.state = busy ? "running" : lastStatus || "none";
+            record.lastError.hidden = busy || !scenario?.last_error;
+            record.lastError.textContent = !record.lastError.hidden ? t(`Причина: ${scenario.last_error}`, `Reason: ${scenario.last_error}`) : "";
+            if (focusedRun && record.run.disabled && !record.edit.disabled) record.edit.focus({ preventScroll: true });
             record.value.hidden = true; return;
         }
         const canControl = Boolean(device && context.canControl(device));

@@ -159,6 +159,13 @@
         if (id != null) {
             const off = node("button", null, "device-room-off");
             off.type = "button";
+            const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            icon.setAttribute("viewBox", "0 0 24 24");
+            icon.setAttribute("aria-hidden", "true");
+            icon.setAttribute("focusable", "false");
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            path.setAttribute("d", "M12 2v10M18.36 6.64a9 9 0 1 1-12.72 0");
+            icon.append(path); off.append(icon);
             off.addEventListener("click", () => {
                 if (window.DeviceManagement?.canExecuteOff(id)) context.executeOff(id);
             });
@@ -234,9 +241,9 @@
             if (room.visible !== members.length) room.counts.textContent += t(` · Показано: ${room.visible}`, ` · Shown: ${room.visible}`);
             room.section.classList.toggle("is-offline", !context.isConnected() || connected === 0);
             if (room.off) {
-                room.off.textContent = t("Выключить комнату…", "Turn room off…");
                 room.off.disabled = !window.DeviceManagement?.canExecuteOff(room.id);
                 const name = window.DeviceManagement?.getGroupName(room.id) || room.id;
+                room.off.setAttribute("aria-label", t(`Выключить комнату «${name}»`, `Turn room “${name}” off`));
                 room.off.title = t(
                     `Назначенные команды выключения для всей группы «${name}», независимо от поиска и фильтров`,
                     `Assigned off operations for the whole group “${name}”, regardless of search and filters`

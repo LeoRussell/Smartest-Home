@@ -88,6 +88,16 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
             self.checkpoint_gateway_runtime()
 
 
+    async def monitor_gateway_loop(self):
+        loop = asyncio.get_running_loop()
+        expected = loop.time() + 1
+        while True:
+            await asyncio.sleep(max(0, expected - loop.time()))
+            now = loop.time()
+            self.connections.record_loop_lag(max(0, now - expected))
+            expected = now + 1
+
+
     def device_is_connected(self, device_id):
         return device_id in self.devices
 
@@ -278,6 +288,20 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
                 )
 
 
+    async def configure_device_keepalive(self, websocket):
+        """Use the activity-aware watchdog for devices, keeping browser defaults.
+
+        websockets starts its keepalive before the peer identifies itself. Its
+        strict Pong deadline must not race the device watchdog or close a link
+        that is still delivering application messages.
+        """
+        websocket.ping_timeout = None
+        keepalive = getattr(websocket, "keepalive_task", None)
+        if keepalive is not None:
+            keepalive.cancel()
+            await asyncio.gather(keepalive, return_exceptions=True)
+
+
     def device_transport_probe_due(self, device_id, now):
         last_activity = self.last_device_heartbeat.get(device_id, now)
         last_probe = self.last_device_probe.get(device_id, last_activity)
@@ -288,22 +312,37 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
         now = asyncio.get_running_loop().time()
         if self.devices.get(device_id) is not websocket or not self.device_transport_probe_due(device_id, now):
             return
+        activity_before_probe = self.last_device_heartbeat.get(device_id)
         self.last_device_probe[device_id] = now
         try:
             pong = await websocket.ping()
-            await asyncio.wait_for(pong, timeout=self.DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS)
+            latency = await asyncio.wait_for(pong, timeout=self.DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS)
+            self.connections.probe(device_id, websocket, rtt_seconds=latency)
             print(f"[PRESENCE] {device_id}: WebSocket ping confirmed; application silence is not a disconnect.")
             return
         except ConnectionClosed:
             return
         except (asyncio.TimeoutError, OSError) as error:
+            # A buffered application message can arrive alongside the timeout,
+            # for example after the host resumes. Let its handler run first.
+            await asyncio.sleep(0)
             if self.devices.get(device_id) is not websocket:
+                return
+            self.connections.probe(device_id, websocket, failed=True)
+            last_activity = self.last_device_heartbeat.get(device_id)
+            if (
+                last_activity is not None
+                and last_activity != activity_before_probe
+                and asyncio.get_running_loop().time() - last_activity <= self.DEVICE_TRANSPORT_IDLE_SECONDS
+            ):
+                print(f"[PRESENCE] {device_id}: application data resumed during the probe; connection kept.")
                 return
             last_data = self.last_device_telemetry.get(device_id)
             data_age = f"{now - last_data:.1f}s" if last_data is not None else "none"
             print(
                 f"[ПРЕДУПРЕЖДЕНИЕ] {device_id}: transport ping failed "
-                f"({type(error).__name__}); last_data_age={data_age}; closing code=1011."
+                f"({type(error).__name__}); probe_elapsed={asyncio.get_running_loop().time() - now:.1f}s, "
+                f"last_data_age={data_age}; closing code=1011."
             )
             try:
                 await websocket.close(code=1011, reason="Device did not answer a WebSocket ping")
@@ -353,6 +392,7 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
             watchdog_task = asyncio.create_task(self.device_presence_watchdog())
             runtime_task = asyncio.create_task(self.gateway_runtime_checkpoint_loop())
             maintenance_task = asyncio.create_task(self.management.maintenance_loop())
+            lag_task = asyncio.create_task(self.monitor_gateway_loop())
             self.fire_automation_event("gateway_started")
             try:
                 if sys.stdin.isatty():
@@ -361,6 +401,7 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
                     print("Интерактивная консоль отключена; Gateway работает в служебном режиме.")
                     await asyncio.Event().wait()
             finally:
+                self.connections.close_all("gateway_shutdown")
                 await self.management.shutdown()
                 applying_tasks = [
                     self.cancel_configuration_apply(device_id, pending=True)
@@ -371,6 +412,7 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
                 watchdog_task.cancel()
                 runtime_task.cancel()
                 maintenance_task.cancel()
+                lag_task.cancel()
                 try:
                     await watchdog_task
                 except asyncio.CancelledError:
@@ -381,6 +423,10 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
                     pass
                 try:
                     await maintenance_task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await lag_task
                 except asyncio.CancelledError:
                     pass
                 self.checkpoint_gateway_runtime(final=True)

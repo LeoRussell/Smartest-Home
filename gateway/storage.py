@@ -13,6 +13,7 @@ from pathlib import Path
 from device_configuration import public_driver_catalog
 from settings import EVENTS_PAGE_SIZE
 from history import ParameterHistory
+from connection_history import ConnectionHistory
 
 
 class StorageMixin:
@@ -341,10 +342,13 @@ class StorageMixin:
         self.management.initialize()
         self.history = ParameterHistory(self)
         self.history.initialize()
+        self.connections = ConnectionHistory(self)
+        self.connections.initialize()
 
 
     def checkpoint_gateway_runtime(self, final=False):
         self.history.cleanup()
+        self.connections.cleanup()
         now = datetime.now(timezone.utc)
         with self.database_connection() as conn:
             row = conn.execute("""
@@ -417,6 +421,9 @@ class StorageMixin:
             history_sample_count = conn.execute(
                 "SELECT COUNT(*) FROM parameter_history"
             ).fetchone()[0]
+            connection_session_count = conn.execute(
+                "SELECT COUNT(*) FROM device_connection_sessions"
+            ).fetchone()[0]
             runtime = conn.execute("""
                 SELECT total_seconds, checkpoint_at
                 FROM gateway_runtime WHERE singleton_id = 1
@@ -454,11 +461,12 @@ class StorageMixin:
                 + device_configuration_count + device_configuration_history_count
                 + parameter_ui_preference_count + automation_count
                 + automation_run_count + automation_run_step_count
-                + history_sample_count
+                + history_sample_count + connection_session_count
             ),
             "automation_count": automation_count,
             "automation_run_count": automation_run_count,
             "history_sample_count": history_sample_count,
+            "connection_session_count": connection_session_count,
             "history_enabled": self.history.settings()["enabled"],
             "device_count": device_count,
             "ever_connected_device_count": ever_connected_device_count,
@@ -1097,7 +1105,7 @@ class StorageMixin:
                     "device_events", "device_schema_history", "command_queue",
                     "parameter_ui_preferences", "device_configurations",
                     "device_configuration_history", "device_group_membership",
-                    "device_common_commands", "device_health", "parameter_history"
+                    "device_common_commands", "device_health", "parameter_history", "device_connection_sessions"
                 ):
                     conn.execute(
                         f"UPDATE {table} SET device_id = ? WHERE device_id = ?",
@@ -1134,6 +1142,8 @@ class StorageMixin:
         old_export = self.DEVICE_CONFIGURATION_EXPORT_DIR / f"{device_id}.json"
         if changing_id:
             self.history.recent.clear()
+            if device_id in self.connections.active:
+                self.connections.active[new_device_id] = self.connections.active.pop(device_id)
             try:
                 old_export.unlink(missing_ok=True)
             except OSError:
@@ -2003,6 +2013,7 @@ class StorageMixin:
                     })
             self.pending_commands.clear()
 
+            self.connections.close_all("database_restore")
             device_sockets = list(self.devices.values())
             active_device_tasks = list(self.device_handler_tasks)
             self.devices.clear()

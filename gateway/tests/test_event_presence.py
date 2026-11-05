@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+import websockets
+from websockets.frames import Opcode
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from main import gateway
@@ -213,6 +215,70 @@ class EventPresenceTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(gateway, "DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS", 0.001):
             await gateway.probe_device_transport("dead", peer)
         self.assertEqual(peer.closes, [(1011, "Device did not answer a WebSocket ping")])
+
+    async def test_application_data_during_probe_keeps_transport_without_refreshing_parameters(self):
+        peer = TestSocket(responds_to_ping=False)
+        gateway.devices["recovering"] = peer
+        loop = asyncio.get_running_loop()
+        old = loop.time() - 100
+        gateway.last_device_heartbeat["recovering"] = old
+        gateway.last_device_probe["recovering"] = old
+        gateway.last_device_telemetry["recovering"] = old
+        gateway.last_parameter_telemetry["recovering"] = {"reading": old}
+        gateway.fresh_device_parameters["recovering"] = {"reading"}
+        original_ping = peer.ping
+
+        async def ping_and_resume_data():
+            result = await original_ping()
+            loop.call_soon(lambda: gateway.last_device_heartbeat.update(recovering=loop.time()))
+            return result
+
+        with (
+            patch.object(peer, "ping", side_effect=ping_and_resume_data),
+            patch.object(gateway, "DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS", 0.001),
+        ):
+            await gateway.probe_device_transport("recovering", peer)
+        self.assertEqual(peer.closes, [])
+        self.assertEqual(gateway.last_device_telemetry["recovering"], old)
+        self.assertFalse(gateway.parameter_value_is_fresh("recovering", "reading"))
+
+    async def test_device_has_one_keepalive_policy_and_lost_transport_still_closes(self):
+        schema = {"parameters": {"enabled": {"type": "boolean", "access": "read_write"}}, "actions": {}}
+        gateway.save_device_metadata("quiet", {"schema": schema, "schema_version": 1, "trust_policy": "allow"})
+        with (
+            patch.object(gateway, "DEVICE_TRANSPORT_IDLE_SECONDS", 0.05),
+            patch.object(gateway, "DEVICE_TRANSPORT_PROBE_TIMEOUT_SECONDS", 0.02),
+        ):
+            async with websockets.serve(gateway.handle_client, "127.0.0.1", 0, ping_interval=0.02, ping_timeout=0.02) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with websockets.connect(f"ws://127.0.0.1:{port}", ping_interval=None) as client:
+                    # This peer still sends real state messages, but deliberately
+                    # omits Pong to reproduce the conflicting timeout policy.
+                    receive_frame = client.protocol.recv_frame
+                    client.protocol.recv_frame = lambda frame: None if frame.opcode == Opcode.PING else receive_frame(frame)
+                    await client.send(json.dumps({"type": "hello", "device": "quiet", "schema": schema, "schema_version": 1}))
+                    while json.loads(await asyncio.wait_for(client.recv(), 2))["type"] != "hello_ack":
+                        pass
+                    connection = gateway.devices["quiet"]
+                    self.assertTrue(connection.keepalive_task.cancelled())
+                    for _ in range(10):
+                        await client.send(json.dumps({"type": "state", "device": "quiet", "data": {"parameters": {"enabled": False}}}))
+                        await asyncio.sleep(0.015)
+                    self.assertIs(gateway.devices.get("quiet"), connection)
+                    await asyncio.sleep(0.07)
+                    await gateway.probe_device_transport("quiet", connection)
+                    await asyncio.wait_for(client.wait_closed(), 2)
+                    self.assertEqual(client.close_code, 1011)
+                    self.assertEqual(client.close_reason, "Device did not answer a WebSocket ping")
+
+                # Browser connections retain the library's normal strict checks.
+                async with websockets.connect(f"ws://127.0.0.1:{port}", ping_interval=None) as browser:
+                    await browser.send(json.dumps({"type": "browser_hello"}))
+                    while json.loads(await asyncio.wait_for(browser.recv(), 2))["type"] != "history_settings":
+                        pass
+                    connection = next(iter(gateway.browser_clients))
+                    self.assertEqual(connection.ping_timeout, 0.02)
+                    self.assertFalse(connection.keepalive_task.done())
 
     async def test_partial_updates_do_not_refresh_other_parameters(self):
         gateway.devices["sensor"] = TestSocket()

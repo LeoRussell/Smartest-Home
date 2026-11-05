@@ -320,10 +320,19 @@
         options.append(group, common);
         const history = node("section", null, "device-settings-section");
         history.dataset.role = "device-settings-schema";
+        const connections = node("section", null, "device-settings-section device-settings-connections");
+        const connectionTitle = node("h3"), connectionHelp = node("p", null, "management-help");
+        const connectionHistory = button("", () => window.ConnectionDiagnostics?.open(deviceSettingsDialog?.device || device.device));
+        for (const [element, ru, en] of [
+            [connectionTitle, "Связь и подключения", "Connection diagnostics"],
+            [connectionHelp, "Сессии, причины разрывов, Wi-Fi и задержки Gateway.", "Sessions, disconnect reasons, Wi-Fi and Gateway delays."],
+            [connectionHistory, "История соединений", "Connection history"]
+        ]) { element.dataset.ru = ru; element.dataset.en = en; element.textContent = t(ru, en); }
+        connections.append(connectionTitle, connectionHelp, connectionHistory);
         const footer = node("div", null, "management-dialog-actions");
         const close = button(t("Закрыть", "Close"), () => view.root.close());
         footer.append(close);
-        view.body.append(identity, notice, identityEditor, options, history, footer);
+        view.body.append(identity, notice, identityEditor, options, connections, history, footer);
         deviceSettingsDialog = {
             ...view, device: device.device, identity, identityEditor, notice, group, common, history, close,
             formDirty: false, savePending: false,
@@ -616,12 +625,17 @@
         const health = node("section", null, "device-health");
         health.dataset.role = "device-health";
         health.setAttribute("aria-live", "off");
+        const content = node("div"); content.dataset.role = "device-health-content";
+        const history = button(t("История соединений", "Connection history"), () => window.ConnectionDiagnostics?.open(device.device), "device-connection-link");
+        history.dataset.role = "connection-history";
+        health.append(content, history);
         panel.append(health);
         updateHealth(device, panel);
     }
 
     function updateHealth(device, panel) {
-        const target = panel.querySelector('[data-role="device-health"]');
+        const wrapper = panel.querySelector('[data-role="device-health"]');
+        const target = wrapper?.querySelector('[data-role="device-health-content"]') || wrapper;
         if (!target) return;
         const health = device.health || {};
         const hasRssi = Number.isInteger(health.wifi_rssi) && health.wifi_rssi <= 0 && health.wifi_rssi >= -127;

@@ -21,6 +21,7 @@
 .workspace-tile h2 { margin: 0 0 4px; color: #000080; font-size: 15px; overflow-wrap: anywhere; }
 .workspace-tile-subtitle { margin: 0 0 12px; color: #404040; font-size: 12px; overflow-wrap: anywhere; }
 .workspace-tile-value { display: block; margin: 0 0 12px; color: #111; font-size: 24px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.workspace-tile-value[hidden] { display: none; }
 .workspace-tile-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: auto; }
 .workspace-tile-status { margin-top: 10px; color: #333; font-size: 12px; }
 .workspace-tile[data-online="false"] { border-left-color: #808080; }
@@ -33,6 +34,20 @@
 .workspace-inline-form { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; }
 .workspace-inline-form :is(input, select) { width: 100%; min-width: 0; }
 .workspace-device-link { color: #000080; }
+.workspace-scenario-edit { color: #000080; }
+.workspace-scenario-test { background: #e2dcf2; color: #4a196b; }
+.workspace-scenario-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.workspace-scenario-controls > button { width: 100%; min-width: 0; padding: 5px 6px; }
+.workspace-scenario-controls .workspace-primary { grid-column: 1 / -1; }
+.workspace-scenario-last-run { margin: 0 0 12px; padding: 8px 10px; border: 1px inset #fff; background: #e4e2dc; color: #333; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.workspace-scenario-last-run[hidden], .workspace-scenario-last-error[hidden] { display: none; }
+.workspace-scenario-last-result, .workspace-scenario-last-error { margin: 0; }
+.workspace-scenario-last-run[data-state="succeeded"] .workspace-scenario-last-result { color: #005000; }
+.workspace-scenario-last-run:is([data-state="failed"], [data-state="interrupted"]) .workspace-scenario-last-result,
+.workspace-scenario-last-error { color: #800000; }
+.workspace-scenario-last-error { margin-top: 5px; }
+.workspace-scenario-last-run[data-state="running"] { border-left: 3px solid #000080; }
+.workspace-tile[data-scenario-state="offline"] .workspace-scenario-last-run[data-state="running"] { border-left-color: #808080; }
 .workspace-choice-list { display: grid; gap: 6px; max-height: 55vh; overflow: auto; padding: 4px; }
 .workspace-choice-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; min-width: 0; }
 .workspace-choice-order { display: flex; flex-direction: column; gap: 4px; justify-content: center; }

@@ -184,6 +184,9 @@ class DeviceManagement:
                 ON CONFLICT(device_id) DO UPDATE SET
                     health_json = excluded.health_json, updated_at = excluded.updated_at
             """, (device_id, json.dumps(accepted, ensure_ascii=False), timestamp))
+        connections = getattr(self.gateway, "connections", None)
+        if connections is not None:
+            connections.record_health(device_id, accepted)
         return True
 
     def record_disconnect(self, device_id, code=None, reason=None):

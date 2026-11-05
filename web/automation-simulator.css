@@ -1,0 +1,59 @@
+/* Virtual scenario execution stays visually separate from real run history. */
+.automation-simulator-dialog { width: min(1000px, calc(100vw - 28px)); }
+.automation-simulator-dialog .management-dialog-title { position: sticky; top: -3px; z-index: 3; }
+.automation-simulator-dialog .management-dialog-body { min-width: 0; }
+.simulation-mode-notice { margin: 0; padding: 10px 12px; border: 2px inset #fff; background: #ffffe1; color: #000080; font-size: 13px; font-weight: 700; line-height: 1.5; }
+.simulation-source { margin: 0; color: #222; font-size: 13px; overflow-wrap: anywhere; }
+.simulation-form { display: grid; gap: 12px; min-width: 0; }
+.simulation-input-section { min-width: 0; padding: 0 10px 10px; border: 2px groove #fff; background: #d4d0c8; }
+.simulation-input-section > summary, .simulation-output-details > summary { min-height: 36px; align-content: center; color: #000080; font-size: 13px; font-weight: 700; cursor: pointer; }
+.simulation-help { margin: 5px 0 10px; color: #404040; font-size: 12px; line-height: 1.5; }
+.simulation-inputs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; min-width: 0; }
+.simulation-input-row { display: grid; align-content: start; gap: 5px; min-width: 0; padding: 10px; border: 1px solid #808080; background: #e4e2dc; }
+.simulation-input-row > strong { color: #111; font-size: 13px; overflow-wrap: anywhere; }
+.simulation-input-id { color: #404040; font-size: 12px; overflow-wrap: anywhere; }
+.simulation-input-observed { margin: 0; color: #333; font-size: 12px; overflow-wrap: anywhere; }
+.simulation-input-control { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; margin-top: 4px; }
+.simulation-override-toggle { display: flex; align-items: center; gap: 7px; min-height: var(--control-height); color: #111; font-size: 12px; cursor: pointer; }
+.simulation-override-toggle input { flex: 0 0 18px; width: 18px; height: 18px; margin: 0; }
+.simulation-input-control > :is(input, select) { flex: 1 1 110px; width: 110px; min-width: 0; max-width: 100%; }
+.automation-simulator-dialog .simulation-input-control > :is(input, select):disabled { color: #555; background: #d0d0d0; }
+.simulation-unit { color: #333; font-size: 12px; }
+.simulation-input-error { margin: 0; color: #800000; font-size: 12px; }
+.simulation-connection-inputs { display: grid; gap: 10px; }
+.simulation-connection-inputs select { width: 100%; min-width: 0; }
+.simulation-actions { position: sticky; bottom: -16px; z-index: 2; padding: 10px 0; border-top: 1px solid #808080; background: #c0c0c0; }
+.simulation-actions .simulation-submit { min-width: 140px; background: #000080; color: #fff; font-weight: 700; }
+.simulation-actions .simulation-submit:disabled { background: #c0c0c0; color: #555; }
+.simulation-feedback[data-state="success"] { color: #005000; }
+.simulation-feedback[data-state="error"] { color: #800000; }
+.simulation-feedback[data-state="info"] { color: #000080; }
+.simulation-feedback[data-state="warning"] { color: #704000; }
+.simulation-results { min-width: 0; padding: 12px; border: 2px inset #fff; border-left: 5px solid #005000; background: #f3f2ed; color: #111; }
+.simulation-results[hidden] { display: none; }
+.simulation-results[data-state="error"] { border-left-color: #800000; }
+.simulation-results[data-state="warning"], .simulation-results.is-stale { border-left-color: #806000; }
+.simulation-results > h3 { margin: 0 0 7px; color: #000080; font-size: 15px; }
+.simulation-result-meta, .simulation-result-message { margin: 0 0 9px; color: #333; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.simulation-warnings { margin: 8px 0; padding-left: 20px; color: #704000; font-size: 12px; overflow-wrap: anywhere; }
+.simulation-trace-scroll, .simulation-table-scroll { max-height: 350px; overflow: auto; min-width: 0; border: 1px solid #808080; background: #fff; }
+.simulation-trace, .simulation-readings-table { border-collapse: collapse; width: 100%; color: #111; font-size: 12px; line-height: 1.5; }
+.simulation-trace caption { padding: 8px 10px; color: #000080; text-align: left; font-weight: 700; }
+.simulation-trace :is(th, td), .simulation-readings-table :is(th, td) { padding: 7px 9px; border: 1px solid #b0b0b0; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.simulation-trace th, .simulation-readings-table th { position: sticky; top: 0; z-index: 1; background: #c0c0c0; }
+.simulation-trace td:first-child { width: 35px; font-variant-numeric: tabular-nums; }
+.simulation-trace td:nth-child(2) { min-width: 60px; font-variant-numeric: tabular-nums; }
+.simulation-trace td:nth-child(3) { min-width: 100px; }
+.simulation-trace tr[data-state="failed"] td { color: #800000; background: #fff0e9; }
+.simulation-output-details { min-width: 0; margin-top: 8px; }
+
+@media (max-width: 650px) {
+    .simulation-inputs { grid-template-columns: minmax(0, 1fr); }
+    .automation-simulator-dialog .management-dialog-body { padding: 12px; }
+    .simulation-input-section { padding-left: 8px; padding-right: 8px; }
+    .simulation-actions { bottom: -12px; }
+    .simulation-actions button { flex: 1 1 100px; }
+    .simulation-results { padding: 8px; }
+}
+.automation-card-actions .automation-simulate-button,
+#automation-simulate-draft { background: #e2dcf2; color: #4a196b; }

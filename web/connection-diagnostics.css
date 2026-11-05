@@ -1,0 +1,31 @@
+.connection-history-dialog { width: min(920px, calc(100vw - 28px)); }
+.connection-history-dialog .management-dialog-title { position: sticky; top: -3px; z-index: 3; }
+.connection-history-dialog .management-dialog-actions { position: sticky; bottom: -16px; z-index: 2; padding: 10px 0; border-top: 1px solid #808080; background: #c0c0c0; }
+.connection-history-tools { display: flex; justify-content: flex-end; }
+.connection-session-list { display: grid; gap: 10px; min-width: 0; }
+.connection-session { min-width: 0; border: 2px inset #fff; background: #f3f2ed; }
+.connection-session > summary { display: flex; flex-wrap: wrap; align-items: center; gap: 7px 12px; padding: 10px; color: #000080; cursor: pointer; font-size: 13px; list-style: none; }
+.connection-session > summary::-webkit-details-marker { display: none; }
+.connection-session > summary::before { content: "▶"; font-size: 10px; }
+.connection-session[open] > summary::before { content: "▼"; }
+.connection-session-state { padding: 2px 6px; border: 1px solid #808080; background: #e4e2dc; color: #333; font-size: 12px; }
+.connection-session[data-status="active"] .connection-session-state { color: #005000; background: #e6f2dd; }
+.connection-session[data-status="interrupted"] .connection-session-state { color: #704000; background: #fff0c2; }
+.connection-session-duration { margin-left: auto; color: #222; font-size: 12px; font-variant-numeric: tabular-nums; }
+.connection-session-content { padding: 0 12px 12px; }
+.connection-session-reason { margin: 0 0 10px; color: #222; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
+.connection-session-reason small { display: block; margin-top: 4px; color: #404040; font-size: 12px; font-weight: 400; }
+.connection-session-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; margin: 0; }
+.connection-session-stats > div { min-width: 0; padding: 6px 0; border-top: 1px solid #c0c0c0; }
+.connection-session-stats dt { color: #404040; font-size: 12px; }
+.connection-session-stats dd { margin: 4px 0 0; color: #111; font-size: 13px; overflow-wrap: anywhere; }
+.device-connection-link { margin-top: 8px; min-height: 28px; padding: 3px 8px; color: #000080; font-size: 12px; }
+.device-settings-connections p { margin: 0 0 10px; }
+@media (max-width: 600px) {
+    .connection-history-dialog .management-dialog-body { padding: 12px; }
+    .connection-history-dialog .management-dialog-actions { bottom: -12px; }
+    .connection-session-stats { grid-template-columns: minmax(0, 1fr); }
+    .connection-session > summary { gap: 7px; }
+    .connection-session-duration { margin-left: 0; }
+    .device-connection-link { min-height: 40px; }
+}

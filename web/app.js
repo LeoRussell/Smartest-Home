@@ -455,6 +455,8 @@ function applyLanguage() {
     updateAutomationEditorMode();
     window.GatewayWorkspace?.languageChanged();
     window.AutomationProgress?.refresh();
+    window.ConnectionDiagnostics?.languageChanged();
+    window.AutomationSimulator?.refresh();
     setGatewayConnectionStatus(lastGatewayStatusMessage, gatewayIsConnectedState);
     if (lastActivityMessage) setActivity(lastActivityMessage, lastActivityOutcome);
 }
@@ -968,6 +970,10 @@ function setGatewayConnectionStatus(message, connected) {
     if (wasConnected !== connected) {
         window.GatewayWorkspace?.connectionChanged();
         window.AutomationProgress?.connectionChanged();
+        if (!connected) {
+            window.ConnectionDiagnostics?.disconnected();
+            window.AutomationSimulator?.disconnected();
+        }
     }
     if (!connected && wasConnected) {
         if ((databaseBackupRefreshPending || databaseBackupActionPending) && databaseBackupFeedback) {
@@ -1223,27 +1229,128 @@ function renderManualScenarioButtons() {
     const panel = document.getElementById("manual-scenario-panel");
     const list = document.getElementById("manual-scenario-buttons");
     if (!panel || !list) return;
+    const focused = document.activeElement;
+    const focusWasInside = panel.contains(focused);
     const scenarios = automations.filter(item => item.config?.program?.trigger?.type === "manual" && item.config.program.trigger.show_on_dashboard === true);
+    const manage = document.getElementById("manual-scenario-manage");
+    if (manage) manage.onclick = () => {
+        setActivePage("automations");
+        const section = document.querySelector(".automation-list-section");
+        section?.scrollIntoView({ block: "start", behavior: "smooth" });
+        const heading = section?.querySelector("h2");
+        if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
+    };
     panel.hidden = scenarios.length === 0;
-    list.replaceChildren();
-    for (const item of scenarios) {
-        const row = document.createElement("div");
-        row.className = "manual-scenario-item";
-        const run = document.createElement("button");
-        run.type = "button";
-        run.dataset.automationId = item.automation_id;
-        run.textContent = item.config.name;
+    const existing = new Map([...list.children].map(row => [row.dataset.automationId, row]));
+    const remainingIds = new Set(scenarios.map(item => item.automation_id));
+    for (const row of [...list.children]) if (!remainingIds.has(row.dataset.automationId)) row.remove();
+    scenarios.forEach((item, index) => {
+        let row = existing.get(item.automation_id);
+        if (!row) {
+            row = document.createElement("article");
+            row.className = "manual-scenario-item";
+            row.dataset.automationId = item.automation_id;
+            const heading = document.createElement("div");
+            heading.className = "manual-scenario-heading";
+            const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            icon.setAttribute("viewBox", "0 0 24 24");
+            icon.setAttribute("aria-hidden", "true");
+            icon.setAttribute("focusable", "false");
+            icon.classList.add("manual-scenario-icon");
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            path.setAttribute("d", "M3 3h7v6H3Zm11 12h7v6h-7ZM6 9v9h8m3-3V6h-7");
+            icon.append(path);
+            const title = document.createElement("h3");
+            title.className = "manual-scenario-name";
+            const summary = document.createElement("p");
+            summary.className = "manual-scenario-summary";
+            heading.append(icon, title, summary);
+            const meta = document.createElement("div");
+            meta.className = "manual-scenario-meta";
+            const status = document.createElement("span");
+            status.className = "manual-scenario-status";
+            status.setAttribute("role", "status");
+            const last = document.createElement("small");
+            last.className = "manual-scenario-last";
+            meta.append(status, last);
+            const actions = document.createElement("div");
+            actions.className = "manual-scenario-actions";
+            const run = document.createElement("button");
+            run.type = "button";
+            run.className = "manual-scenario-run";
+            run.dataset.automationId = item.automation_id;
+            run.dataset.role = "manual-scenario-run";
+            const play = document.createElement("span");
+            play.textContent = "▶"; play.setAttribute("aria-hidden", "true");
+            const runLabel = document.createElement("span");
+            runLabel.className = "manual-scenario-run-label";
+            run.append(play, runLabel);
+            run.addEventListener("click", () => launchManualScenario(row.dataset.automationId));
+            const edit = document.createElement("button");
+            edit.type = "button";
+            edit.className = "manual-scenario-edit";
+            edit.dataset.role = "manual-scenario-edit";
+            edit.addEventListener("click", () => {
+                const current = automations.find(candidate => candidate.automation_id === row.dataset.automationId);
+                if (current) refreshAutomationEditor({ ...current.config, automation_id: current.automation_id });
+            });
+            actions.append(run, edit);
+            row.append(heading, meta, actions);
+        }
+        const title = row.querySelector(".manual-scenario-name");
+        const scenarioName = item.config.name || localized("Без названия", "Untitled scenario");
+        title.textContent = scenarioName;
+        row.setAttribute("aria-label", scenarioName);
+        const summary = row.querySelector(".manual-scenario-summary");
+        const statements = [...(item.config.program.body || [])];
+        const targetIds = new Set();
+        for (let visited = 0; statements.length && visited < 512; visited++) {
+            const statement = statements.pop();
+            if (["set_parameter", "invoke_action"].includes(statement?.type) && typeof statement.device === "string") targetIds.add(statement.device);
+            if (statement?.type === "if") {
+                for (const branch of statement.branches || []) statements.push(...(branch.then || []));
+                statements.push(...(statement.else || []));
+            }
+        }
+        const targets = [...targetIds].map(id => {
+            const device = devices.find(candidate => candidate.device === id);
+            return device?.display_name || device?.name || id;
+        });
+        summary.textContent = targets.length
+            ? `${localized("Устройства", "Devices")}: ${targets.slice(0, 2).join(", ")}${targets.length > 2 ? localized(` и ещё ${targets.length - 2}`, ` and ${targets.length - 2} more`) : ""}`
+            : localized("Выполняется на Gateway", "Runs on the Gateway");
+        summary.title = automationSummary(item.config);
+        const busy = manualScenarioIsBusy(item);
+        const run = row.querySelector(".manual-scenario-run");
+        row.querySelector(".manual-scenario-run-label").textContent = busy ? localized("Выполняется…", "Running…") : localized("Запустить", "Run");
         run.title = automationSummary(item.config);
-        run.disabled = !isGatewayConnected() || !item.enabled || manualScenarioIsBusy(item);
-        run.addEventListener("click", () => launchManualScenario(item.automation_id));
-        const status = document.createElement("small");
-        status.textContent = manualScenarioIsBusy(item) ? localized("Выполняется…", "Running…")
+        run.setAttribute("aria-label", `${busy ? localized("Выполняется сценарий", "Running scenario") : localized("Запустить сценарий", "Run scenario")} «${scenarioName}»`);
+        run.disabled = !isGatewayConnected() || !item.enabled || busy;
+        const edit = row.querySelector(".manual-scenario-edit");
+        edit.textContent = localized("Изменить", "Edit");
+        edit.setAttribute("aria-label", `${localized("Изменить сценарий", "Edit scenario")} «${scenarioName}»`);
+        const status = row.querySelector(".manual-scenario-status");
+        const state = !isGatewayConnected() ? "offline" : busy ? "running" : !item.enabled ? "disabled" : "ready";
+        const statusText = !isGatewayConnected() ? localized("Gateway недоступен", "Gateway offline") : busy ? localized("Выполняется…", "Running…")
             : !item.enabled ? localized("Сценарий отключён", "Scenario disabled")
-                : !isGatewayConnected() ? localized("Нет связи с Gateway", "Gateway offline")
-                    : item.last_run_status ? automationRunStatusLabel(item.last_run_status) : localized("Готов к запуску", "Ready to run");
-        if (item.last_error) status.title = item.last_error;
-        row.append(run, status);
-        list.append(row);
+                : localized("Готов к запуску", "Ready to run");
+        if (status.textContent !== statusText) status.textContent = statusText;
+        row.dataset.state = state;
+        const last = row.querySelector(".manual-scenario-last");
+        const lastParts = [item.last_triggered_at ? formatEventTime(item.last_triggered_at) : "", item.last_run_status ? automationRunStatusLabel(item.last_run_status) : ""].filter(Boolean);
+        last.textContent = lastParts.length
+            ? `${localized("Последний запуск", "Last run")}: ${lastParts.join(" · ")}`
+            : localized("Ещё не запускался", "Not run yet");
+        last.dataset.state = item.last_run_status || "none";
+        last.title = item.last_error || "";
+        if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+    });
+    if (focusWasInside && (document.activeElement === document.body || focused.disabled)) {
+        const oldId = focused.closest(".manual-scenario-item")?.dataset.automationId;
+        const replacement = [...list.children].find(row => row.dataset.automationId === oldId);
+        const target = focused.isConnected && !focused.disabled ? focused
+            : replacement?.querySelector(".manual-scenario-edit") || (panel.hidden ? document.getElementById("tab-devices") : manage);
+        target?.focus({ preventScroll: true });
     }
 }
 
@@ -1364,7 +1471,15 @@ function renderAutomations() {
                 sendGatewayAction("delete_automation", { automation_id: item.automation_id });
             }
         });
-        actions.append(toggle, check, edit, remove);
+        const simulate = document.createElement("button");
+        simulate.type = "button";
+        simulate.className = "automation-action-button automation-simulate-button";
+        simulate.dataset.role = "automation-simulate";
+        simulate.textContent = localized("Тест", "Test");
+        simulate.title = localized("Проверить выполнение с виртуальными показаниями", "Test execution with virtual readings");
+        simulate.disabled = !isGatewayConnected();
+        simulate.addEventListener("click", () => window.AutomationSimulator?.request(item.automation_id));
+        actions.append(toggle, check, simulate, edit, remove);
         card.append(copy, actions);
         const diagnostics = window.AutomationInspector?.createPanel(item.automation_id);
         if (diagnostics) card.append(diagnostics);
@@ -1375,6 +1490,7 @@ function renderAutomations() {
     }
     window.AutomationProgress?.refresh();
     window.GatewayWorkspace?.refresh();
+    window.AutomationSimulator?.refresh();
 }
 
 function requestAutomationRunHistory(automationId) {
@@ -1684,10 +1800,10 @@ function createAutomationRunEntry(run, automationId, automationName) {
     return entry;
 }
 
-function buildAutomationConfig() {
+function buildAutomationConfig({ allowUntitled = false } = {}) {
     const program = window.AutomationBlockly?.compile();
     if (!program) throw new Error(localized("Редактор блоков пока не готов.", "The block editor is not ready."));
-    const name = document.getElementById("automation-name").value.trim();
+    const name = document.getElementById("automation-name").value.trim() || (allowUntitled ? localized("Тестовый сценарий", "Test scenario") : "");
     if (!name) throw new Error(localized("Введите название сценария.", "Enter a scenario name."));
     return {
         version: 2,
@@ -1781,6 +1897,7 @@ function connectGateway() {
         sendGatewayAction("get_automations");
         window.DeviceManagement?.connected();
         window.GatewayWorkspace?.connected();
+        window.ConnectionDiagnostics?.connected();
     });
 
     gatewaySocket.addEventListener("message", (event) => {
@@ -1839,6 +1956,8 @@ function connectGateway() {
 // =========================
 
 function handleGatewayMessage(message) {
+    if (window.ConnectionDiagnostics?.handleMessage(message)) return;
+    if (window.AutomationSimulator?.handleMessage(message)) return;
     if (window.GatewayWorkspace?.handleMessage(message)) return;
     if (window.AutomationProgress?.handleMessage(message)) {
         window.GatewayWorkspace?.refresh();
@@ -2110,6 +2229,9 @@ function handleGatewayMessage(message) {
             if (Object.keys(receivedStats).length === statKeys.length) {
                 if (Number.isFinite(Number(message.history_sample_count)) && Number(message.history_sample_count) >= 0) {
                     receivedStats.history_sample_count = Number(message.history_sample_count);
+                }
+                if (Number.isFinite(Number(message.connection_session_count)) && Number(message.connection_session_count) >= 0) {
+                    receivedStats.connection_session_count = Number(message.connection_session_count);
                 }
                 databaseStats = receivedStats;
                 databaseStatsReceivedAt = performance.now() / 1000;
@@ -2571,6 +2693,8 @@ function handleGatewayMessage(message) {
         }
     }
     window.GatewayWorkspace?.refresh();
+    window.ConnectionDiagnostics?.refresh();
+    window.AutomationSimulator?.refresh();
 }
 
 // =========================
@@ -6630,6 +6754,19 @@ window.DeviceViews?.initialize({
     isConnected: isGatewayConnected,
     executeOff: groupId => window.DeviceManagement?.executeOff(groupId)
 });
+window.ConnectionDiagnostics?.initialize({
+    localized, language: () => uiSettings.language, getDevices: () => devices,
+    isConnected: isGatewayConnected, send: sendGatewayAction, labelDialog,
+    formatTime: formatEventTime, formatDuration: formatDatabaseDuration
+});
+window.AutomationSimulator?.initialize({
+    localized, language: () => uiSettings.language, getDevices: () => devices,
+    getAutomations: () => automations, getDraft: () => buildAutomationConfig({ allowUntitled: true }),
+    isConnected: isGatewayConnected, send: sendGatewayAction,
+    createRequestId: createCommandId, labelDialog,
+    formatValue: formatDisplayedParameterValue, formatTime: formatEventTime
+});
+document.getElementById("automation-simulate-draft")?.addEventListener("click", () => window.AutomationSimulator?.request());
 window.AutomationProgress?.init({
     translate: localized, language: () => uiSettings.language,
     getAutomations: () => automations, getDevices: () => devices,
@@ -6652,6 +6789,12 @@ window.GatewayWorkspace?.initialize({
         else sendDeviceAction(deviceId, actionId);
     },
     runScenario: launchManualScenario, scenarioBusy: manualScenarioIsBusy,
+    scenarioStatusLabel: automationRunStatusLabel,
+    editScenario(automationId) {
+        const current = automations.find(item => item.automation_id === automationId);
+        if (current) refreshAutomationEditor({ ...current.config, automation_id: current.automation_id });
+    },
+    testScenario: automationId => window.AutomationSimulator?.request(automationId),
     openDevice(deviceId) {
         deviceFilter = "all";
         if (deviceSearchInput) deviceSearchInput.value = "";

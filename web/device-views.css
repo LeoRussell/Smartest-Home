@@ -38,8 +38,9 @@
 .device-room-toggle:active:not(:disabled) { border: 1px inset #808080; box-shadow: none; }
 .device-room-name { grid-column: 2; font-size: 15px; overflow-wrap: anywhere; }
 .device-room-counts { grid-column: 2; color: #333; font-size: 12px; overflow-wrap: anywhere; }
-.device-room-off { flex: 0 1 auto; background: #f0cf7a; color: #3b2800; font-size: 12px; }
-.device-room-off:hover:not(:disabled) { background: #ffe0a1; color: #3b2800; }
+.device-room-off { display: grid; place-items: center; flex: 0 0 36px; width: 36px; height: 36px; min-width: 36px; padding: 4px; background: #d4d0c8; color: #800000; }
+.device-room-off svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.device-room-off:hover:not(:disabled) { background: #ffe0a1; color: #800000; }
 .device-room-off:disabled { background: var(--surface); color: #555; box-shadow: none; }
 .device-room-content { display: grid; gap: 12px; min-width: 0; padding: 12px 10px 10px; }
 .device-room-content[hidden] { display: none; }
@@ -63,9 +64,9 @@
     .device-view-field { flex-basis: calc(50% - 5px); }
     .device-view-room-actions { width: 100%; }
     .device-view-room-actions button { flex: 1 1 110px; min-width: 0; }
-    .device-room-header { flex-wrap: wrap; gap: 6px; }
-    .device-room-toggle { flex-basis: 100%; }
-    .device-room-off { margin-left: 22px; max-width: calc(100% - 22px); }
+    .device-room-header { flex-wrap: nowrap; gap: 6px; }
+    .device-room-toggle { flex-basis: auto; }
+    .device-room-off { flex-basis: 40px; width: 40px; height: 40px; min-width: 40px; margin-left: 0; }
     .device-room-content { padding: 12px 6px 6px; gap: 8px; }
     .device-panel.is-compact { padding: 10px; }
 }
