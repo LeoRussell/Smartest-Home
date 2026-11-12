@@ -39,6 +39,9 @@ DATABASE_BACKUP_ID_PATTERN = re.compile(
 
 COMMAND_TIMEOUT_SECONDS = 5
 
+# A stalled browser must not hold device telemetry and ACK processing forever.
+BROWSER_SEND_TIMEOUT_SECONDS = 5
+
 EVENTS_PAGE_SIZE = 30
 
 DEVICE_STALE_SECONDS = 45

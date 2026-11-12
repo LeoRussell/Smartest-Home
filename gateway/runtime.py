@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,12 +18,43 @@ from protocol import ProtocolMixin
 from device_management import DeviceManagement
 
 
+async def run_until_shutdown(awaitable):
+    """Let CLI services finish their finally blocks on a normal SIGTERM stop."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    requested = False
+    installed = False
+
+    def request_stop():
+        nonlocal requested
+        requested = True
+        task.cancel()
+
+    try:
+        if signal.getsignal(signal.SIGTERM) == signal.SIG_DFL:
+            loop.add_signal_handler(signal.SIGTERM, request_stop)
+            installed = True
+    except (NotImplementedError, RuntimeError, ValueError):
+        # Windows event loops don't support add_signal_handler. Ctrl+C still
+        # uses asyncio.run's normal cancellation and cleanup path.
+        pass
+    try:
+        return await awaitable
+    except asyncio.CancelledError:
+        if not requested:
+            raise
+    finally:
+        if installed:
+            loop.remove_signal_handler(signal.SIGTERM)
+
+
 class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, AutomationMixin, ProtocolMixin):
     def __init__(self, database_path=None):
         self.AUTOMATION_RUN_HISTORY_LIMIT = settings.AUTOMATION_RUN_HISTORY_LIMIT
         self.BASE_DIR = settings.BASE_DIR
         self.COMMAND_RETRY_LIMIT = settings.COMMAND_RETRY_LIMIT
         self.COMMAND_TIMEOUT_SECONDS = settings.COMMAND_TIMEOUT_SECONDS
+        self.BROWSER_SEND_TIMEOUT_SECONDS = settings.BROWSER_SEND_TIMEOUT_SECONDS
         self.CONFIGURATION_APPLY_TIMEOUT_SECONDS = settings.CONFIGURATION_APPLY_TIMEOUT_SECONDS
         self.DATABASE_BACKUP_DIR = settings.DATABASE_BACKUP_DIR
         self.DATABASE_BACKUP_DOWNLOAD_LIMIT = settings.DATABASE_BACKUP_DOWNLOAD_LIMIT
@@ -63,9 +95,11 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
         self.configuration_confirmed_devices = set()
         self.pending_commands = {}
         self.automation_tasks = {}
+        self._automation_progress = {}
         self.automation_trigger_tasks = {}
         self.automation_trigger_devices = {}
         self.database_restore_in_progress = False
+        self.shutting_down = False
         self.automation_stop_requests = set()
         self.automation_waiting_tasks = set()
         self.automation_restart_tasks = set()
@@ -368,6 +402,7 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
 
 
     async def run(self):
+        self.shutting_down = False
         self.init_db()
         self.load_pending_commands()
         self.sync_device_configuration_exports()
@@ -401,18 +436,54 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
                     print("Интерактивная консоль отключена; Gateway работает в служебном режиме.")
                     await asyncio.Event().wait()
             finally:
+                self.shutting_down = True
                 self.connections.close_all("gateway_shutdown")
+                trigger_tasks = list(self.automation_trigger_tasks.values())
+                running_tasks = list(self.automation_tasks.values())
+                command_timers = [pending["timeout_task"] for pending in self.pending_commands.values()
+                                  if pending.get("timeout_task") is not None]
+                self.automation_stop_requests.update(self.automation_tasks)
+                for task in trigger_tasks + running_tasks + command_timers:
+                    task.cancel()
+                watchdog_task.cancel()
+                runtime_task.cancel()
+                maintenance_task.cancel()
+                lag_task.cancel()
                 await self.management.shutdown()
+                if trigger_tasks or running_tasks or command_timers:
+                    await asyncio.gather(*trigger_tasks, *running_tasks, *command_timers, return_exceptions=True)
+                with self.database_connection() as connection:
+                    self.interrupt_automation_records(connection, "Gateway остановил выполнение сценария.")
+                self.automation_tasks.clear()
+                self._automation_progress.clear()
+                self.automation_trigger_tasks.clear()
+                self.automation_trigger_devices.clear()
+                self.automation_stop_requests.clear()
+                self.automation_waiting_tasks.clear()
+                self.automation_restart_tasks.clear()
+                for command_id, pending in list(self.pending_commands.items()):
+                    if self.pending_commands.get(command_id) is not pending:
+                        continue
+                    pending["timeout_task"] = None
+                    if pending.get("automation_id") or pending["operation"].get("transient"):
+                        removed = self.remove_pending_command(command_id)
+                        if removed is not None:
+                            await self.send_pending_command_result(
+                                removed, "unavailable", removed["operation"].get("value"),
+                                "Gateway остановлен; отложенная команда сценария отменена."
+                            )
+                    else:
+                        pending["status"] = "queued"
+                        self.update_command_queue_record(pending, "queued")
+                        result = pending.get("result_future")
+                        if result is not None and not result.done():
+                            result.set_result({"status": "unavailable", "error": "Gateway остановлен."})
                 applying_tasks = [
                     self.cancel_configuration_apply(device_id, pending=True)
                     for device_id in list(self.configuration_apply_tasks)
                 ]
                 if applying_tasks:
                     await asyncio.gather(*applying_tasks, return_exceptions=True)
-                watchdog_task.cancel()
-                runtime_task.cancel()
-                maintenance_task.cancel()
-                lag_task.cancel()
                 try:
                     await watchdog_task
                 except asyncio.CancelledError:

@@ -1059,7 +1059,7 @@ class AutomationMixin:
 
 
     def start_automation_run(self, automation_id, config, reason):
-        if self.database_restore_in_progress:
+        if self.database_restore_in_progress or self.shutting_down:
             return False
         existing_task = self.automation_tasks.get(automation_id)
         task_is_active = existing_task is not None and not existing_task.done()
@@ -1163,7 +1163,7 @@ class AutomationMixin:
 
 
     def fire_automation_event(self, event_type, device_id=None, parameter=None, value=None):
-        if self.database_restore_in_progress:
+        if self.database_restore_in_progress or self.shutting_down:
             return
         with self.database_connection() as conn:
             rows = conn.execute("""

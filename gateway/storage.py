@@ -17,6 +17,19 @@ from connection_history import ConnectionHistory
 
 
 class StorageMixin:
+    def interrupt_automation_records(self, connection, reason):
+        """Close unfinished records even if a task was cancelled before entering."""
+        timestamp = self.current_time()
+        for table in ("automation_runs", "automation_run_steps"):
+            connection.execute(f"""
+                UPDATE {table} SET status = 'interrupted', finished_at = ?,
+                    error = COALESCE(error, ?) WHERE status = 'running'
+            """, (timestamp, reason))
+        connection.execute("""
+            UPDATE automations SET run_status = 'idle', last_run_status = 'interrupted',
+                last_error = COALESCE(last_error, ?) WHERE run_status = 'running'
+        """, (reason,))
+
     @contextmanager
     def database_connection(self):
         """Commit or roll back the transaction, then always release its file handle."""
@@ -202,25 +215,7 @@ class StorageMixin:
             }.items():
                 if column not in automation_columns:
                     conn.execute(f"ALTER TABLE automations ADD COLUMN {column} {column_type}")
-            interrupted_at = self.current_time()
-            conn.execute("""
-                UPDATE automation_runs
-                SET status = 'interrupted', finished_at = ?,
-                    error = COALESCE(error, 'Gateway перезапустился во время выполнения.')
-                WHERE status = 'running'
-            """, (interrupted_at,))
-            conn.execute("""
-                UPDATE automation_run_steps
-                SET status = 'interrupted', finished_at = ?,
-                    error = COALESCE(error, 'Gateway перезапустился во время выполнения.')
-                WHERE status = 'running'
-            """, (interrupted_at,))
-            conn.execute("""
-                UPDATE automations
-                SET run_status = 'idle', last_run_status = 'interrupted',
-                    last_error = COALESCE(last_error, 'Gateway перезапустился во время выполнения.')
-                WHERE run_status = 'running'
-            """)
+            self.interrupt_automation_records(conn, "Gateway перезапустился во время выполнения.")
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_command_queue_device_status
                 ON command_queue (device_id, status)
@@ -237,6 +232,7 @@ class StorageMixin:
                 "protocol_version": "INTEGER",
                 "firmware_version": "TEXT",
                 "command_dedup": "INTEGER DEFAULT 0",
+                "command_replay_guard": "INTEGER DEFAULT 0",
                 "schema_version": "INTEGER",
                 "schema_json": "TEXT",
                 "state_json": "TEXT",
@@ -339,6 +335,7 @@ class StorageMixin:
         print(f"База данных: {self.DB_PATH}")
 
         self.GATEWAY_SESSION_STARTED_AT = datetime.now(timezone.utc)
+        self._automation_progress.clear()
         self.management.initialize()
         self.history = ParameterHistory(self)
         self.history.initialize()
@@ -391,8 +388,11 @@ class StorageMixin:
                 "SELECT COUNT(*) FROM device_events"
             ).fetchone()[0]
             ever_connected_device_count = conn.execute("""
-                SELECT COUNT(DISTINCT device_id)
-                FROM device_events WHERE event_type = 'connection'
+                SELECT COUNT(*) FROM (
+                    SELECT device_id FROM devices WHERE last_seen IS NOT NULL
+                    UNION
+                    SELECT device_id FROM device_events WHERE event_type = 'connection'
+                )
             """).fetchone()[0]
             schema_snapshot_count = conn.execute(
                 "SELECT COUNT(*) FROM device_schema_history"
@@ -715,11 +715,11 @@ class StorageMixin:
             conn.execute("""
                 INSERT INTO devices (
                     device_id, last_seen, connected, name, display_name, firmware_id,
-                    protocol_version, firmware_version, command_dedup,
+                    protocol_version, firmware_version, command_dedup, command_replay_guard,
                     schema_version, schema_json,
                     trust_policy, device_profile, board_profile, driver_catalog_json
                 )
-                VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(device_id) DO UPDATE SET
                     last_seen = excluded.last_seen,
                     connected = 1,
@@ -729,6 +729,7 @@ class StorageMixin:
                     protocol_version = excluded.protocol_version,
                     firmware_version = excluded.firmware_version,
                     command_dedup = excluded.command_dedup,
+                    command_replay_guard = excluded.command_replay_guard,
                     schema_version = excluded.schema_version,
                     schema_json = excluded.schema_json,
                     trust_policy = excluded.trust_policy,
@@ -744,6 +745,7 @@ class StorageMixin:
                 metadata.get("protocol_version"),
                 metadata.get("firmware_version"),
                 int(metadata.get("command_dedup") is True),
+                int(metadata.get("command_replay_guard") is True),
                 metadata.get("schema_version"),
                 schema_json,
                 metadata.get("trust_policy"),
@@ -784,7 +786,7 @@ class StorageMixin:
             row = conn.execute(
                 """
                 SELECT name, display_name, firmware_id, protocol_version, firmware_version,
-                       command_dedup, schema_version, schema_json, trust_policy,
+                       command_dedup, command_replay_guard, schema_version, schema_json, trust_policy,
                        device_profile, board_profile, driver_catalog_json
                 FROM devices WHERE device_id = ?
                 """,
@@ -815,6 +817,7 @@ class StorageMixin:
             "protocol_version": row["protocol_version"],
             "firmware_version": row["firmware_version"],
             "command_dedup": bool(row["command_dedup"]),
+            "command_replay_guard": bool(row["command_replay_guard"]),
             "schema_version": row["schema_version"],
             "schema": schema,
             "trust_policy": row["trust_policy"],
@@ -1171,6 +1174,14 @@ class StorageMixin:
         return metadata is not None and metadata.get("command_dedup") is True
 
 
+    def device_supports_command_replay_guard(self, device_id):
+        metadata = self.device_metadata.get(device_id) or self.load_device_metadata(device_id)
+        return (
+            metadata is not None and metadata.get("command_dedup") is True
+            and metadata.get("command_replay_guard") is True
+        )
+
+
     def record_schema_snapshot_in_connection(self, conn, device_id, metadata, timestamp, source):
         schema_json = json.dumps(metadata["schema"], ensure_ascii=False)
         canonical = json.dumps(
@@ -1336,24 +1347,47 @@ class StorageMixin:
             """).fetchall()
 
         for command_id, device_id, operation_json, payload_json, status, attempts in rows:
+            def discard(error, final_status="unavailable"):
+                with self.database_connection() as conn:
+                    conn.execute("""
+                        UPDATE command_queue SET status = ?, updated_at = ?, error = ?
+                        WHERE command_id = ?
+                    """, (final_status, self.current_time(), error, command_id))
+
             try:
                 operation = json.loads(operation_json)
                 payload = json.loads(payload_json)
-            except (TypeError, json.JSONDecodeError):
-                print(f"[WARN] Skipping unreadable queued command {command_id}.")
+            except (TypeError, ValueError, RecursionError):
+                discard("Невозможно прочитать сохранённую команду; повтор отменён.", "failed")
                 continue
             if not isinstance(operation, dict) or not isinstance(payload, dict):
+                discard("Некорректная структура сохранённой команды; повтор отменён.", "failed")
                 continue
-            if operation.get("transient"):
-                with self.database_connection() as conn:
-                    conn.execute("""
-                        UPDATE command_queue SET status = 'unavailable',
-                            updated_at = ?, error = ? WHERE command_id = ?
-                    """, (
-                        self.current_time(),
-                        "Общая команда отменена при перезапуске Gateway; отложенное выполнение запрещено.",
-                        command_id
-                    ))
+            if operation.get("transient") or operation.get("automation_id") or operation.get("automation_run_id"):
+                discard("Команда сценария или общего управления отменена при перезапуске Gateway; отложенное выполнение запрещено.")
+                continue
+            data = payload.get("data")
+            kind, name = operation.get("kind"), operation.get("name")
+            valid = (
+                self.valid_command_id(command_id)
+                and isinstance(device_id, str) and bool(device_id)
+                and type(attempts) is int and attempts >= 0
+                and kind in ("parameter", "action")
+                and isinstance(name, str) and bool(name)
+                and payload.get("type") == "command" and isinstance(data, dict)
+                and data.get("command_id") == command_id
+            )
+            if valid and kind == "parameter":
+                valid = (data.get("command") == "set" and data.get("parameter") == name
+                         and "value" in data and "value" in operation
+                         and self.schema_values_match(data["value"], operation["value"]))
+            elif valid:
+                valid = (data.get("command") == "invoke" and data.get("action") == name
+                         and isinstance(operation.get("arguments", {}), dict)
+                         and isinstance(data.get("arguments", {}), dict)
+                         and self.schema_values_match(data.get("arguments", {}), operation.get("arguments", {})))
+            if not valid:
+                discard("Сохранённая команда не соответствует своей операции; повтор отменён.", "failed")
                 continue
             self.pending_commands[command_id] = {
                 "command_id": command_id,
@@ -1752,7 +1786,7 @@ class StorageMixin:
             rows = conn.execute("""
                 SELECT
                     device_id, last_seen, last_telemetry_at, led, connected, name, display_name, state_json,
-                    protocol_version, firmware_version, command_dedup,
+                    protocol_version, firmware_version, command_dedup, command_replay_guard,
                     schema_version, schema_json,
                     trust_policy, device_profile, board_profile, driver_catalog_json
                 FROM devices
@@ -1831,6 +1865,7 @@ class StorageMixin:
                     "protocol_version": row["protocol_version"],
                     "firmware_version": row["firmware_version"],
                     "command_dedup": bool(row["command_dedup"]),
+                    "command_replay_guard": bool(row["command_replay_guard"]),
                     "schema_version": row["schema_version"],
                     "schema": stored_schema,
                     "trust_policy": row["trust_policy"],
@@ -1855,6 +1890,7 @@ class StorageMixin:
                 "protocol_version": metadata.get("protocol_version"),
                 "firmware_version": metadata.get("firmware_version"),
                 "command_dedup": metadata.get("command_dedup", False),
+                "command_replay_guard": metadata.get("command_replay_guard", False),
                 "schema_version": metadata.get("schema_version"),
                 "schema_source": (
                     "device"
@@ -1900,6 +1936,7 @@ class StorageMixin:
                     "protocol_version": metadata.get("protocol_version"),
                     "firmware_version": metadata.get("firmware_version"),
                     "command_dedup": metadata.get("command_dedup", False),
+                    "command_replay_guard": metadata.get("command_replay_guard", False),
                     "schema_version": metadata.get("schema_version"),
                     "schema_source": (
                         "device"
@@ -2001,6 +2038,16 @@ class StorageMixin:
                 if decision_event is not None:
                     decision_event.set()
 
+            # Stop durable delivery before telling callers it was cancelled.
+            # A socket/handler shutdown can fail before the database copy starts;
+            # commands cancelled here must not resurrect on the next restart.
+            with self.database_connection() as conn:
+                conn.execute("""
+                    UPDATE command_queue
+                    SET status = 'unavailable', updated_at = ?,
+                        error = 'Command queue cleared during database restore.'
+                    WHERE status IN ('queued', 'sent')
+                """, (self.current_time(),))
             for pending in list(self.pending_commands.values()):
                 timeout_task = pending.get("timeout_task")
                 if timeout_task is not None:

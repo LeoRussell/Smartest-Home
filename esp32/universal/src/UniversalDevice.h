@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <GatewayClient.h>
+#include <CommandResultCache.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include "user_config.h"
@@ -15,6 +16,7 @@ public:
     void fillSchema(JsonObject schema) const;
     void sendState(GatewayClient& gateway, bool logMessage = false);
     uint32_t configurationVersion() const;
+    bool commandDedupReady() const;
 
 private:
     enum class IdentifyDriver : uint8_t {
@@ -86,6 +88,7 @@ private:
                                  const char* error = nullptr) const;
     void sendConfigurationReport(GatewayClient& gateway);
     Preferences preferences_;
+    CommandResultCache commandCache_;
     Adafruit_NeoPixel identifyPixel_{1, 48, NEO_GRB + NEO_KHZ800};
     Component components_[MAX_COMPONENTS];
     IdentifyIndicator identifyIndicator_;
@@ -93,6 +96,7 @@ private:
     uint32_t configurationVersion_ = 0;
     uint32_t stateSequence_ = 0;
     String configurationHash_;
+    String activeConfigurationJson_;
     unsigned long lastHeartbeatAt_ = 0;
     unsigned long identifyNextAt_ = 0;
     uint8_t identifyPulsesRemaining_ = 0;

@@ -1,0 +1,83 @@
+name: Project checks
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  application:
+    name: Gateway and browser (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: gateway/requirements.txt
+      - name: Install server dependencies
+        run: python -m pip install -r gateway/requirements.txt
+      - name: Require native firmware test compiler on Linux
+        if: runner.os == 'Linux'
+        run: g++ --version
+      - name: Run server and firmware-cache tests
+        run: python -X utf8 -m unittest discover -s gateway/tests -v
+      - name: Check browser workflows and layouts
+        run: python -X utf8 web/tests/browser_smoke.py
+      - name: Exercise reconnect and restart cycles
+        run: python -X utf8 gateway/soak_test.py --cycles 3 --interval 0 --report "${{ runner.temp }}/gateway-soak.json"
+
+  firmware:
+    name: ESP32 firmware builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PLATFORMIO_SETTING_ENABLE_TELEMETRY: "no"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.2.0
+      - name: Cache firmware toolchains
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: ${{ runner.os }}-pio-6.2.0-${{ hashFiles('esp32/**/platformio.ini', 'esp32/shared/lib/GatewayClient/library.json') }}
+          restore-keys: ${{ runner.os }}-pio-6.2.0-
+      - name: Use placeholder network settings
+        run: cp esp32/shared/include/secrets.example.h esp32/shared/include/secrets.h
+      - name: Build universal firmware
+        run: pio run -d esp32/universal
+      - name: Build all LED profiles
+        run: pio run -d esp32/examples/led -e esp32-s3-devkitc-1 -e esp32-s3-devkitc-1-v1_0-neopixel -e esp32-s3-devkitc-1-v1_1 -e adafruit_feather_esp32s3
+      - name: Test command cache core and storage adapter
+        env:
+          ARDUINOJSON_INCLUDE_DIR: ${{ github.workspace }}/esp32/universal/.pio/libdeps/esp32-s3-devkitc-1/ArduinoJson/src
+        run: |
+          g++ --version
+          test -f "$ARDUINOJSON_INCLUDE_DIR/ArduinoJson.h"
+          python -X utf8 -m unittest discover -s gateway/tests -p test_firmware_command_cache.py -v

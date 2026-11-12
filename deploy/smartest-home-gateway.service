@@ -11,8 +11,9 @@ WorkingDirectory=/opt/smartest-home
 Environment=PYTHONUNBUFFERED=1
 Environment=GATEWAY_HOST=0.0.0.0
 Environment=GATEWAY_PORT=8765
+Environment=GATEWAY_HTTP_PORT=8080
 Environment=GATEWAY_DB_PATH=/var/lib/smartest-home/gateway.db
-ExecStart=/opt/smartest-home/.venv/bin/python /opt/smartest-home/gateway/main.py
+ExecStart=/opt/smartest-home/.venv/bin/python /opt/smartest-home/run.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

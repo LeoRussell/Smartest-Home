@@ -31,7 +31,7 @@
             notSet: "(не задано)", off: "Выкл.", on: "Вкл.",
             wait: "подождать", seconds: "секунд",
             invalidWorkspace: "Добавьте один блок запуска и соедините с ним сценарий.", emptyBody: "В сценарии нет действий.",
-            missingBlock: "Сценарий содержит неподдерживаемый или неполный блок.", invalidArgument: "Проверьте значение аргумента действия."
+            missingBlock: "Сценарий содержит неподдерживаемый или неполный блок.", unavailable: "недоступно", invalidArgument: "Проверьте значение аргумента действия.", discardArguments: "Удалить недоступные аргументы"
         },
         en: {
             manual: "When a button is pressed", dashboard: "Show on Devices page",
@@ -43,7 +43,7 @@
             notSet: "(not set)", off: "Off", on: "On",
             wait: "wait", seconds: "seconds",
             invalidWorkspace: "Add one trigger block and connect the scenario to it.", emptyBody: "The scenario has no actions.",
-            missingBlock: "The scenario contains an unsupported or incomplete block.", invalidArgument: "Check the action argument value."
+            missingBlock: "The scenario contains an unsupported or incomplete block.", unavailable: "unavailable", invalidArgument: "Check the action argument value.", discardArguments: "Remove unavailable arguments"
         }
     };
 
@@ -149,80 +149,102 @@
 
     function refreshDropdown(block, fieldName, selectedValue = block.getFieldValue(fieldName)) {
         const field = block.getField(fieldName);
+        if (field.gatewayPreserveSelection) field.gatewayMissingValue = selectedValue;
         const options = field.getOptions(false);
         if (!options.some(option => option[1] === selectedValue)) selectedValue = options[0][1];
         block.setFieldValue(selectedValue, fieldName);
         return options;
     }
 
-    function triggerValueField(definition) {
+    function selectionDropdown(generator) {
+        const field = new Blockly.FieldDropdown(function () {
+            const options = generator.call(this);
+            const selected = this.gatewayMissingValue;
+            return typeof selected === "string" && selected && !options.some(option => option[1] === selected)
+                ? [...options, [`${selected} (${text("unavailable")})`, selected]] : options;
+        });
+        field.gatewayPreserveSelection = true;
+        return field;
+    }
+
+    function triggerValueField(definition, previousValue) {
         if (definition?.type === "boolean") {
-            return new Blockly.FieldDropdown([
+            const field = selectionDropdown(() => [
                 [text("on"), "true"], [text("off"), "false"]
             ]);
+            if (previousValue != null) field.gatewayMissingValue = String(previousValue);
+            return field;
         }
         if (definition?.type === "enum") {
             const options = (definition.options || []).map(option => [
                 option.label, JSON.stringify(option.value)
             ]);
-            if (options.length) return new Blockly.FieldDropdown(options);
+            if (options.length) {
+                const field = selectionDropdown(() => options);
+                if (previousValue != null) field.gatewayMissingValue = String(previousValue);
+                return field;
+            }
         }
         if (definition?.type === "integer" || definition?.type === "number") {
-            const initial = definition.min ?? 0;
-            const precision = definition.type === "integer"
-                ? 1
-                : definition.step ?? (definition.precision != null
-                    ? 10 ** -definition.precision : 0.01);
-            return new Blockly.FieldNumber(
-                initial,
-                definition.min ?? -Infinity,
-                definition.max ?? Infinity,
-                precision
-            );
+            if (previousValue != null && (!String(previousValue).trim() || !Number.isFinite(Number(previousValue)))) {
+                return new Blockly.FieldTextInput(String(previousValue));
+            }
+            // Schema limits are checked when compiling. A refreshed Schema must
+            // never clamp or round an existing condition into a different one.
+            return new Blockly.FieldNumber(definition.min ?? 0, -Infinity, Infinity, 0);
         }
         return new Blockly.FieldTextInput("");
     }
 
-    function updateParameterTriggerFilter(block) {
+    function updateParameterTriggerFilter(block, preservedValue) {
         const valueInput = block.getInput("FILTER_VALUE");
         if (!valueInput) return;
         const definition = selectedParameter(block);
         const nextType = definition?.type || "string";
-        const schemaKey = `${block.getFieldValue("DEVICE")}:${block.getFieldValue("PARAMETER")}:${nextType}`;
-        if (block.triggerValueSchemaKey_ !== schemaKey) {
-            const oldType = block.triggerValueType_;
-            const oldValue = block.getFieldValue("VALUE");
+        const schemaKey = JSON.stringify([block.getFieldValue("DEVICE"), block.getFieldValue("PARAMETER"), definition]);
+        if (block.triggerValueSchemaKey_ !== schemaKey || preservedValue !== undefined) {
+            const oldValue = preservedValue !== undefined ? preservedValue : block.getFieldValue("VALUE");
             valueInput.removeField("VALUE", true);
-            valueInput.appendField(triggerValueField(definition), "VALUE");
+            valueInput.removeField("VALUE_STATUS", true);
+            valueInput.appendField(triggerValueField(definition, oldValue), "VALUE");
+            valueInput.appendField(new Blockly.FieldLabel(text("unavailable")), "VALUE_STATUS");
             block.triggerValueType_ = nextType;
             block.triggerValueSchemaKey_ = schemaKey;
 
-            // Keep the selected value across devices exposing the same type.
-            if (oldType === nextType && oldValue !== null && oldValue !== undefined) {
+            if (oldValue !== null && oldValue !== undefined) {
                 const field = block.getField("VALUE");
-                const options = field.getOptions ? field.getOptions(false) : null;
-                if (!options || options.some(option => option[1] === oldValue)) {
-                    try { block.setFieldValue(oldValue, "VALUE"); } catch (error) { /* use the field default */ }
-                }
+                if (field.gatewayPreserveSelection) field.getOptions(false);
+                block.setFieldValue(oldValue, "VALUE");
             }
         }
-        valueInput.setVisible(block.getFieldValue("MATCH") === "equals");
+        const filtered = block.getFieldValue("MATCH") === "equals";
+        let valid = true;
+        if (filtered) { try { parseTriggerValue(block.getFieldValue("VALUE"), definition); } catch { valid = false; } }
+        block.getField("VALUE_STATUS")?.setVisible(!valid);
+        block.setWarningText(valid ? null : text("invalidTriggerValue"), "trigger-value");
+        valueInput.setVisible(filtered);
     }
 
     function parseTriggerValue(raw, definition) {
         if (!definition) throw new Error(text("missingBlock"));
-        if (definition.type === "boolean") return raw === "true";
-        if (definition.type === "enum") {
-            try { return JSON.parse(raw); } catch (error) { throw new Error(text("invalidTriggerValue")); }
+        if (definition.type === "boolean") {
+            if (raw !== "true" && raw !== "false") throw new Error(text("invalidTriggerValue"));
+            return raw === "true";
         }
-        if (definition.type === "integer") {
-            const value = Number(raw);
-            if (!Number.isSafeInteger(value)) throw new Error(text("invalidTriggerValue"));
+        if (definition.type === "enum") {
+            let value;
+            try { value = JSON.parse(raw); } catch (error) { throw new Error(text("invalidTriggerValue")); }
+            if (!(definition.options || []).some(option => option.value === value)) throw new Error(text("invalidTriggerValue"));
             return value;
         }
-        if (definition.type === "number") {
+        if (["integer", "number"].includes(definition.type)) {
             const value = Number(raw);
-            if (!Number.isFinite(value)) throw new Error(text("invalidTriggerValue"));
+            if (!String(raw).trim() || !Number.isFinite(value) || definition.type === "integer" && !Number.isSafeInteger(value) ||
+                definition.min != null && value < definition.min || definition.max != null && value > definition.max) throw new Error(text("invalidTriggerValue"));
+            if (definition.step != null) {
+                const position = (value - (definition.min ?? 0)) / definition.step;
+                if (!Number.isFinite(position) || Math.abs(position - Math.round(position)) > 1e-9) throw new Error(text("invalidTriggerValue"));
+            }
             return value;
         }
         if (definition.type === "string") return raw;
@@ -262,40 +284,86 @@
         if (argument.type === "boolean") {
             const options = optional ? [[text("notSet"), ""]] : [];
             options.push([text("off"), "false"], [text("on"), "true"]);
-            return new Blockly.FieldDropdown(options);
+            const field = selectionDropdown(() => options);
+            if (initialValue != null) field.gatewayMissingValue = String(initialValue);
+            return field;
         }
         if (argument.type === "enum") {
             const options = optional ? [[text("notSet"), ""]] : [];
             for (const item of argument.options || []) {
                 options.push([item.label, JSON.stringify(item.value)]);
             }
-            return new Blockly.FieldDropdown(options);
+            const field = selectionDropdown(() => options);
+            if (initialValue != null) field.gatewayMissingValue = String(initialValue);
+            return field;
         }
         return new Blockly.FieldTextInput(initialValue ?? "");
     }
 
-    function updateActionArguments(block, actionIdOverride = null) {
+    function actionArgumentValues(block) {
+        return Object.fromEntries((block.getInput("ARGUMENTS")?.fieldRow || [])
+            .filter(field => field.name?.startsWith("ARG_")).map(field => [field.name.slice(4), block.getFieldValue(field.name)]));
+    }
+
+    function updateActionArguments(block, actionIdOverride = null, discardUnavailable = false) {
+        const actionId = actionIdOverride || block.getFieldValue("ACTION") || "";
+        const target = JSON.stringify([block.getFieldValue("DEVICE"), actionId, block.getFieldValue("MODE"), block.getFieldValue("OPERATION")]);
+        const sameTarget = !block.gatewayArgumentTarget || block.gatewayArgumentTarget === target;
+        const saved = sameTarget ? { ...block.gatewaySavedArguments, ...actionArgumentValues(block) } : {};
         if (block.getInput("ARGUMENTS")) block.removeInput("ARGUMENTS");
         const device = devices.find(item => item.device === block.getFieldValue("DEVICE"));
-        const definition = device?.schema?.actions?.[actionIdOverride || block.getFieldValue("ACTION")];
+        const definition = device?.schema?.actions?.[actionId];
         const argumentsMap = definition?.arguments || {};
+        const unavailable = Object.keys(saved).filter(id => !Object.hasOwn(argumentsMap, id) || argumentsMap[id].type === "json");
+        if (discardUnavailable && definition) for (const id of unavailable) delete saved[id];
+        block.gatewayArgumentTarget = target;
+        block.gatewaySavedArguments = saved;
         const input = block.appendDummyInput("ARGUMENTS");
         let fieldCount = 0;
         for (const [id, argument] of Object.entries(argumentsMap)) {
             if (argument.type === "json") continue;
             if (fieldCount > 0) input.appendField("·");
             input.appendField(argument.label || id);
-            input.appendField(makeArgumentField(argument), `ARG_${id}`);
+            const value = saved[id];
+            const field = makeArgumentField(argument, value);
+            input.appendField(field, `ARG_${id}`);
+            if (value != null) {
+                if (field.gatewayPreserveSelection) field.getOptions(false);
+                block.setFieldValue(String(value), `ARG_${id}`);
+            }
             fieldCount += 1;
         }
+        const retainedUnavailable = discardUnavailable && definition ? [] : unavailable;
+        for (const id of retainedUnavailable) {
+            const value = saved[id];
+            if (fieldCount > 0) input.appendField("·");
+            input.appendField(`${id} (${text("unavailable")})`);
+            input.appendField(new Blockly.FieldTextInput(String(value ?? "")), `ARG_${id}`);
+            fieldCount += 1;
+        }
+        if (definition && retainedUnavailable.length) {
+            input.appendField(new Blockly.FieldCheckbox("FALSE"), "DISCARD_REMOVED_ARGS").appendField(text("discardArguments"));
+        }
+        block.setWarningText(retainedUnavailable.length ? text("invalidArgument") : null, "action-arguments");
         if (!fieldCount) input.appendField(text("action"));
     }
 
-    function restoreBlockSelection(block, selection = {}) {
+    function discardUnavailableArguments(block, event) {
+        if (block.getFieldValue("DISCARD_REMOVED_ARGS") !== "TRUE") return;
+        const previous = JSON.stringify(block.saveExtraState());
+        const group = Blockly.Events.getGroup();
+        Blockly.Events.setGroup(event.group || true);
+        try {
+            updateActionArguments(block, block.type === "iot_invoke_mode" ? modeActionForBlock(block) : null, true);
+            Blockly.Events.fire(new Blockly.Events.BlockChange(block, "mutation", null, previous, JSON.stringify(block.saveExtraState())));
+        } finally { Blockly.Events.setGroup(group); }
+    }
+
+    function restoreBlockSelection(block, selection = {}, triggerValue) {
         for (const field of ["DEVICE", ...selectionFields[block.type]]) {
             refreshDropdown(block, field, selection[field] ?? block.getFieldValue(field));
         }
-        if (block.type === "iot_when_parameter_changes") updateParameterTriggerFilter(block);
+        if (block.type === "iot_when_parameter_changes") updateParameterTriggerFilter(block, triggerValue);
         else if (block.type === "iot_parameter_compare") updateParameterComparison(block);
         else if (block.type === "iot_device_parameter") updateValueConnection(block);
         else if (block.type === "iot_set_parameter") updateValueConnection(block, "PARAMETER", "VALUE");
@@ -303,21 +371,43 @@
     }
 
     function prepareWorkspaceState(state) {
+        state = state ? JSON.parse(JSON.stringify(state)) : state;
         const visit = value => {
             if (!value || typeof value !== "object") return;
             if (selectionFields[value.type] && value.fields) {
                 // Older saved scenarios have no extraState. Restore their device
                 // selection before Blockly loads dependent dropdowns and arguments.
-                value.extraState = { selection: Object.fromEntries(
+                value.extraState = { ...value.extraState, selection: Object.fromEntries(
                     ["DEVICE", ...selectionFields[value.type]]
                         .filter(field => value.fields[field] !== undefined)
                         .map(field => [field, value.fields[field]])
                 ) };
+                if (value.type === "iot_when_parameter_changes" && value.fields.VALUE !== undefined) value.extraState.triggerValue = value.fields.VALUE;
+                if (["iot_invoke_action", "iot_invoke_mode"].includes(value.type)) {
+                    delete value.fields.DISCARD_REMOVED_ARGS;
+                    value.extraState.arguments = { ...value.extraState.arguments, ...Object.fromEntries(
+                        Object.entries(value.fields).filter(([name]) => name.startsWith("ARG_")).map(([name, raw]) => [name.slice(4), raw])
+                    ) };
+                }
             }
             Object.values(value).forEach(visit);
         };
         visit(state);
         return state;
+    }
+
+    function validateWorkspaceState(state) {
+        const stack = [...(state?.blocks?.blocks || [])];
+        let count = 0;
+        while (stack.length) {
+            const block = stack.pop();
+            if (!block || typeof block !== "object" || !Blockly.Blocks[block.type] || ++count > 1000) throw new Error(text("missingBlock"));
+            for (const input of Object.values(block.inputs || {})) {
+                if (input?.block) stack.push(input.block);
+                if (input?.shadow) stack.push(input.shadow);
+            }
+            if (block.next?.block) stack.push(block.next.block);
+        }
     }
 
     function defineBlocks() {
@@ -326,8 +416,8 @@
             init() {
                 this.appendDummyInput()
                     .appendField(text("parameterChanged"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
-                    .appendField(new Blockly.FieldDropdown(parameterOptions), "PARAMETER");
+                    .appendField(selectionDropdown(deviceOptions), "DEVICE")
+                    .appendField(selectionDropdown(parameterOptions), "PARAMETER");
                 this.appendDummyInput("FILTER")
                     .appendField(text("triggerFilter"))
                     .appendField(new Blockly.FieldDropdown([
@@ -355,21 +445,21 @@
                 if (event.name === "DEVICE") {
                     refreshDropdown(this, "PARAMETER");
                 }
-                if (["DEVICE", "PARAMETER", "MATCH"].includes(event.name)) {
+                if (["DEVICE", "PARAMETER", "MATCH", "VALUE"].includes(event.name)) {
                     updateParameterTriggerFilter(this);
                 }
             }
         };
         Blockly.Blocks.iot_when_device_connects = {
             init() {
-                this.appendDummyInput().appendField(text("deviceConnected")).appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE");
+                this.appendDummyInput().appendField(text("deviceConnected")).appendField(selectionDropdown(deviceOptions), "DEVICE");
                 this.setNextStatement(true);
                 this.setColour(210);
             }
         };
         Blockly.Blocks.iot_when_device_disconnects = {
             init() {
-                this.appendDummyInput().appendField(text("deviceDisconnected")).appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE");
+                this.appendDummyInput().appendField(text("deviceDisconnected")).appendField(selectionDropdown(deviceOptions), "DEVICE");
                 this.setNextStatement(true);
                 this.setColour(210);
             }
@@ -393,8 +483,8 @@
             init() {
                 this.appendDummyInput()
                     .appendField(text("readParameter"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
-                    .appendField(new Blockly.FieldDropdown(parameterOptions), "PARAMETER");
+                    .appendField(selectionDropdown(deviceOptions), "DEVICE")
+                    .appendField(selectionDropdown(parameterOptions), "PARAMETER");
                 this.setOutput(true);
                 this.setColour(195);
                 this.setTooltip(text("readParameterHelp"));
@@ -414,9 +504,9 @@
             init() {
                 this.appendDummyInput()
                     .appendField(text("parameterValue"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
-                    .appendField(new Blockly.FieldDropdown(parameterOptions), "PARAMETER")
-                    .appendField(new Blockly.FieldDropdown(parameterComparisonOptions), "OPERATOR");
+                    .appendField(selectionDropdown(deviceOptions), "DEVICE")
+                    .appendField(selectionDropdown(parameterOptions), "PARAMETER")
+                    .appendField(selectionDropdown(parameterComparisonOptions), "OPERATOR");
                 this.appendValueInput("RIGHT");
                 this.setOutput(true, "Boolean");
                 this.setColour(195);
@@ -430,7 +520,7 @@
         };
         Blockly.Blocks.iot_device_connected = {
             init() {
-                this.appendDummyInput().appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE").appendField(text("isConnected"));
+                this.appendDummyInput().appendField(selectionDropdown(deviceOptions), "DEVICE").appendField(text("isConnected"));
                 this.setOutput(true, "Boolean");
                 this.setColour(195);
             }
@@ -439,8 +529,8 @@
             init() {
                 this.appendDummyInput()
                     .appendField(text("setParameter"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
-                    .appendField(new Blockly.FieldDropdown(writableParameterOptions), "PARAMETER");
+                    .appendField(selectionDropdown(deviceOptions), "DEVICE")
+                    .appendField(selectionDropdown(writableParameterOptions), "PARAMETER");
                 this.appendValueInput("VALUE").appendField("=");
                 this.setPreviousStatement(true);
                 this.setNextStatement(true);
@@ -461,8 +551,8 @@
             init() {
                 this.appendDummyInput("HEADER")
                     .appendField(text("invokeAction"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
-                    .appendField(new Blockly.FieldDropdown(actionOptions), "ACTION");
+                    .appendField(selectionDropdown(deviceOptions), "DEVICE")
+                    .appendField(selectionDropdown(actionOptions), "ACTION");
                 this.setPreviousStatement(true);
                 this.setNextStatement(true);
                 this.setColour(25);
@@ -470,6 +560,9 @@
                 updateActionArguments(this);
             },
             onchange(event) {
+                if (event.type === Blockly.Events.BLOCK_CHANGE && event.blockId === this.id && event.name === "DISCARD_REMOVED_ARGS") {
+                    discardUnavailableArguments(this, event); return;
+                }
                 if (event.type === Blockly.Events.BLOCK_CHANGE && event.blockId === this.id && ["DEVICE", "ACTION"].includes(event.name)) {
                     refreshDropdown(this, "ACTION");
                     updateActionArguments(this);
@@ -480,9 +573,9 @@
             init() {
                 this.appendDummyInput("HEADER")
                     .appendField(text("selectMode"))
-                    .appendField(new Blockly.FieldDropdown(deviceOptions), "DEVICE")
-                    .appendField(new Blockly.FieldDropdown(modeOptions), "MODE")
-                    .appendField(new Blockly.FieldDropdown(modeOperationOptions), "OPERATION");
+                    .appendField(selectionDropdown(deviceOptions), "DEVICE")
+                    .appendField(selectionDropdown(modeOptions), "MODE")
+                    .appendField(selectionDropdown(modeOperationOptions), "OPERATION");
                 this.setPreviousStatement(true);
                 this.setNextStatement(true);
                 this.setColour(25);
@@ -492,6 +585,7 @@
             },
             onchange(event) {
                 if (event.type !== Blockly.Events.BLOCK_CHANGE || event.blockId !== this.id) return;
+                if (event.name === "DISCARD_REMOVED_ARGS") { discardUnavailableArguments(this, event); return; }
                 if (["DEVICE", "MODE"].includes(event.name)) {
                     refreshDropdown(this, "MODE");
                     refreshDropdown(this, "OPERATION");
@@ -516,10 +610,17 @@
             Blockly.Blocks[type].saveExtraState = function () {
                 return { selection: Object.fromEntries(
                     ["DEVICE", ...selectionFields[type]].map(field => [field, this.getFieldValue(field)])
-                ) };
+                ), ...(type === "iot_when_parameter_changes" ? { triggerValue: this.getFieldValue("VALUE") } : {}), ...(["iot_invoke_action", "iot_invoke_mode"].includes(type) ? { arguments: Object.fromEntries(
+                    (this.getInput("ARGUMENTS")?.fieldRow || []).filter(field => field.name?.startsWith("ARG_")).map(field => [field.name.slice(4), this.getFieldValue(field.name)])
+                ) } : {}) };
             };
             Blockly.Blocks[type].loadExtraState = function (state) {
-                restoreBlockSelection(this, state?.selection);
+                this.gatewaySavedArguments = state?.arguments || {};
+                if (["iot_invoke_action", "iot_invoke_mode"].includes(type)) {
+                    this.removeInput("ARGUMENTS", true);
+                    this.gatewayArgumentTarget = null;
+                }
+                restoreBlockSelection(this, state?.selection, state?.triggerValue);
             };
         }
     }
@@ -602,8 +703,9 @@
         deviceCatalogSignature = catalogSignature(devices);
         language = nextLanguage === "en" ? "en" : "ru";
         applyBlocklyLocale();
-        disposeWorkspace();
         defineBlocks();
+        validateWorkspaceState(serializedState);
+        disposeWorkspace();
         workspace = Blockly.inject(container, {
             toolbox: toolbox(),
             media: "vendor/blockly/media/",
@@ -677,14 +779,18 @@
             case "iot_device_parameter": return {
                 type: "parameter", device: block.getFieldValue("DEVICE"), parameter: block.getFieldValue("PARAMETER")
             };
-            case "iot_parameter_compare": return {
-                type: "compare",
-                operator: block.getFieldValue("OPERATOR"),
-                left: {
-                    type: "parameter", device: block.getFieldValue("DEVICE"), parameter: block.getFieldValue("PARAMETER")
-                },
-                right: parseValue(block.getInputTargetBlock("RIGHT"), depth + 1)
-            };
+            case "iot_parameter_compare": {
+                const operator = block.getFieldValue("OPERATOR");
+                if (!["eq", "ne", "lt", "le", "gt", "ge"].includes(operator) ||
+                    !["eq", "ne"].includes(operator) && !["integer", "number"].includes(selectedParameter(block)?.type)) throw new Error(text("missingBlock"));
+                return {
+                    type: "compare", operator,
+                    left: {
+                        type: "parameter", device: block.getFieldValue("DEVICE"), parameter: block.getFieldValue("PARAMETER")
+                    },
+                    right: parseValue(block.getInputTargetBlock("RIGHT"), depth + 1)
+                };
+            }
             case "iot_device_connected": return { type: "device_connected", device: block.getFieldValue("DEVICE") };
             case "logic_negate": return {
                 type: "not", operand: parseValue(block.getInputTargetBlock("BOOL"), depth + 1)
@@ -729,7 +835,10 @@
                 const device = devices.find(item => item.device === deviceId);
                 const definition = device?.schema?.actions?.[actionId];
                 if (!definition) throw new Error(text("missingBlock"));
+                const argumentTarget = JSON.stringify([deviceId, actionId || "", block.getFieldValue("MODE"), block.getFieldValue("OPERATION")]);
+                if (block.gatewayArgumentTarget !== argumentTarget) throw new Error(text("invalidArgument"));
                 const args = {};
+                if (Object.keys(actionArgumentValues(block)).some(id => !Object.hasOwn(definition.arguments || {}, id) || definition.arguments[id].type === "json")) throw new Error(text("invalidArgument"));
                 for (const [id, argument] of Object.entries(definition.arguments || {})) {
                     if (argument.type === "json") {
                         if (argument.required !== false) throw new Error(text("invalidArgument"));
@@ -745,18 +854,8 @@
                     if (raw.trim() === "" && argument.required !== false && ["integer", "number"].includes(argument.type)) {
                         throw new Error(text("invalidArgument"));
                     }
-                    if (argument.type === "boolean") args[id] = raw === "true";
-                    else if (argument.type === "enum") {
-                        try { args[id] = JSON.parse(raw); } catch (error) { throw new Error(text("invalidArgument")); }
-                    } else if (argument.type === "integer") {
-                        const value = Number(raw);
-                        if (!Number.isSafeInteger(value)) throw new Error(text("invalidArgument"));
-                        args[id] = value;
-                    } else if (argument.type === "number") {
-                        const value = Number(raw);
-                        if (!Number.isFinite(value)) throw new Error(text("invalidArgument"));
-                        args[id] = value;
-                    } else args[id] = raw;
+                    try { args[id] = parseTriggerValue(raw, argument); }
+                    catch { throw new Error(text("invalidArgument")); }
                 }
                 statements.push({ type: "invoke_action", device: deviceId, action: actionId, arguments: args });
             } else if (block.type === "iot_wait_seconds") {
@@ -837,15 +936,34 @@
 
     function load(state) {
         if (!workspace) return;
-        workspace.clear();
-        if (state?.blocks) Blockly.serialization.workspaces.load(prepareWorkspaceState(state), workspace);
-        refreshParameterBlockFields();
-        workspace.clearUndo();
-        resize();
-        announceHistoryState();
+        validateWorkspaceState(state);
+        const previous = Blockly.serialization.workspaces.save(workspace);
+        Blockly.Events.disable();
+        try {
+            workspace.clear();
+            if (state?.blocks) Blockly.serialization.workspaces.load(prepareWorkspaceState(state), workspace);
+            refreshParameterBlockFields();
+        } catch (error) {
+            workspace.clear();
+            Blockly.serialization.workspaces.load(prepareWorkspaceState(previous), workspace);
+            refreshParameterBlockFields();
+            throw error;
+        } finally {
+            Blockly.Events.enable();
+            workspace.clearUndo();
+            resize();
+            announceHistoryState();
+        }
     }
 
     function loadLegacy(config) {
+        if (!workspace) return;
+        const previous = Blockly.serialization.workspaces.save(workspace);
+        try { populateLegacy(config); }
+        catch (error) { load(previous); throw error; }
+    }
+
+    function populateLegacy(config) {
         if (!workspace || !config?.trigger || !config?.target) return;
         const source = devices.find(item => item.device === config.trigger.device);
         const sourceParameter = source?.schema?.parameters?.[config.trigger.parameter];

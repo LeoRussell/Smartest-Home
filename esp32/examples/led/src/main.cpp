@@ -5,20 +5,18 @@
 #include <Adafruit_NeoPixel.h>
 #endif
 #include <ArduinoJson.h>
-#include <Preferences.h>
 #include "secrets.h"
 #include <GatewayClient.h>
 #include "DeviceModes.h"
 #include "DeviceSchema.h"
+#include <CommandResultCache.h>
 
 const uint16_t GATEWAY_PORT = 8765;
 
 const unsigned long STATE_INTERVAL_MS = 10000;
-const uint8_t COMMAND_CACHE_SLOTS = 16;
 
 GatewayClient gateway;
-Preferences commandCache;
-bool commandCacheReady = false;
+CommandResultCache commandCache;
 unsigned long lastStateSentAt = 0;
 uint32_t stateSequence = 0;
 bool ledState = false;
@@ -27,13 +25,6 @@ bool identifyRunning = false;
 bool identifyOn = false;
 unsigned int identifyPulsesRemaining = 0;
 unsigned long identifyNextAt = 0;
-
-struct CachedCommandResult {
-    String id;
-    String result;
-};
-CachedCommandResult cachedCommands[COMMAND_CACHE_SLOTS];
-uint8_t nextCommandCacheSlot = 0;
 
 #if DEVICE_LED_DRIVER == DEVICE_LED_DRIVER_NEOPIXEL
 Adafruit_NeoPixel onboardLed(1, LED_PIN, NEO_GRB + NEO_KHZ800);
@@ -99,63 +90,6 @@ void initializeLedOutput() {
     setLedOutput(false);
 }
 
-void loadCommandResults() {
-    if (!commandCacheReady) return;
-    nextCommandCacheSlot = commandCache.getUChar("next", 0) % COMMAND_CACHE_SLOTS;
-    for (uint8_t slot = 0; slot < COMMAND_CACHE_SLOTS; slot++) {
-        String idKey = "id";
-        idKey += String(slot);
-        String resultKey = "r";
-        resultKey += String(slot);
-        String id = commandCache.getString(idKey.c_str(), "");
-        String result = commandCache.getString(resultKey.c_str(), "");
-        if (id.isEmpty() || result.isEmpty()) continue;
-        JsonDocument document;
-        if (deserializeJson(document, result) ||
-            document["type"] != "command_result" ||
-            strcmp(document["command_id"] | "", id.c_str()) != 0) {
-            continue;
-        }
-        cachedCommands[slot].id = id;
-        cachedCommands[slot].result = result;
-    }
-}
-
-bool replayCachedCommandResult(const char* commandId) {
-    if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
-        return false;
-    }
-
-    for (const CachedCommandResult& cached : cachedCommands) {
-        if (cached.id != commandId) continue;
-        // Replaying an acknowledgement must not repeat an old side effect:
-        // newer commands may already have changed the physical output.
-        gateway.sendText(cached.result);
-        Serial.println("Replayed cached result for duplicate command");
-        return true;
-    }
-    return false;
-}
-
-void rememberCommandResult(const char* commandId, const String& result) {
-    if (!commandCacheReady || commandId == nullptr || commandId[0] == '\0') {
-        return;
-    }
-
-    const uint8_t slot = nextCommandCacheSlot;
-    String idKey = "id";
-    idKey += String(slot);
-    String resultKey = "r";
-    resultKey += String(slot);
-    commandCache.putString(idKey.c_str(), "");
-    commandCache.putString(resultKey.c_str(), result);
-    commandCache.putString(idKey.c_str(), commandId);
-    cachedCommands[slot].id = commandId;
-    cachedCommands[slot].result = result;
-    nextCommandCacheSlot = (slot + 1) % COMMAND_CACHE_SLOTS;
-    commandCache.putUChar("next", nextCommandCacheSlot);
-}
-
 void sendHello() {
     JsonDocument doc;
 
@@ -164,8 +98,9 @@ void sendHello() {
     doc["device"] = DEVICE_ID;
     doc["name"] = DEVICE_NAME;
     doc["protocol_version"] = 2;
-    doc["command_dedup"] = commandCacheReady;
-    doc["firmware_version"] = "1.6.0";
+    doc["command_dedup"] = commandCache.available();
+    doc["command_replay_guard"] = commandCache.available();
+    doc["firmware_version"] = "1.6.1";
     doc["schema_version"] = 8;
     gateway.appendHealth(doc["health"].to<JsonObject>());
 
@@ -173,7 +108,7 @@ void sendHello() {
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
-    doc["data"]["firmware"] = "1.6.0";
+    doc["data"]["firmware"] = "1.6.1";
     doc["data"]["protocol"] = 2;
 
     gateway.sendJson(doc);
@@ -200,6 +135,17 @@ void sendState(bool ledOn, bool logMessage = true) {
     }
 }
 
+void sendDurableResult(JsonDocument& result) {
+    String outgoing;
+    const bool durable = commandCache.complete(result, outgoing);
+    if (!outgoing.isEmpty()) gateway.sendText(outgoing);
+    if (!durable) {
+        Serial.println("[COMMAND] Result could not be persisted; new commands are blocked until cache recovery.");
+        sendState(ledState, false);
+        lastStateSentAt = millis();
+    }
+}
+
 void sendCommandResult(
     const char* commandId,
     const char* parameter,
@@ -221,16 +167,13 @@ void sendCommandResult(
         doc["data"]["error"] = errorMessage;
     }
 
-    String message;
-    serializeJson(doc, message);
-    rememberCommandResult(commandId, message);
-    gateway.sendText(message);
+    sendDurableResult(doc);
 
     Serial.printf(
         "[COMMAND] result id=%s parameter=%s success=%s value=%s\n",
         commandId,
         parameter,
-        success ? "true" : "false",
+        doc["success"].as<bool>() ? "true" : "false",
         value ? "true" : "false"
     );
 }
@@ -253,16 +196,51 @@ void sendActionResult(
             ? errorMessage : "Unsupported action";
     }
 
-    String message;
-    serializeJson(doc, message);
-    rememberCommandResult(commandId, message);
-    gateway.sendText(message);
+    sendDurableResult(doc);
     Serial.printf(
         "[COMMAND] result id=%s action=%s success=%s\n",
         commandId,
         action,
-        success ? "true" : "false"
+        doc["success"].as<bool>() ? "true" : "false"
     );
+}
+
+bool reserveCommand(JsonDocument& request, const char* commandId) {
+    String replay;
+    JsonVariantConst replayOnly = request["data"]["require_cached_result"];
+    const bool validReplayFlag = replayOnly.isUnbound() || replayOnly.is<bool>();
+    const auto decision = validReplayFlag
+        ? commandCache.reserve(commandId, replay, !replayOnly.as<bool>())
+        : CommandResultCache::Decision::Rejected;
+    if (decision == CommandResultCache::Decision::Execute) return true;
+    if (decision == CommandResultCache::Decision::Replay) {
+        gateway.sendText(replay);
+        Serial.println("[COMMAND] Replayed cached acknowledgement; no action repeated.");
+    } else {
+        JsonDocument result;
+        result["type"] = "command_result";
+        result["id"] = commandId;
+        result["command_id"] = commandId;
+        result["device"] = DEVICE_ID;
+        result["success"] = false;
+        JsonObject data = result["data"].to<JsonObject>();
+        if (request["data"]["command"] == "invoke") {
+            data["action"] = request["data"]["action"];
+        } else {
+            data["parameter"] = request["data"]["parameter"];
+            if (request["data"]["parameter"] == "led") data["value"] = ledState;
+        }
+        data["error"] = !validReplayFlag
+            ? "require_cached_result must be boolean; no action was performed."
+            : decision == CommandResultCache::Decision::Uncertain
+                ? "Command result is unknown or no longer cached; it was not repeated. Check the current state before issuing a new command."
+                : "Durable command cache is unavailable or full of unresolved commands; no action was performed. Check NVS and restart the device.";
+        gateway.sendJson(result);
+        Serial.printf("[COMMAND] %s\n", data["error"].as<const char*>());
+    }
+    sendState(ledState, false);
+    lastStateSentAt = millis();
+    return false;
 }
 
 void onWebSocketEvent(
@@ -303,23 +281,19 @@ void onWebSocketEvent(
                     break;
                 }
                 const char* commandName = doc["data"]["command"] | "set";
-                const char* commandId =
-                    doc["data"]["command_id"] | "";
+                JsonVariantConst idValue = doc["data"]["command_id"];
+                if (!CommandResultCache::validCommandId(idValue)) {
+                    Serial.println("[COMMAND] Missing or invalid command_id.");
+                    break;
+                }
+                const char* commandId = idValue.as<const char*>();
                 Serial.printf(
                     "[COMMAND] received id=%s type=%s\n",
                     commandId,
                     commandName
                 );
 
-                if (commandId[0] == '\0') {
-                    Serial.println("Command has no command_id");
-                    break;
-                }
-                if (replayCachedCommandResult(commandId)) {
-                    sendState(ledState, false);
-                    lastStateSentAt = millis();
-                    break;
-                }
+                if (!reserveCommand(doc, commandId)) break;
 
                 if (strcmp(commandName, "invoke") == 0) {
                     const char* action = doc["data"]["action"] | "";
@@ -425,9 +399,9 @@ void setup() {
     // A closed or unread native USB console must not stall network processing.
     Serial.setTxTimeoutMs(1);
 #endif
-    // Keep acknowledgements from older firmware behavior out of this cache.
-    commandCacheReady = commandCache.begin("command_ack_v2", false);
-    loadCommandResults();
+    if (!commandCache.begin(DEVICE_ID, "command_ack_v2", true)) {
+        Serial.println("[COMMAND] Durable cache unavailable; new hardware commands will be rejected.");
+    }
     initializeLedOutput();
 
     gateway.begin(

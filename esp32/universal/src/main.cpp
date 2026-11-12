@@ -7,7 +7,7 @@
 namespace {
 constexpr uint16_t GATEWAY_PORT = 8765;
 constexpr char BOARD_PROFILE[] = "esp32-s3-devkitc-1";
-constexpr char FIRMWARE_VERSION[] = "1.0.1";
+constexpr char FIRMWARE_VERSION[] = "1.0.2";
 
 GatewayClient gateway;
 UniversalDevice device;
@@ -22,7 +22,8 @@ void sendHello() {
     message["device"] = UNIVERSAL_DEVICE_ID;
     message["name"] = UNIVERSAL_DEVICE_NAME;
     message["protocol_version"] = 2;
-    message["command_dedup"] = false;
+    message["command_dedup"] = device.commandDedupReady();
+    message["command_replay_guard"] = device.commandDedupReady();
     message["device_profile"] = "universal";
     message["board_profile"] = BOARD_PROFILE;
     message["firmware_version"] = FIRMWARE_VERSION;

@@ -1,0 +1,10 @@
+.automation-local-draft { margin: 0 0 14px; padding: 12px; border: 2px inset #fff; border-left: 4px solid #005000; background: #e6f2dd; color: #111; }
+.automation-local-draft[hidden] { display: none; }
+.automation-local-draft[data-state="warning"] { background: #ffffe1; border-left-color: #806000; }
+.automation-local-draft > strong { color: #005000; font-size: 13px; }
+.automation-local-draft[data-state="warning"] > strong { color: #704000; }
+.automation-local-draft p { margin: 6px 0; color: #333; font-size: 12px; overflow-wrap: anywhere; }
+.automation-local-draft-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.automation-local-draft-actions button { color: #000080; }
+.automation-local-draft-actions button[hidden] { display: none; }
+@media (max-width: 600px) { .automation-local-draft-actions button { flex: 1 1 150px; min-width: 0; } }

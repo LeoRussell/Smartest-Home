@@ -110,7 +110,7 @@ class TransientCommandTests(unittest.IsolatedAsyncioTestCase):
                 "parameters": {"led": {"type": "boolean", "access": "read_write"}},
                 "actions": {"identify": {"label": "Identify"}},
             },
-            "schema_version": 1, "command_dedup": True,
+            "schema_version": 1, "command_dedup": True, "command_replay_guard": True,
         })
         self.gateway.devices["lamp"] = RecordingSocket()
 

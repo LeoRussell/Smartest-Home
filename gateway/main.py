@@ -3,7 +3,7 @@
 import asyncio
 import sys
 
-from runtime import Gateway
+from runtime import Gateway, run_until_shutdown
 
 
 for stream in (sys.stdin, sys.stdout, sys.stderr):
@@ -15,7 +15,7 @@ gateway = Gateway()
 
 
 async def main():
-    await gateway.run()
+    await run_until_shutdown(gateway.run())
 
 
 if __name__ == "__main__":

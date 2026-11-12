@@ -715,7 +715,7 @@ class SchemaMixin:
             active_metadata = dict(previous)
             for key in (
                 "name", "protocol_version", "firmware_version",
-                "command_dedup", "trust_policy"
+                "command_dedup", "command_replay_guard", "trust_policy"
             ):
                 active_metadata[key] = offered_metadata.get(key)
             self.save_device_metadata(device_id, active_metadata)
@@ -742,7 +742,7 @@ class SchemaMixin:
         active_metadata = dict(previous)
         for key in (
             "name", "protocol_version", "firmware_version",
-            "command_dedup", "trust_policy"
+            "command_dedup", "command_replay_guard", "trust_policy"
         ):
             active_metadata[key] = offered_metadata.get(key)
         self.save_device_metadata(device_id, active_metadata)

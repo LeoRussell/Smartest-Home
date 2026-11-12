@@ -135,6 +135,7 @@ class ParameterHistory:
             return 0
         definitions = metadata.get("schema", {}).get("parameters", {})
         inserted = 0
+        recent_updates = {}
         with self.gateway.database_connection() as connection:
             for parameter_id, value in parameters.items():
                 definition = definitions.get(parameter_id, {})
@@ -168,11 +169,16 @@ class ParameterHistory:
                     INSERT INTO parameter_history(device_id, parameter_id, sampled_at, value, value_type, unit)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, (device_id, parameter_id, now, number, value_type, unit))
-                self.recent[key] = (now, number)
-                self.recent.move_to_end(key)
-                while len(self.recent) > 4096:
-                    self.recent.popitem(last=False)
+                recent_updates[key] = (now, number)
                 inserted += 1
+        # A later INSERT or COMMIT may roll back every sample in this batch.
+        # Publish sampling boundaries only after the transaction succeeds, so
+        # the next telemetry packet can retry values that never reached SQLite.
+        for key, sample in recent_updates.items():
+            self.recent[key] = sample
+            self.recent.move_to_end(key)
+        while len(self.recent) > 4096:
+            self.recent.popitem(last=False)
         self.inserts_since_cleanup += inserted
         self.sample_count += inserted
         self.cleanup()

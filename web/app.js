@@ -41,7 +41,7 @@ const automationUndoButton = document.getElementById("automation-undo");
 const automationRedoButton = document.getElementById("automation-redo");
 
 const UI_SETTINGS_KEY = "iot-gateway-ui-settings-v1";
-const NOTIFICATION_STATE_KEY = "iot-gateway-notifications-v1";
+const NOTIFICATION_STATE_KEY = `iot-gateway-notifications-v2:${encodeURIComponent(window.GatewayConnection.url())}`;
 const DEVICE_FAVORITES_KEY = "iot-gateway-device-favorites-v1";
 const DEVICE_SORT_KEY = "iot-gateway-device-sort-v1";
 
@@ -75,7 +75,15 @@ const uiSettings = {
     timezone: typeof savedUiSettings.timezone === "string" ? savedUiSettings.timezone : "local",
     importantOnly: savedUiSettings.importantOnly === true
 };
-const savedNotificationState = readLocalState(NOTIFICATION_STATE_KEY, {});
+let savedNotificationState = readLocalState(NOTIFICATION_STATE_KEY, null);
+if (savedNotificationState === null) {
+    // Existing releases only used the page host's default Gateway. Migrate
+    // those read markers without importing them into a different database.
+    savedNotificationState = window.GatewayConnection.isDefault()
+        ? readLocalState("iot-gateway-notifications-v1", {}) : {};
+    try { localStorage.setItem(NOTIFICATION_STATE_KEY, JSON.stringify(savedNotificationState)); }
+    catch { /* In-memory notifications still work without browser storage. */ }
+}
 let unreadNotifications = Array.isArray(savedNotificationState.unread)
     ? savedNotificationState.unread.filter(item => isVisibleEvent(item) && Number.isFinite(Number(item.id))).slice(0, 50)
     : [];
@@ -109,6 +117,9 @@ let databaseBackupRefreshPending = false;
 let databaseBackupRequest = null;
 let automations = [];
 let editingAutomationId = null;
+let automationEditorRevision = 0;
+let pendingAutomationSave = null;
+let automationSaveTargetId = null;
 let pendingAutomationWorkspaceState = null;
 const automationRunHistories = new Map();
 const automationRunHistoryCounts = new Map();
@@ -262,9 +273,7 @@ function renderDatabaseStats() {
 }
 
 function databaseBackupDownloadUrl(backupId) {
-    const host = window.location.hostname || "localhost";
-    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
-    return `${protocol}//${host}:8765/gateway-backups/${encodeURIComponent(backupId)}`;
+    return window.GatewayConnection.downloadUrl(`/gateway-backups/${encodeURIComponent(backupId)}`);
 }
 
 function finishDatabaseBackupRequest() {
@@ -306,9 +315,7 @@ function requestDatabaseBackup(action, fields = {}) {
 }
 
 function deviceConfigurationExportUrl(deviceId) {
-    const host = window.location.hostname || "localhost";
-    const protocol = window.location.protocol === "https:" ? "https:" : "http:";
-    return `${protocol}//${host}:8765/gateway-schemas/${encodeURIComponent(deviceId)}.json`;
+    return window.GatewayConnection.downloadUrl(`/gateway-schemas/${encodeURIComponent(deviceId)}.json`);
 }
 
 function renderDatabaseBackups() {
@@ -486,6 +493,8 @@ function applyLanguage() {
     window.AutomationProgress?.refresh();
     window.ConnectionDiagnostics?.languageChanged();
     window.AutomationSimulator?.refresh();
+    window.AutomationDraft?.refresh();
+    window.GatewayConnection?.languageChanged();
     setGatewayConnectionStatus(lastGatewayStatusMessage, gatewayIsConnectedState);
     if (lastActivityMessage) setActivity(lastActivityMessage, lastActivityOutcome);
 }
@@ -799,6 +808,7 @@ function initializeInterface() {
         translate: localized,
         language: () => uiSettings.language,
         getAutomations: () => automations,
+        getDevices: () => devices,
         getDraft: buildAutomationConfig,
         isConnected: isGatewayConnected,
         createRequestId: createCommandId,
@@ -876,8 +886,11 @@ function initializeInterface() {
     });
     automationCancelEdit?.addEventListener("click", () => {
         editingAutomationId = null;
+        automationSaveTargetId = null;
+        automationEditorRevision += 1;
         automationForm?.reset();
         window.AutomationBlockly?.clear();
+        window.AutomationDraft?.editorLoaded({ discardActive: true });
         document.getElementById("automation-editor-title").textContent = localized("Новый сценарий", "New scenario");
         updateAutomationEditorMode();
         if (automationFeedback) setFeedback(automationFeedback, "", "info");
@@ -1009,6 +1022,7 @@ function setGatewayConnectionStatus(message, connected) {
     const wasConnected = gatewayIsConnectedState;
     lastGatewayStatusMessage = message;
     gatewayIsConnectedState = connected;
+    window.GatewayConnection?.status(connected);
     if (!connected) {
         for (const pending of pendingManualRuns.values()) window.clearTimeout(pending.timer);
         pendingManualRuns.clear();
@@ -1024,6 +1038,11 @@ function setGatewayConnectionStatus(message, connected) {
         }
     }
     if (!connected && wasConnected) {
+        if (pendingAutomationSave) {
+            finishAutomationSave();
+            setFeedback(automationFeedback, localized("Связь прервана во время сохранения. Черновик оставлен; после подключения проверьте список сценариев.", "Connection lost while saving. The draft was kept; check the scenario list after reconnecting."), "warning");
+            window.AutomationDraft?.flush();
+        }
         if ((databaseBackupRefreshPending || databaseBackupActionPending) && databaseBackupFeedback) {
             setFeedback(databaseBackupFeedback, localized(
                 "Соединение с Gateway потеряно. После подключения обновите список и проверьте результат операции.",
@@ -1204,31 +1223,30 @@ function automationTriggerTimingLabel(trigger) {
 function refreshAutomationEditor(config = null) {
     const BlocklyEditor = window.AutomationBlockly;
     if (config) {
-        window.AutomationInspector?.clearDraft();
-        editingAutomationId = config.automation_id || editingAutomationId;
-        document.getElementById("automation-name").value = config.name || "";
-        document.getElementById("automation-editor-title").textContent = localized("Изменить сценарий", "Edit scenario");
-        pendingAutomationWorkspaceState = config.workspace || null;
-        setActivePage("automations");
-        if (BlocklyEditor?.isReady()) {
-            try {
-                if (config.trigger && config.target) BlocklyEditor.loadLegacy(config);
-                else BlocklyEditor.load(config.workspace || null);
-            } catch (error) {
-                editingAutomationId = null;
-                pendingAutomationWorkspaceState = null;
-                setFeedback(automationFeedback, error.message || localized("Не удалось открыть сценарий.", "Could not open the scenario."), "error");
-                updateAutomationEditorMode();
-                return;
-            }
-            pendingAutomationWorkspaceState = null;
+        window.AutomationDraft?.flush();
+        try {
+            setActivePage("automations");
+            if (!BlocklyEditor?.isReady()) throw new Error(localized("Редактор блоков пока не готов.", "The block editor is not ready."));
+            if (config.trigger && config.target) BlocklyEditor.loadLegacy(config);
+            else BlocklyEditor.load(config.workspace || null);
+        } catch (error) {
+            setFeedback(automationFeedback, error.message || localized("Не удалось открыть сценарий. Текущие блоки сохранены.", "Could not open the scenario. Current blocks were kept."), "error");
+            updateAutomationEditorMode();
+            return false;
         }
+        window.AutomationInspector?.clearDraft();
+        editingAutomationId = config.automation_id || null;
+        automationSaveTargetId = editingAutomationId ? null : config.save_id || null;
+        automationEditorRevision += 1;
+        document.getElementById("automation-name").value = config.name || "";
+        pendingAutomationWorkspaceState = null;
+        window.AutomationDraft?.editorLoaded({ unsaved: !editingAutomationId });
         updateAutomationEditorMode();
         requestAnimationFrame(() => {
             automationForm?.closest(".automation-editor-card")?.scrollIntoView({ block: "start", behavior: "smooth" });
             document.getElementById("automation-name")?.focus({ preventScroll: true });
         });
-        return;
+        return true;
     }
     if (activePage !== "automations" || !BlocklyEditor) return;
     if (!BlocklyEditor.isReady()) {
@@ -1236,6 +1254,7 @@ function refreshAutomationEditor(config = null) {
             "automation-workspace", devices, uiSettings.language, pendingAutomationWorkspaceState
         );
         pendingAutomationWorkspaceState = null;
+        window.AutomationDraft?.editorLoaded();
     } else {
         BlocklyEditor.update(devices, uiSettings.language);
     }
@@ -1515,7 +1534,6 @@ function renderAutomations() {
                 number += 1;
             } while (automations.some(candidate => candidate.config?.name === copyName));
             config.name = copyName;
-            editingAutomationId = null;
             refreshAutomationEditor(config);
             setAutomationStatus(localized("Открыта копия сценария. Проверьте блоки и сохраните её под новым именем.", "A scenario copy is open. Review the blocks and save it with a new name."), true);
         });
@@ -1884,6 +1902,7 @@ function buildAutomationConfig({ allowUntitled = false } = {}) {
 
 function submitAutomation(event) {
     event.preventDefault();
+    if (pendingAutomationSave) return;
     let config;
     try {
         config = buildAutomationConfig();
@@ -1892,13 +1911,42 @@ function submitAutomation(event) {
         return;
     }
     const existing = automations.find(item => item.automation_id === editingAutomationId);
+    if (!editingAutomationId && !automationSaveTargetId) automationSaveTargetId = createCommandId();
+    const request = {
+        id: createCommandId(), editorId: editingAutomationId, revision: automationEditorRevision,
+        targetId: editingAutomationId || automationSaveTargetId,
+        signature: JSON.stringify(automationEditorDocument()), timer: null
+    };
+    pendingAutomationSave = request;
     if (sendGatewayAction("save_automation", {
-        automation_id: editingAutomationId,
+        automation_id: request.targetId,
         enabled: existing?.enabled ?? true,
+        request_id: request.id,
         config
     })) {
+        window.AutomationDraft?.flush();
         setFeedback(automationFeedback, localized("Проверяю и сохраняю…", "Validating and saving…"), "info");
+        request.timer = window.setTimeout(() => {
+            if (pendingAutomationSave !== request) return;
+            finishAutomationSave();
+            setFeedback(automationFeedback, localized("Подтверждение сохранения не получено. Черновик оставлен; проверьте список сценариев перед повторным сохранением.", "Save confirmation was not received. The draft was kept; check the scenario list before saving again."), "warning");
+            window.AutomationDraft?.flush();
+        }, 30000);
+    } else {
+        finishAutomationSave();
+        setFeedback(automationFeedback, localized("Не удалось отправить сценарий. Черновик оставлен в редакторе.", "Could not send the scenario. The draft remains in the editor."), "error");
     }
+    updateAutomationEditorMode();
+}
+
+function automationEditorDocument() {
+    return { automation_id: editingAutomationId, save_id: automationSaveTargetId, name: document.getElementById("automation-name").value, workspace: window.AutomationBlockly?.getState() };
+}
+
+function finishAutomationSave() {
+    if (pendingAutomationSave) window.clearTimeout(pendingAutomationSave.timer);
+    pendingAutomationSave = null;
+    updateAutomationEditorMode();
 }
 
 function updateAutomationEditorMode() {
@@ -1908,7 +1956,8 @@ function updateAutomationEditorMode() {
         ? localized("Изменить сценарий", "Edit scenario")
         : localized("Новый сценарий", "New scenario");
     if (automationSaveButton) {
-        automationSaveButton.textContent = editingAutomationId
+        automationSaveButton.disabled = Boolean(pendingAutomationSave);
+        automationSaveButton.textContent = pendingAutomationSave ? localized("Сохраняю…", "Saving…") : editingAutomationId
             ? localized("Сохранить изменения", "Save changes")
             : localized("Сохранить сценарий", "Save scenario");
     }
@@ -1944,10 +1993,15 @@ function connectGateway() {
     clearTimeout(reconnectTimer);
     setGatewayConnectionStatus("Подключение к Gateway...", false);
 
-    const host = window.location.hostname || "localhost";
-
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const gatewaySocket = new WebSocket(`${protocol}//${host}:8765`);
+    let gatewaySocket;
+    try {
+        gatewaySocket = new WebSocket(window.GatewayConnection.url());
+    } catch {
+        setGatewayConnectionStatus("Ошибка соединения с Gateway", false);
+        window.GatewayConnection.failed();
+        setActivity(localized("Браузер не разрешил открыть соединение. Проверьте адрес Gateway в настройках.", "The browser could not open the connection. Check the Gateway address in Settings."), false);
+        return;
+    }
     socket = gatewaySocket;
 
     gatewaySocket.addEventListener("open", () => {
@@ -2151,6 +2205,11 @@ function handleGatewayMessage(message) {
         case "automation_save_result":
         case "automation_update_result":
         case "automation_delete_result": {
+            const saveRequest = message.type === "automation_save_result" ? pendingAutomationSave : null;
+            if (message.type === "automation_save_result") {
+                if (!saveRequest || message.request_id && message.request_id !== saveRequest.id) break;
+                finishAutomationSave();
+            }
             const text = message.success
                 ? localized("Готово.", "Done.")
                 : (message.message || localized("Не удалось изменить сценарий.", "Could not update the scenario."));
@@ -2158,15 +2217,30 @@ function handleGatewayMessage(message) {
             else setAutomationStatus(text, message.success);
             if (message.success && message.type === "automation_delete_result" && message.automation_id === editingAutomationId) {
                 editingAutomationId = null;
+                automationSaveTargetId = null;
+                automationEditorRevision += 1;
                 automationForm?.reset();
                 window.AutomationBlockly?.clear();
+                window.AutomationDraft?.editorLoaded({ discardActive: true });
                 updateAutomationEditorMode();
             }
             if (message.success && message.type === "automation_save_result") {
+                const sameEditor = saveRequest.revision === automationEditorRevision && saveRequest.editorId === editingAutomationId;
+                const unchanged = sameEditor && saveRequest.signature === JSON.stringify(automationEditorDocument());
+                if (!unchanged) {
+                    if (sameEditor && !editingAutomationId) { editingAutomationId = message.automation_id || saveRequest.targetId; automationSaveTargetId = null; }
+                    setAutomationStatus(localized("Отправленная версия сохранена. Новые изменения оставлены в редакторе.", "The submitted version was saved. Newer edits remain in the editor."), true);
+                    window.AutomationDraft?.flush();
+                    updateAutomationEditorMode();
+                    break;
+                }
                 window.AutomationInspector?.clearDraft();
                 editingAutomationId = null;
+                automationSaveTargetId = null;
+                automationEditorRevision += 1;
                 automationForm?.reset();
                 window.AutomationBlockly?.clear();
+                window.AutomationDraft?.editorLoaded({ discardActive: true });
                 document.getElementById("automation-editor-title").textContent = localized("Новый сценарий", "New scenario");
                 refreshAutomationEditor();
                 updateAutomationEditorMode();
@@ -2434,6 +2508,12 @@ function handleGatewayMessage(message) {
         case "device_identity_result": {
             if (message.success) {
                 if (message.device !== message.new_device_id) {
+                    const renamed = devices.find(item => item.device === message.device);
+                    if (renamed) renamed.device = message.new_device_id;
+                    if (parameterUiPreferences[message.device]) {
+                        parameterUiPreferences[message.new_device_id] = parameterUiPreferences[message.device];
+                        delete parameterUiPreferences[message.device];
+                    }
                     window.AutomationBlockly?.replaceDeviceId(message.device, message.new_device_id);
                     if (favoriteDeviceIds.delete(message.device)) {
                         favoriteDeviceIds.add(message.new_device_id);
@@ -2543,7 +2623,12 @@ function handleGatewayMessage(message) {
                 const device = devices.find(
                     item => item.device === message.device
                 );
-                if (pending.actionId) {
+                if (message.replayed === true) {
+                    setActivity(localized(
+                        `Получено повторное подтверждение ранее выполненной команды на ${message.device}. Текущее состояние определяется телеметрией устройства.`,
+                        `Received a cached confirmation of an earlier command on ${message.device}. Current state comes from device telemetry.`
+                    ));
+                } else if (pending.actionId) {
                     const label = device?.schema?.actions?.[pending.actionId]?.label || pending.actionId;
                     setActivity(`Действие «${label}» на ${message.device} выполнено.`);
                 } else {
@@ -2562,10 +2647,10 @@ function handleGatewayMessage(message) {
                     `${message.error || "устройство недоступно"}`
                 );
             } else if (message.success !== true) {
-                setActivity(
-                    `Устройство ${message.device} не выполнило команду: ` +
-                    `${message.error || "причина не указана"}.`
-                );
+                setActivity(localized(
+                    `Устройство ${message.device} сообщило об ошибке команды: ${message.error || "причина не указана"}.`,
+                    `Device ${message.device} reported a command error: ${message.error || "no reason provided"}.`
+                ), false);
             } else {
                 setActivity(
                     `Результат команды ${pending.commandId} не совпал ` +
@@ -2736,6 +2821,11 @@ function handleGatewayMessage(message) {
         }
 
         case "error": {
+            window.AutomationInspector?.handleMessage(message);
+            if (pendingAutomationSave && message.request_id === pendingAutomationSave.id) {
+                finishAutomationSave();
+                setFeedback(automationFeedback, message.message || localized("Не удалось сохранить сценарий. Черновик оставлен.", "Could not save the scenario. The draft was kept."), "error");
+            }
             if (databaseBackupRequest && (
                 message.request_id === databaseBackupRequest.id ||
                 !message.request_id && message.action === databaseBackupRequest.action
@@ -6827,6 +6917,11 @@ window.ConnectionDiagnostics?.initialize({
     isConnected: isGatewayConnected, send: sendGatewayAction, labelDialog,
     formatTime: formatEventTime, formatDuration: formatDatabaseDuration
 });
+window.AutomationDraft?.initialize({
+    localized, formatTime: formatEventTime, capture: automationEditorDocument,
+    isReady: () => window.AutomationBlockly?.isReady() === true,
+    restore: document => refreshAutomationEditor(document)
+});
 window.AutomationSimulator?.initialize({
     localized, language: () => uiSettings.language, getDevices: () => devices,
     getAutomations: () => automations, getDraft: () => buildAutomationConfig({ allowUntitled: true }),
@@ -6875,6 +6970,7 @@ window.GatewayWorkspace?.initialize({
         panel.tabIndex = -1; panel.scrollIntoView({ block: "start", behavior: "smooth" }); panel.focus({ preventScroll: true });
     }
 });
+window.GatewayConnection.initialize({ localized, reload: () => window.location.reload() });
 initializeInterface();
 connectGateway();
 setInterval(renderDatabaseStats, 1000);

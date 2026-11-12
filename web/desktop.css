@@ -1,4 +1,9 @@
 /* Windows 98 inspired desktop theme */
+.gateway-connection-form { display: grid; gap: 12px; min-width: 0; }
+.gateway-connection-form input { width: 100%; min-width: 0; }
+.gateway-connection-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.gateway-connection-actions button[type="submit"] { background: #216b21; color: #fff; }
+.gateway-connection-status { overflow-wrap: anywhere; }
 :root {
     color-scheme: light;
     --desktop: #008080;

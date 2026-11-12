@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <utility>
 #include <mbedtls/sha256.h>
 #include <esp_arduino_version.h>
 
@@ -85,9 +86,13 @@ bool isAllowedIdCharacter(char value, bool first) {
                        value == '.' || value == '-'));
 }
 
-bool calculateConfigurationHash(JsonVariantConst configuration, String& hash) {
+bool calculateConfigurationHash(JsonVariantConst configuration, String& hash,
+                                String* serializedConfiguration = nullptr) {
     String canonical;
-    serializeJson(configuration, canonical);
+    const size_t expectedSize = measureJson(configuration);
+    if (!canonical.reserve(expectedSize) ||
+        serializeJson(configuration, canonical) != expectedSize ||
+        canonical.length() != expectedSize) return false;
 
     uint8_t digest[32];
     if (mbedtls_sha256_ret(
@@ -104,12 +109,20 @@ bool calculateConfigurationHash(JsonVariantConst configuration, String& hash) {
     }
     encoded[64] = '\0';
     hash = encoded;
+    if (hash.length() != 64) return false;
+    if (serializedConfiguration != nullptr) {
+        *serializedConfiguration = std::move(canonical);
+        if (serializedConfiguration->length() != expectedSize) return false;
+    }
     return true;
 }
 }  // namespace
 
 bool UniversalDevice::begin() {
     analogReadResolution(12);
+    if (!commandCache_.begin(UNIVERSAL_DEVICE_ID, "universal_ack")) {
+        Serial.println("[COMMAND] Durable cache unavailable; hardware commands will be rejected.");
+    }
     if (!preferences_.begin("device_cfg", false)) {
         Serial.println("[CONFIG] NVS could not be opened; GPIO remains inactive.");
         return false;
@@ -143,7 +156,8 @@ bool UniversalDevice::begin() {
         return false;
     }
     String calculatedHash;
-    if (!calculateConfigurationHash(storedConfiguration, calculatedHash) ||
+    String activeConfiguration;
+    if (!calculateConfigurationHash(storedConfiguration, calculatedHash, &activeConfiguration) ||
         calculatedHash != configurationHash_) {
         Serial.println("[CONFIG] Stored configuration hash does not match; GPIO remains inactive.");
         configurationVersion_ = 0;
@@ -174,6 +188,7 @@ bool UniversalDevice::begin() {
     memcpy(components_, parsed, sizeof(components_));
     componentCount_ = parsedCount;
     identifyIndicator_ = parsedIdentify;
+    activeConfigurationJson_ = std::move(activeConfiguration);
     configured_ = true;
     configurePins();
     Serial.printf("[CONFIG] Loaded version %lu with %u components.\n",
@@ -212,6 +227,10 @@ bool UniversalDevice::loadEmbeddedConfiguration(String& error) {
 
 uint32_t UniversalDevice::configurationVersion() const {
     return configurationVersion_;
+}
+
+bool UniversalDevice::commandDedupReady() const {
+    return commandCache_.available();
 }
 
 bool UniversalDevice::isAllowedPin(uint8_t pin) const {
@@ -554,7 +573,8 @@ bool UniversalDevice::applyConfiguration(
     if (!parseAndValidate(configuration, parsed, parsedCount, parsedIdentify, error)) return false;
 
     String calculatedHash;
-    if (!calculateConfigurationHash(configuration, calculatedHash) ||
+    String activeConfiguration;
+    if (!calculateConfigurationHash(configuration, calculatedHash, &activeConfiguration) ||
         calculatedHash != hash) {
         error = "configuration hash does not match its contents";
         return false;
@@ -592,7 +612,10 @@ bool UniversalDevice::applyConfiguration(
     envelope["hash"] = hash;
     envelope["configuration"].set(configuration);
     String serialized;
-    if (serializeJson(envelope, serialized) > MAX_CONFIGURATION_BYTES + 256) {
+    const size_t envelopeSize = measureJson(envelope);
+    if (envelope.overflowed() || !serialized.reserve(envelopeSize) ||
+        serializeJson(envelope, serialized) != envelopeSize ||
+        serialized.length() != envelopeSize || envelopeSize > MAX_CONFIGURATION_BYTES + 256) {
         error = "configuration exceeds the supported non-volatile storage limit";
         return false;
     }
@@ -602,6 +625,7 @@ bool UniversalDevice::applyConfiguration(
     }
     if (identicalConfiguration) {
         configurationVersion_ = version;
+        activeConfigurationJson_ = std::move(activeConfiguration);
         return true;
     }
 
@@ -672,7 +696,8 @@ bool UniversalDevice::applyConfiguration(
     componentCount_ = parsedCount;
     identifyIndicator_ = parsedIdentify;
     configurationVersion_ = version;
-    configurationHash_ = hash;
+    configurationHash_ = std::move(calculatedHash);
+    activeConfigurationJson_ = std::move(activeConfiguration);
     configured_ = true;
     configurePins(retainedPwmRoutes);
     return true;
@@ -992,10 +1017,11 @@ void UniversalDevice::sendConfigurationReport(GatewayClient& gateway) {
     JsonObject schema = message["schema"].to<JsonObject>();
     fillSchema(schema);
     if (configured_) {
-        const String savedEnvelope = preferences_.getString("envelope", "");
         JsonDocument stored;
-        if (!deserializeJson(stored, savedEnvelope)) {
-            message["configuration"].set(stored["configuration"].as<JsonVariantConst>());
+        // NVS can expose a failed commit's new value before it becomes durable.
+        // Report the active configuration matching the RAM hash/schema instead.
+        if (!deserializeJson(stored, activeConfigurationJson_)) {
+            message["configuration"].set(stored.as<JsonVariantConst>());
         }
     } else {
         JsonObject empty = message["configuration"].to<JsonObject>();
@@ -1036,15 +1062,55 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
         return;
     }
 
-    const char* commandId = message["data"]["command_id"] | "";
+    JsonVariantConst idValue = message["data"]["command_id"];
+    if (!CommandResultCache::validCommandId(idValue)) return;
+    const char* commandId = idValue.as<const char*>();
     const char* commandName = message["data"]["command"] | "";
-    if (commandId[0] == '\0') return;
     JsonDocument result;
     result["type"] = "command_result";
     result["id"] = commandId;
     result["command_id"] = commandId;
     result["device"] = UNIVERSAL_DEVICE_ID;
     JsonObject data = result["data"].to<JsonObject>();
+    if (strcmp(commandName, "invoke") == 0) {
+        data["action"] = message["data"]["action"];
+    } else {
+        data["parameter"] = message["data"]["parameter"];
+    }
+
+    String replay;
+    JsonVariantConst replayOnly = message["data"]["require_cached_result"];
+    const bool validReplayFlag = replayOnly.isUnbound() || replayOnly.is<bool>();
+    const auto decision = validReplayFlag
+        ? commandCache_.reserve(commandId, replay, !replayOnly.as<bool>())
+        : CommandResultCache::Decision::Rejected;
+    if (decision != CommandResultCache::Decision::Execute) {
+        if (decision == CommandResultCache::Decision::Replay) {
+            gateway.sendText(replay);
+        } else {
+            result["success"] = false;
+            data["error"] = !validReplayFlag
+                ? "require_cached_result must be boolean; no action was performed."
+                : decision == CommandResultCache::Decision::Uncertain
+                    ? "Command result is unknown or no longer cached; it was not repeated. Check the current state before issuing a new command."
+                    : "Durable command cache is unavailable or full of unresolved commands; no action was performed. Check NVS and restart the device.";
+            const char* parameter = data["parameter"] | "";
+            for (uint8_t index = 0; index < componentCount_; ++index) {
+                const Component& component = components_[index];
+                if (strcmp(component.parameterId, parameter) != 0) continue;
+                if (component.driver == Driver::GpioOutput || component.driver == Driver::DigitalInput) {
+                    data["value"] = component.booleanValue;
+                } else {
+                    data["value"] = component.integerValue;
+                }
+                break;
+            }
+            gateway.sendJson(result);
+        }
+        sendState(gateway);
+        return;
+    }
+
     bool success = false;
     String error;
     if (!configured_) error = "device has no applied hardware configuration";
@@ -1067,6 +1133,10 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
     }
     result["success"] = success;
     if (!success) data["error"] = error;
-    gateway.sendJson(result);
-    if (success) sendState(gateway);
+    String outgoing;
+    if (!commandCache_.complete(result, outgoing)) {
+        Serial.println("[COMMAND] Result could not be persisted; new hardware commands are blocked.");
+    }
+    if (!outgoing.isEmpty()) gateway.sendText(outgoing);
+    sendState(gateway);
 }

@@ -92,21 +92,34 @@ class ProtocolMixin:
 
 
     async def send_json(self, websocket, data):
-        await websocket.send(
-            json.dumps(data, ensure_ascii=False)
-        )
+        document = json.dumps(data, ensure_ascii=False)
+        if websocket not in self.browser_clients:
+            await websocket.send(document)
+            return
+        try:
+            await asyncio.wait_for(websocket.send(document), timeout=self.BROWSER_SEND_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            self.browser_clients.discard(websocket)
+            self.detach_pending_commands_for_browser(websocket)
+            try:
+                await asyncio.wait_for(
+                    websocket.close(code=1013, reason="Browser is not reading Gateway messages"),
+                    timeout=1,
+                )
+            except Exception:
+                pass
+            raise
 
 
     async def broadcast(self, data):
-        disconnected_clients = set()
-
-        for websocket in list(self.browser_clients):
+        async def deliver(websocket):
             try:
                 await self.send_json(websocket, data)
             except Exception:
-                disconnected_clients.add(websocket)
+                self.browser_clients.discard(websocket)
+                self.detach_pending_commands_for_browser(websocket)
 
-        self.browser_clients.difference_update(disconnected_clients)
+        await asyncio.gather(*(deliver(websocket) for websocket in list(self.browser_clients)))
 
 
     async def send_device_list(self, websocket=None):
@@ -205,6 +218,13 @@ class ProtocolMixin:
 
     async def handle_browser_message(self, websocket, message):
 
+        if self.shutting_down:
+            await self.send_json(websocket, {
+                "type": "error", "code": "gateway_stopping",
+                "action": message.get("action"), "request_id": message.get("request_id"),
+                "command_id": message.get("command_id"), "message": "Gateway завершает работу.",
+            })
+            return
         action = message.get("action")
         if action == "run_automation":
             request_id = message.get("request_id")
@@ -404,6 +424,14 @@ class ProtocolMixin:
             return
 
         if action == "save_automation":
+            request_id = message.get("request_id")
+            if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
+                await self.send_json(websocket, {
+                    "type": "automation_save_result", "success": False,
+                    "automation_id": message.get("automation_id"),
+                    "message": "Некорректный идентификатор запроса сохранения сценария.",
+                })
+                return
             automation_id = message.get("automation_id")
             config = message.get("config")
             is_new = automation_id in (None, "")
@@ -417,7 +445,8 @@ class ProtocolMixin:
                 )
             await self.send_json(websocket, {
                 "type": "automation_save_result", "success": success,
-                "automation_id": automation_id, "message": message_text
+                "automation_id": automation_id, "message": message_text,
+                **({"request_id": request_id} if request_id is not None else {}),
             })
             if success:
                 await self.publish_automation_list()
@@ -680,6 +709,7 @@ class ProtocolMixin:
                 "success": success,
                 "device": device_id,
                 "new_device_id": new_device_id if success else device_id,
+                "request_id": message.get("request_id"),
                 "message": message_text
             })
             if success:
@@ -1183,6 +1213,9 @@ class ProtocolMixin:
 
         try:
             async for raw_message in websocket:
+                if self.shutting_down:
+                    await websocket.close(code=1012, reason="Gateway is stopping")
+                    break
                 try:
                     message = json.loads(raw_message)
                 except (ValueError, RecursionError):
@@ -1338,6 +1371,7 @@ class ProtocolMixin:
                         "schema_version", None if is_legacy else 1
                     )
                     command_dedup = message.get("command_dedup", False)
+                    command_replay_guard = message.get("command_replay_guard", False)
                     device_profile = message.get("device_profile")
                     board_profile = message.get("board_profile")
                     driver_ids = message.get("driver_catalog", [])
@@ -1346,6 +1380,7 @@ class ProtocolMixin:
 
                     if (
                         type(command_dedup) is not bool
+                        or type(command_replay_guard) is not bool
                     ) or (
                         protocol_version is not None
                         and (type(protocol_version) is not int or protocol_version < 1)
@@ -1401,6 +1436,7 @@ class ProtocolMixin:
                         "protocol_version": protocol_version,
                         "firmware_version": firmware_version,
                         "command_dedup": command_dedup,
+                        "command_replay_guard": command_replay_guard,
                         "schema_version": schema_version,
                         "schema": schema,
                         "device_profile": device_profile,
@@ -1652,12 +1688,13 @@ class ProtocolMixin:
 
                     command_id = message.get("command_id")
                     success = message.get("success")
+                    replayed = message.get("replayed", False)
                     data = message.get("data", {})
 
                     if (
-                        not isinstance(command_id, str)
-                        or not 1 <= len(command_id) <= 80
+                        not self.valid_command_id(command_id)
                         or type(success) is not bool
+                        or type(replayed) is not bool
                         or not isinstance(data, dict)
                     ):
                         continue
@@ -1695,7 +1732,16 @@ class ProtocolMixin:
                         definition = self.device_metadata.get(
                             device_id, {"schema": self.default_legacy_schema()}
                         )["schema"].get("parameters", {}).get(parameter)
-                        if (
+                        if not success:
+                            status = "failed"
+                            result_error = error_message or "Устройство отклонило команду."
+                            if (
+                                definition is None
+                                or not self.is_schema_value(value, definition)
+                                or not self.value_within_schema_limits(value, definition)
+                            ):
+                                value = None
+                        elif (
                             definition is None
                             or not self.is_schema_value(value, definition)
                             or not self.value_within_schema_limits(value, definition)
@@ -1703,30 +1749,29 @@ class ProtocolMixin:
                             status = "failed"
                             result_error = "Устройство вернуло значение, не соответствующее Schema."
                             value = None
-                        elif success and not self.schema_values_match(value, operation["value"]):
+                        elif not self.schema_values_match(value, operation["value"]):
                             status = "failed"
                             result_error = "Устройство подтвердило значение, отличающееся от запрошенного."
-                        elif success:
+                        else:
                             status = "succeeded"
                             result_error = None
-                        else:
-                            status = "failed"
-                            if (
-                                definition is None
-                                or not self.is_schema_value(value, definition)
-                                or not self.value_within_schema_limits(value, definition)
-                            ):
-                                value = None
-                            result_error = error_message or "Устройство отклонило команду."
                     else:
                         status = "succeeded" if success else "failed"
                         result_error = None if success else error_message or "Действие отклонено устройством."
+
+                    # Claim the validated ACK before any browser I/O yields. Its
+                    # timeout or a disconnect must not finish the same command.
+                    pending = self.remove_pending_command(command_id)
+                    if pending is None:
+                        continue
+                    if replayed:
+                        pending["replayed"] = True
 
                     # A parameter command result includes the device's actual value.
                     # Persist and broadcast it here so the state update does not
                     # create a second, duplicate history entry for the same action.
                     automation_state_change = None
-                    if operation["kind"] == "parameter" and value is not None:
+                    if operation["kind"] == "parameter" and value is not None and not replayed:
                         previous_parameters = dict(self.device_states.get(device_id, {}))
                         self.device_states[device_id] = {
                             **previous_parameters,
@@ -1757,7 +1802,6 @@ class ProtocolMixin:
                                     "value": value
                                 }
 
-                    pending = self.remove_pending_command(command_id)
                     await self.send_pending_command_result(
                         pending,
                         status,

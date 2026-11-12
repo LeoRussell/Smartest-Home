@@ -18,6 +18,32 @@
         if (check?.timer) clearTimeout(check.timer);
     }
 
+    function deviceReferences(config) {
+        const ids = new Set(), stack = [config]; let count = 0;
+        while (stack.length && count++ < 4000) {
+            const value = stack.pop();
+            if (!value || typeof value !== "object") continue;
+            if (typeof value.device === "string") ids.add(value.device);
+            for (const child of Object.values(value)) if (child && typeof child === "object") stack.push(child);
+        }
+        return [...ids].sort();
+    }
+
+    function catalogSignature(ids) {
+        if (!options.getDevices) return null;
+        const devices = new Map(options.getDevices().map(device => [device.device, device]));
+        return JSON.stringify(ids.map(id => {
+            const device = devices.get(id);
+            return [id, device?.connected, device?.schema, device?.pending_schema, device?.configuration_status];
+        }));
+    }
+
+    function invalidateCatalog(check) {
+        if (check?.devices && !check.stale && check.catalogSignature !== catalogSignature(check.devices)) {
+            release(check); check.pending = false; check.stale = true; check.catalogChanged = true;
+        }
+    }
+
     function update() {
         options.render();
         const host = document.getElementById("automation-editor-diagnostics");
@@ -56,6 +82,8 @@
             checkedAt: new Date().toISOString(),
             issues: []
         };
+        check.devices = deviceReferences(config);
+        check.catalogSignature = catalogSignature(check.devices);
         checks.set(key, check);
         check.timer = setTimeout(() => {
             if (checks.get(key) !== check || !check.pending) return;
@@ -65,7 +93,7 @@
         }, 10000);
         if (!options.send("check_automation", {
             automation_id: automationId,
-            ...(automationId ? {} : { config }),
+            config: JSON.parse(JSON.stringify(config)),
             request_id: check.requestId
         })) {
             release(check);
@@ -78,6 +106,7 @@
     function createPanel(automationId) {
         const check = checks.get(keyFor(automationId));
         if (!check) return null;
+        invalidateCatalog(check);
         const panel = document.createElement("section");
         panel.className = "automation-diagnostics";
         panel.setAttribute("aria-live", "polite");
@@ -85,7 +114,8 @@
         if (check.pending) {
             title.textContent = text("Проверяю сценарий…", "Checking scenario…");
         } else if (check.stale) {
-            title.textContent = check.connectionChanged
+            title.textContent = check.catalogChanged
+                ? text("Устройства или Schema изменились — повторите проверку", "Devices or Schema changed — check again") : check.connectionChanged
                 ? text("Соединение менялось — повторите проверку", "Connection changed — check again")
                 : text("Сценарий изменён — повторите проверку", "Scenario changed — check it again");
         } else if (check.transportError) {
@@ -195,9 +225,17 @@
             }
         },
         handleMessage(message) {
+            if (message.type === "error" && message.request_id) {
+                const check = [...checks.values()].find(item => item.pending && item.requestId === message.request_id);
+                if (!check) return false;
+                release(check); check.pending = false;
+                check.issues = [{ severity: "error", message: message.message || text("Проверка сценария не выполнена.", "The scenario check failed.") }];
+                update(); return true;
+            }
             if (message.type !== "automation_diagnostics") return;
             const key = keyFor(message.automation_id);
             const check = checks.get(key);
+            invalidateCatalog(check);
             if (!check || check.requestId !== message.request_id || check.stale || !check.pending) return;
             if (key === DRAFT_KEY) {
                 let signature;
@@ -248,6 +286,9 @@
         filtered,
         createPanel,
         request,
-        pending: automationId => Boolean(checks.get(keyFor(automationId))?.pending)
+        pending(automationId) {
+            const check = checks.get(keyFor(automationId)); invalidateCatalog(check);
+            return Boolean(check?.pending);
+        }
     };
 })();

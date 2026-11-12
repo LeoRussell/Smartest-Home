@@ -7,6 +7,16 @@ import uuid
 
 
 class CommandsMixin:
+    @staticmethod
+    def valid_command_id(command_id):
+        if not isinstance(command_id, str) or not 1 <= len(command_id) <= 80 or "\0" in command_id:
+            return False
+        try:
+            command_id.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return True
+
     async def send_command_queue_state(self, websocket=None):
         commands = [
             {
@@ -26,6 +36,10 @@ class CommandsMixin:
 
 
     async def notify_command_queued(self, pending):
+        # A send can yield while an ACK or cancellation claims the command.
+        # Never turn its final durable result back into a queued operation.
+        if self.pending_commands.get(pending["command_id"]) is not pending:
+            return
         if pending["operation"].get("transient"):
             removed = self.remove_pending_command(pending["command_id"])
             if removed is not None:
@@ -50,12 +64,22 @@ class CommandsMixin:
 
 
     async def deliver_pending_command(self, pending):
-        if pending.get("sending"):
+        if self.pending_commands.get(pending["command_id"]) is not pending or pending.get("sending"):
             return False
         device_id = pending["device"]
         websocket = self.devices.get(device_id)
         if websocket is None or device_id in self.pending_device_schemas or self.device_configuration_is_pending(device_id):
             await self.notify_command_queued(pending)
+            return False
+
+        retry = pending.get("attempts", 0) > 0
+        if retry and not self.device_supports_command_replay_guard(device_id):
+            removed = self.remove_pending_command(pending["command_id"])
+            if removed is not None:
+                await self.send_pending_command_result(
+                    removed, "unavailable", removed["operation"].get("value"),
+                    "Результат команды неизвестен. Повтор отключён: прошивка не объявила защиту от выполнения ID, отсутствующего в кэше."
+                )
             return False
 
         operation = pending["operation"]
@@ -85,9 +109,15 @@ class CommandsMixin:
             pending["status"] = "sent"
             self.update_command_queue_record(pending, "sent")
             payload = dict(pending["payload"])
+            if retry:
+                # A finite firmware cache may already have evicted this ID.
+                # A retry may replay a saved result, never execute a cache miss.
+                payload["data"] = {**payload["data"], "require_cached_result": True}
             payload["device"] = self.firmware_identity_for(device_id)
             await self.send_json(websocket, payload)
         except Exception:
+            if self.pending_commands.get(pending["command_id"]) is not pending:
+                return True
             await self.notify_command_queued(pending)
             return False
         finally:
@@ -122,7 +152,7 @@ class CommandsMixin:
             if pending["device"] == device_id and pending.get("status") == "queued":
                 if (
                     pending.get("attempts", 0) > 0
-                    and not self.device_supports_command_dedup(device_id)
+                    and not self.device_supports_command_replay_guard(device_id)
                 ):
                     pending = self.remove_pending_command(pending["command_id"])
                     if pending is not None:
@@ -130,7 +160,7 @@ class CommandsMixin:
                             pending,
                             "unavailable",
                             pending["operation"].get("value"),
-                            "Повтор отключён: прошивка не объявила защиту от повторного command_id."
+                            "Повтор отключён: прошивка не объявила защиту от выполнения ID, отсутствующего в кэше."
                         )
                     continue
                 await self.deliver_pending_command(pending)
@@ -154,6 +184,9 @@ class CommandsMixin:
     async def send_pending_command_result(self, pending, status, value, error):
         operation = pending["operation"]
         result_record = {"status": status, "value": value, "error": error}
+        replayed = pending.get("replayed") is True
+        if replayed:
+            result_record["replayed"] = True
         pending["status"] = status
 
         # Notify the browser as soon as the device result is known. History and
@@ -169,6 +202,8 @@ class CommandsMixin:
                 **{operation["kind"]: operation["name"]},
                 "value": value
             }
+            if replayed:
+                message["replayed"] = True
             if error:
                 message["error"] = error
             try:
@@ -179,10 +214,13 @@ class CommandsMixin:
         self.update_command_queue_record(pending, status, result_record, error)
         result_future = pending.get("result_future")
         if result_future is not None and not result_future.done():
-            result_future.set_result({"status": status, "value": value, "error": error})
+            result_future.set_result(dict(result_record))
         automation_state_change = pending.pop("automation_state_change", None)
+        if replayed:
+            automation_state_change = None
         if (
-            automation_state_change is None
+            not replayed
+            and automation_state_change is None
             and self.is_automation_command(pending["command_id"], pending.get("automation_id"))
             and status in ("succeeded", "failed")
             and operation["kind"] == "parameter"
@@ -200,7 +238,8 @@ class CommandsMixin:
         deferred_state_events = pending.pop("deferred_state_events", [])
         for state_event in deferred_state_events:
             is_confirmed_command_state = (
-                status in ("succeeded", "failed")
+                not replayed
+                and status in ("succeeded", "failed")
                 and value is not None
                 and operation["kind"] == "parameter"
                 and state_event["parameter"] == operation["name"]
@@ -252,6 +291,8 @@ class CommandsMixin:
                     "status": status,
                     "error": error
                 }
+                if replayed:
+                    command_event["replayed"] = True
                 if pending.get("automation_id"):
                     command_event["automation_id"] = pending["automation_id"]
                     command_event["run_id"] = pending.get("automation_run_id")
@@ -278,14 +319,14 @@ class CommandsMixin:
             return
 
         pending["timeout_task"] = None
-        if not self.device_supports_command_dedup(pending["device"]):
+        if not self.device_supports_command_replay_guard(pending["device"]):
             pending = self.remove_pending_command(command_id)
             if pending is not None:
                 await self.send_pending_command_result(
                     pending,
                     "timeout",
                     pending["operation"].get("value"),
-                    "Устройство не подтвердило команду. Повтор отключён, так как прошивка не объявила защиту от дублей."
+                    "Устройство не подтвердило команду. Повтор отключён: прошивка не объявила защиту от выполнения ID, отсутствующего в кэше."
                 )
             return
         if pending.get("attempts", 0) < self.COMMAND_RETRY_LIMIT:
@@ -329,14 +370,14 @@ class CommandsMixin:
                     )
                 continue
             if retry:
-                if not self.device_supports_command_dedup(device_id):
+                if not self.device_supports_command_replay_guard(device_id):
                     pending = self.remove_pending_command(command_id)
                     if pending is not None:
                         await self.send_pending_command_result(
                             pending,
                             status,
                             pending["operation"].get("value"),
-                            "Результат команды неизвестен после разрыва. Автоповтор отключён для прошивки без защиты от дублей."
+                            "Результат команды неизвестен после разрыва. Автоповтор отключён: прошивка не объявила защиту от выполнения ID, отсутствующего в кэше."
                         )
                     continue
                 task = pending.get("timeout_task")
@@ -383,6 +424,9 @@ class CommandsMixin:
                     "message": message
                 })
 
+        if self.shutting_down:
+            await reject("Gateway завершает работу.")
+            return False
         if not isinstance(device_id, str) or device_id not in self.devices:
             await reject(f"Устройство {device_id} не подключено.")
             return False
@@ -429,7 +473,7 @@ class CommandsMixin:
         if requested_command_id is None:
             prefix = "cmd" if browser is not None else "console"
             command_id = f"{prefix}-{uuid.uuid4().hex}"
-        elif isinstance(requested_command_id, str) and 1 <= len(requested_command_id) <= 80:
+        elif self.valid_command_id(requested_command_id):
             command_id = requested_command_id
         else:
             await reject("Некорректный command_id.")
@@ -508,6 +552,9 @@ class CommandsMixin:
                     "message": message
                 })
 
+        if self.shutting_down:
+            await reject("Gateway завершает работу.")
+            return False
         if not isinstance(device_id, str) or device_id not in self.devices:
             await reject(f"Устройство {device_id} не подключено.")
             return False
@@ -544,7 +591,7 @@ class CommandsMixin:
         if requested_command_id is None:
             prefix = "cmd" if browser is not None else "console"
             command_id = f"{prefix}-{uuid.uuid4().hex}"
-        elif isinstance(requested_command_id, str) and 1 <= len(requested_command_id) <= 80:
+        elif self.valid_command_id(requested_command_id):
             command_id = requested_command_id
         else:
             await reject("Некорректный command_id.")

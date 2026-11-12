@@ -784,8 +784,17 @@
                 settingsFeedback(message.message || (message.success ? t("Настройки истории сохранены.", "History settings saved.") : t("Не удалось сохранить настройки.", "Could not save settings.")), message.success ? "success" : "error");
                 renderSettings(); return true;
             }
-            if (message.type === "device_identity_result" && message.success && layout && message.device !== message.new_device_id) {
-                layout = layout.map(item => item.device === message.device ? { ...item, device: message.new_device_id } : item); save();
+            if (message.type === "device_identity_result" && message.success && message.device !== message.new_device_id) {
+                if (layout) {
+                    layout = layout.map(item => item.device === message.device ? { ...item, device: message.new_device_id } : item); save();
+                }
+                if (selected) {
+                    const [kind, device, parameter] = JSON.parse(selected);
+                    if (device === message.device) {
+                        selected = JSON.stringify([kind, message.new_device_id, parameter]);
+                        selectedSchemaKey = ""; catalogKey = ""; clearHistory();
+                    }
+                }
             }
             return false;
         },
