@@ -30,8 +30,9 @@ class LauncherTests(unittest.IsolatedAsyncioTestCase):
                 gateway_reservation.bind(("127.0.0.1", 0))
                 http_port = http_reservation.getsockname()[1]
                 gateway_port = gateway_reservation.getsockname()[1]
-            options = SimpleNamespace(host="127.0.0.1", http_port=http_port, gateway_port=gateway_port, db=Path(temporary) / "integration.db")
-            with patch("sys.stdin", io.StringIO()), redirect_stdout(io.StringIO()):
+            options = SimpleNamespace(host="0.0.0.0", http_port=http_port, gateway_port=gateway_port, db=Path(temporary) / "integration.db")
+            output = io.StringIO()
+            with patch("sys.stdin", io.StringIO()), patch.object(launcher, "lan_ipv4_addresses", return_value=["192.168.50.8"]), redirect_stdout(output):
                 task = asyncio.create_task(launcher.run_services(options))
                 try:
                     for _ in range(100):
@@ -54,7 +55,19 @@ class LauncherTests(unittest.IsolatedAsyncioTestCase):
                                     break
                         def fetch_interface():
                             with urllib.request.urlopen(f"http://127.0.0.1:{http_port}/", timeout=2) as response:
-                                return response.read()
+                                body = response.read()
+                            request = urllib.request.Request(f"http://127.0.0.1:{http_port}/gateway-config.js?refresh=1", headers={"Host": f"192.168.50.8:{http_port}"})
+                            with urllib.request.urlopen(request, timeout=2) as response:
+                                script = response.read().decode("utf-8")
+                                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                                self.assertIn("javascript", response.headers["Content-Type"])
+                                self.assertEqual(int(response.headers["Content-Length"]), len(script.encode("utf-8")))
+                                self.assertEqual(json.loads(script.split("=", 1)[1].strip().rstrip(";")), {"gateway_port": gateway_port})
+                            request = urllib.request.Request(f"http://127.0.0.1:{http_port}/gateway-config.js", method="HEAD")
+                            with urllib.request.urlopen(request, timeout=2) as response:
+                                self.assertEqual(response.read(), b"")
+                                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                            return body
                         body = await asyncio.to_thread(fetch_interface)
                         self.assertIn(b"gateway-connection.js", body)
                         self.assertTrue(options.db.is_file())
@@ -67,6 +80,17 @@ class LauncherTests(unittest.IsolatedAsyncioTestCase):
             with socket.socket() as client:
                 client.settimeout(1)
                 self.assertNotEqual(client.connect_ex(("127.0.0.1", http_port)), 0)
+            self.assertIn(f"Local network: http://192.168.50.8:{http_port}", output.getvalue())
+
+    def test_lan_discovery_filters_loopback_vpn_benchmark_and_link_local_addresses(self):
+        addresses = ["127.0.0.1", "169.254.1.2", "198.18.0.1", "192.168.0.104", "192.168.0.104", "10.0.0.8", "203.0.113.9"]
+        records = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (address, 0)) for address in addresses]
+        with patch.object(launcher.socket, "getaddrinfo", return_value=records):
+            self.assertEqual(launcher.lan_ipv4_addresses(), ["10.0.0.8", "192.168.0.104"])
+
+    def test_unavailable_lan_address_discovery_does_not_prevent_startup(self):
+        with patch.object(launcher.socket, "getaddrinfo", side_effect=OSError("resolver unavailable")):
+            self.assertEqual(launcher.lan_ipv4_addresses(), [])
 
     async def test_serves_web_only_and_closes_listener_on_gateway_failure(self):
         with TemporaryDirectory() as temporary:

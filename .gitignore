@@ -14,3 +14,6 @@ gateway/backups/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Machine-local recovery state for optional Windows LAN firewall rules.
+/deploy/.lan-firewall-state.json

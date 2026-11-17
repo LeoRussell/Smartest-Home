@@ -4,15 +4,36 @@ import argparse
 import asyncio
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
+import json
 import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 from threading import Thread
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
+LAN_NETWORKS = tuple(ipaddress.ip_network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def lan_ipv4_addresses():
+    """Discover local addresses without probing an Internet service or router."""
+    try:
+        records = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return []
+    addresses = set()
+    for record in records:
+        try:
+            address = ipaddress.ip_address(record[4][0])
+        except ValueError:
+            continue
+        if any(address in network for network in LAN_NETWORKS):
+            addresses.add(address)
+    return [str(address) for address in sorted(addresses)]
 
 
 def port_number(value):
@@ -58,6 +79,34 @@ def use_project_environment():
 
 
 class WebHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, gateway_port=8765, **kwargs):
+        self.gateway_port = gateway_port
+        super().__init__(*args, **kwargs)
+
+    def runtime_configuration(self, *, head=False):
+        if urlsplit(self.path).path != "/gateway-config.js":
+            return False
+        # Only the port is server-owned. The browser must use the page's host,
+        # so opening a LAN URL never sends a phone to its own localhost.
+        body = ("window.__GATEWAY_CONFIG__ = " + json.dumps({"gateway_port": self.gateway_port}) + ";\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/javascript; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+        return True
+
+    def do_GET(self):
+        if not self.runtime_configuration():
+            super().do_GET()
+
+    def do_HEAD(self):
+        if not self.runtime_configuration(head=True):
+            super().do_HEAD()
+
     def log_request(self, code="-", size="-"):
         if isinstance(code, int) and code >= 400:
             super().log_request(code, size)
@@ -78,7 +127,7 @@ async def run_services(options, *, gateway_factory=None, web_directory=None):
     server_type = ThreadingHTTPServer
     if ":" in options.host:
         server_type = type("IPv6WebServer", (ThreadingHTTPServer,), {"address_family": socket.AF_INET6})
-    server = server_type((options.host, options.http_port), partial(WebHandler, directory=str(directory)))
+    server = server_type((options.host, options.http_port), partial(WebHandler, directory=str(directory), gateway_port=options.gateway_port))
     thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, name="gateway-web", daemon=True)
     thread.start()
     try:
@@ -88,8 +137,17 @@ async def run_services(options, *, gateway_factory=None, web_directory=None):
         url_host = f"[{host}]" if ":" in host else host
         print(f"Web interface: http://{url_host}:{server.server_port}", flush=True)
         print(f"Gateway: ws://{url_host}:{options.gateway_port}", flush=True)
+        if options.host == "0.0.0.0":
+            addresses = lan_ipv4_addresses()
+            for address in addresses:
+                print(f"Local network: http://{address}:{server.server_port}", flush=True)
+            if not addresses:
+                print("Local network: open http://<this computer's LAN IP>:" + str(server.server_port), flush=True)
+            print(f"Allow inbound TCP {server.server_port} and {options.gateway_port} from your local network in the firewall.", flush=True)
+        elif host in ("127.0.0.1", "localhost", "::1"):
+            print("Local-only binding. Use --host 0.0.0.0 to accept connections from other devices.", flush=True)
         if options.gateway_port != 8765:
-            print("Set the Gateway address in the web interface settings and match the ESP32 port.", flush=True)
+            print("The web interface uses the configured Gateway port automatically. Match the ESP32 port separately.", flush=True)
         print("Press Ctrl+C to stop both services.", flush=True)
         await gateway.run()
     finally:

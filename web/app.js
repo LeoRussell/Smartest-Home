@@ -77,9 +77,9 @@ const uiSettings = {
 };
 let savedNotificationState = readLocalState(NOTIFICATION_STATE_KEY, null);
 if (savedNotificationState === null) {
-    // Existing releases only used the page host's default Gateway. Migrate
-    // those read markers without importing them into a different database.
-    savedNotificationState = window.GatewayConnection.isDefault()
+    // Legacy releases used the page host on port 8765. A launcher's custom
+    // default port may represent another database and must not inherit IDs.
+    savedNotificationState = window.GatewayConnection.isLegacyDefault()
         ? readLocalState("iot-gateway-notifications-v1", {}) : {};
     try { localStorage.setItem(NOTIFICATION_STATE_KEY, JSON.stringify(savedNotificationState)); }
     catch { /* In-memory notifications still work without browser storage. */ }

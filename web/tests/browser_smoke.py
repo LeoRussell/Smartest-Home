@@ -37,8 +37,22 @@ window.WebSocket=SmokeSocket;
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
+    runtime_config = None
+
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        if self.path.partition("?")[0] == "/gateway-config.js" and self.runtime_config is not None:
+            body = ("window.__GATEWAY_CONFIG__ = " + json.dumps(self.runtime_config) + ";\n").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        super().do_GET()
 
 
 class Browser:
@@ -172,6 +186,42 @@ async def run(options):
                     if not await browser.evaluate("lastReadEventId===42 && readNotificationIds.has('42')"):
                         raise AssertionError("Default Gateway notification read markers did not migrate")
                     print("Existing notification read markers: migrated only to the default Gateway.")
+                    # A newly opened LAN browser must discover the launcher's
+                    # custom WS port without copying localhost from the server.
+                    await browser.evaluate("localStorage.removeItem('iot-gateway-connection-v1');localStorage.removeItem('iot-gateway-notifications-v2:'+encodeURIComponent('ws://'+location.hostname+':18777/'))")
+                    QuietHandler.runtime_config = {"gateway_port": 18777}
+                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.ready()
+                    custom = await browser.evaluate("({socket:__smokeSockets[0].url,backup:databaseBackupDownloadUrl('test.sqlite3'),schema:deviceConfigurationExportUrl('lamp'),default:GatewayConnection.isDefault(),legacy:GatewayConnection.isLegacyDefault(),readMarker:lastReadEventId,hasLegacyReadId:readNotificationIds.has('42'),help:document.getElementById('gateway-address-help').textContent})")
+                    if custom["socket"] != "ws://127.0.0.1:18777/" or custom["backup"] != "http://127.0.0.1:18777/gateway-backups/test.sqlite3" or custom["schema"] != "http://127.0.0.1:18777/gateway-schemas/lamp.json" or not custom["default"] or "18777" not in custom["help"]:
+                        raise AssertionError(("Custom launcher port was not applied consistently", custom))
+                    if custom["legacy"] or custom["readMarker"] is not None or custom["hasLegacyReadId"]:
+                        raise AssertionError(("Legacy notification markers migrated into a custom runtime Gateway", custom))
+                    frozen = await browser.evaluate("window.__GATEWAY_CONFIG__.gateway_port=19999;({socket:GatewayConnection.url(),default:GatewayConnection.isDefault()})")
+                    if frozen != {"socket": "ws://127.0.0.1:18777/", "default": True}:
+                        raise AssertionError(("Runtime mutation changed the active Gateway", frozen))
+                    await browser.evaluate("localStorage.setItem('iot-gateway-connection-v1',JSON.stringify({url:'ws://127.0.0.1:18765/'}))")
+                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.ready()
+                    override = await browser.evaluate("({socket:GatewayConnection.url(),default:GatewayConnection.isDefault()})")
+                    if override != {"socket": "ws://127.0.0.1:18765/", "default": False}:
+                        raise AssertionError(("Explicit Gateway address lost precedence over launch config", override))
+                    await browser.evaluate("localStorage.setItem('iot-gateway-connection-v1',JSON.stringify({url:'ws://'+location.hostname+':8765/'}));localStorage.removeItem('iot-gateway-notifications-v2:'+encodeURIComponent('ws://'+location.hostname+':8765/'))")
+                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.ready()
+                    if not await browser.evaluate("!GatewayConnection.isDefault() && GatewayConnection.isLegacyDefault() && lastReadEventId===42 && readNotificationIds.has('42')"):
+                        raise AssertionError("Explicit legacy endpoint did not retain notification migration on a custom-port page")
+                    await browser.evaluate("localStorage.removeItem('iot-gateway-connection-v1')")
+                    for invalid_port in (0, 65536, "18777", True):
+                        QuietHandler.runtime_config = {"gateway_port": invalid_port}
+                        await browser.call("Page.reload", ignoreCache=True)
+                        await browser.ready()
+                        if await browser.evaluate("GatewayConnection.url()") != "ws://127.0.0.1:8765/":
+                            raise AssertionError(("Invalid runtime port was trusted", invalid_port))
+                    print("Launcher runtime port: discovered, immutable, explicit override preserved; invalid ports use the static fallback.")
+                    QuietHandler.runtime_config = None
+                    if not await browser.evaluate("__smokeErrors.length===0"):
+                        raise AssertionError(await browser.evaluate("__smokeErrors"))
                     await browser.call("Browser.close")
             finally:
                 if process.poll() is None:

@@ -2,6 +2,10 @@
 (() => {
     "use strict";
     const KEY = "iot-gateway-connection-v1";
+    // The combined launcher supplies only a port. Use the page's host so a
+    // phone never connects to its own localhost or the server's wildcard IP.
+    const configuredPort = window.__GATEWAY_CONFIG__?.gateway_port;
+    const defaultPort = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535 ? configuredPort : 8765;
     let options, ui, connected = false, feedback = null;
     const t = (ru, en) => options.localized(ru, en);
     const node = (tag, ru, en, className) => {
@@ -20,8 +24,8 @@
         if (window.location.protocol === "https:" && url.protocol !== "wss:") throw new Error("secure_address_required");
         return url.href;
     }
-    function defaultUrl() {
-        return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:8765/`;
+    function defaultUrl(port = defaultPort) {
+        return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:${port}/`;
     }
     function savedUrl() {
         try { return normalize(JSON.parse(localStorage.getItem(KEY))?.url); }
@@ -76,6 +80,7 @@
     }
     window.GatewayConnection = {
         url, downloadUrl, normalize, isDefault: () => activeUrl === defaultUrl(),
+        isLegacyDefault: () => activeUrl === defaultUrl(8765),
         initialize(context) {
             options = context;
             const section = node("section", null, null, "settings-group gateway-connection-settings");
@@ -93,8 +98,8 @@
             const actions = node("div", null, null, "gateway-connection-actions"); actions.append(save, reset);
             const status = node("p", null, null, "management-feedback gateway-connection-status");
             const message = node("p", null, null, "management-feedback"); message.setAttribute("role", "status");
-            const help = node("p", "Пустое поле — адрес этой страницы, порт 8765. При смене адреса страница перезагрузится; устройства и база остаются на выбранном Gateway.",
-                "Leave empty to use this page's host on port 8765. Changing the address reloads this page; devices and data belong to the selected Gateway.", "management-help");
+            const help = node("p", `Пустое поле — адрес этой страницы, порт ${defaultPort}. При смене адреса страница перезагрузится; устройства и база остаются на выбранном Gateway.`,
+                `Leave empty to use this page's host on port ${defaultPort}. Changing the address reloads this page; devices and data belong to the selected Gateway.`, "management-help");
             help.id = "gateway-address-help"; input.setAttribute("aria-describedby", help.id);
             form.append(label, actions); form.addEventListener("submit", event => { event.preventDefault(); apply(input.value); });
             section.append(heading, form, help, status, message); document.querySelector("#settings-page .settings-card").append(section);
