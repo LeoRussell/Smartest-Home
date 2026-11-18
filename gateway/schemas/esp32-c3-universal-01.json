@@ -1,0 +1,63 @@
+{
+  "export_format": "smartest-home-device",
+  "export_version": 1,
+  "exported_at": "2026-11-18T22:20:28+03:00",
+  "device_id": "esp32-c3-universal-01",
+  "schema_version": 2,
+  "firmware_version": "1.0.3",
+  "schema": {
+    "format_version": 1,
+    "components": {
+      "temperature": {
+        "label": "Температурный датчик",
+        "category": "sensor",
+        "description": "Считывает ADC и линейно преобразует настроенный raw-диапазон в заданные значения."
+      }
+    },
+    "parameters": {
+      "temp_value": {
+        "label": "Показание датчика",
+        "component": "temperature",
+        "type": "integer",
+        "access": "read_only",
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "precision": 0,
+        "unit": "raw"
+      }
+    },
+    "actions": {},
+    "capabilities": {
+      "universal_profile": true
+    }
+  },
+  "device_profile": "universal",
+  "board_profile": "esp32-c3-supermini",
+  "hardware_configuration": {
+    "components": [
+      {
+        "driver": "analog_input",
+        "id": "temperature",
+        "interval_ms": 500,
+        "label": "Температурный датчик",
+        "parameter_id": "temp_value",
+        "parameter_label": "Показание датчика",
+        "pin": 3,
+        "raw_max": 4095,
+        "raw_min": 0,
+        "unit": "raw",
+        "value_max": 100,
+        "value_min": 0
+      }
+    ],
+    "format_version": 1
+  },
+  "ui_preferences": {},
+  "configuration_version": 3,
+  "configuration_hash": "f5b57417a9baa8cec0430012104237a37f1b06f83f69417aa33a9b5e1e9ec73c",
+  "configuration_status": "failed",
+  "configuration_applied_version": 2,
+  "configuration_updated_at": "2026-11-18T22:20:08+03:00",
+  "configuration_applied_at": "2026-11-18T22:19:16+03:00"
+}

@@ -8,7 +8,7 @@ import uuid
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 from websockets.exceptions import ConnectionClosed
-from device_configuration import DRIVERS, validate_device_configuration
+from device_configuration import DRIVERS, supported_board_profile, validate_device_configuration
 from simulation import handle_simulation_message
 
 
@@ -928,10 +928,10 @@ class ProtocolMixin:
             if (
                 metadata is not None
                 and metadata.get("device_profile") == "universal"
-                and metadata.get("board_profile") == "esp32-s3-devkitc-1"
+                and supported_board_profile(metadata.get("board_profile"))
             ):
                 normalized, generated_schema, validation_error = validate_device_configuration(
-                    configuration, metadata.get("driver_ids", [])
+                    configuration, metadata.get("driver_ids", []), metadata.get("board_profile")
                 )
                 normalized_ui_preferences = {}
                 if validation_error is None:
@@ -978,7 +978,7 @@ class ProtocolMixin:
                     except (OSError, sqlite3.Error, ValueError) as error:
                         result_message = f"Не удалось сохранить конфигурацию: {error}"
             elif metadata is not None and metadata.get("device_profile") == "universal":
-                result_message = "Для этой версии конструктора поддерживается профиль ESP32-S3 DevKitC-1."
+                result_message = "Профиль этой платы не поддерживается конструктором."
 
             await self.send_json(websocket, {
                 "type": "device_configuration_save_result",
@@ -1407,7 +1407,7 @@ class ProtocolMixin:
 
                     if device_profile == "universal":
                         if (
-                            board_profile != "esp32-s3-devkitc-1"
+                            not supported_board_profile(board_profile)
                             or not isinstance(driver_ids, list)
                             or not 1 <= len(driver_ids) <= 16
                             or any(

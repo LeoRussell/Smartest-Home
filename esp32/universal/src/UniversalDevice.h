@@ -6,6 +6,8 @@
 #include <CommandResultCache.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include "BoardProfile.h"
+#include "PwmChannels.h"
 #include "user_config.h"
 
 class UniversalDevice {
@@ -48,6 +50,7 @@ private:
         char unit[25] = {};
         Driver driver = Driver::GpioOutput;
         uint8_t pin = 0;
+        uint8_t pwmChannel = UniversalPwm::NO_CHANNEL;
         uint32_t intervalMs = 1000;
         uint32_t lastPollAt = 0;
         int32_t integerValue = 0;
@@ -73,6 +76,7 @@ private:
     bool loadEmbeddedConfiguration(String& error);
     bool isAllowedPin(uint8_t pin) const;
     bool isAllowedAdcPin(uint8_t pin) const;
+    bool planPwmChannels(Component* next, uint8_t count, bool* retained) const;
     bool validLogicalId(const char* value) const;
     bool keyIsAllowed(const char* key, Driver driver) const;
     bool setParameter(const char* parameterId, JsonVariantConst requested,
@@ -89,7 +93,8 @@ private:
     void sendConfigurationReport(GatewayClient& gateway);
     Preferences preferences_;
     CommandResultCache commandCache_;
-    Adafruit_NeoPixel identifyPixel_{1, 48, NEO_GRB + NEO_KHZ800};
+    // No pin is driven before a validated indicator configuration is applied.
+    Adafruit_NeoPixel identifyPixel_{1, -1, NEO_GRB + NEO_KHZ800};
     Component components_[MAX_COMPONENTS];
     IdentifyIndicator identifyIndicator_;
     uint8_t componentCount_ = 0;

@@ -184,6 +184,13 @@ bool UniversalDevice::begin() {
         configurationHash_ = "";
         return false;
     }
+    bool retainedPwmRoutes[MAX_COMPONENTS] = {};
+    if (!planPwmChannels(parsed, parsedCount, retainedPwmRoutes)) {
+        Serial.println("[CONFIG] Stored PWM routes exceed this board's channels; GPIO remains inactive.");
+        configurationVersion_ = 0;
+        configurationHash_ = "";
+        return false;
+    }
 
     memcpy(components_, parsed, sizeof(components_));
     componentCount_ = parsedCount;
@@ -234,13 +241,29 @@ bool UniversalDevice::commandDedupReady() const {
 }
 
 bool UniversalDevice::isAllowedPin(uint8_t pin) const {
-    // Conservative DevKitC-1 profile: omit strapping, USB, flash/PSRAM and
-    // both possible onboard RGB LED pins (GPIO38 and GPIO48).
-    return pin == 1 || pin == 2 || (pin >= 4 && pin <= 18) || pin == 21;
+    return UniversalBoard::allowedPin(pin);
 }
 
 bool UniversalDevice::isAllowedAdcPin(uint8_t pin) const {
-    return pin == 1 || pin == 2 || (pin >= 4 && pin <= 10);
+    return UniversalBoard::allowedAdcPin(pin);
+}
+
+bool UniversalDevice::planPwmChannels(Component* next, uint8_t count, bool* retained) const {
+    UniversalPwm::Route planned[MAX_COMPONENTS];
+    UniversalPwm::Route previous[MAX_COMPONENTS];
+    for (uint8_t index = 0; index < count; ++index) {
+        planned[index].pin = next[index].pin;
+        planned[index].enabled = next[index].driver == Driver::PwmOutput;
+    }
+    for (uint8_t index = 0; index < componentCount_; ++index) {
+        previous[index].pin = components_[index].pin;
+        previous[index].channel = components_[index].pwmChannel;
+        previous[index].enabled = components_[index].driver == Driver::PwmOutput;
+    }
+    if (!UniversalPwm::plan(planned, count, previous, componentCount_,
+                            UniversalBoard::PWM_CHANNELS, retained)) return false;
+    for (uint8_t index = 0; index < count; ++index) next[index].pwmChannel = planned[index].channel;
+    return true;
 }
 
 bool UniversalDevice::validLogicalId(const char* value) const {
@@ -336,7 +359,7 @@ bool UniversalDevice::parseAndValidate(
                 return false;
             }
             const int pin = indicator["pin"].as<int>();
-            if (pin < 0 || pin > 48 || !isAllowedPin(static_cast<uint8_t>(pin))) {
+            if (pin < 0 || pin > 48 || !UniversalBoard::allowedIdentifyGpioPin(static_cast<uint8_t>(pin))) {
                 error = "GPIO identify pin is not supported by this board profile";
                 return false;
             }
@@ -353,8 +376,10 @@ bool UniversalDevice::parseAndValidate(
             }
             const int pin = indicator["pin"].as<int>();
             const int brightness = indicator["brightness"].as<int>();
-            if ((pin != 38 && pin != 48) || brightness < 1 || brightness > 255) {
-                error = "NeoPixel identify pin must be GPIO 38 or 48 and brightness 1..255";
+            if (pin < 0 || pin > 48 ||
+                !UniversalBoard::allowedIdentifyNeoPixelPin(static_cast<uint8_t>(pin)) ||
+                brightness < 1 || brightness > 255) {
+                error = "NeoPixel identify indicator is not supported on this pin or board profile";
                 return false;
             }
             identify.driver = IdentifyDriver::NeoPixel;
@@ -383,6 +408,7 @@ bool UniversalDevice::parseAndValidate(
         return false;
     }
     count = 0;
+    uint8_t pwmCount = 0;
     bool usedPins[49] = {};
 
     for (JsonVariantConst raw : components) {
@@ -518,6 +544,10 @@ bool UniversalDevice::parseAndValidate(
             component.minimumValue = valueMinimum;
             component.maximumValue = valueMaximum;
         } else {
+            if (++pwmCount > UniversalBoard::PWM_CHANNELS) {
+                error = "too many PWM outputs for this board profile";
+                return false;
+            }
             JsonVariantConst initial = source["initial_value"];
             JsonVariantConst minimumValue = source["min_value"];
             JsonVariantConst maximumValue = source["max_value"];
@@ -571,6 +601,11 @@ bool UniversalDevice::applyConfiguration(
     uint8_t parsedCount = 0;
     IdentifyIndicator parsedIdentify;
     if (!parseAndValidate(configuration, parsed, parsedCount, parsedIdentify, error)) return false;
+    bool retainedPwmRoutes[MAX_COMPONENTS] = {};
+    if (!planPwmChannels(parsed, parsedCount, retainedPwmRoutes)) {
+        error = "PWM routes exceed the channels supported by this board profile";
+        return false;
+    }
 
     String calculatedHash;
     String activeConfiguration;
@@ -636,18 +671,18 @@ bool UniversalDevice::applyConfiguration(
         identifyPulsesRemaining_ = 0;
     }
     const IdentifyIndicator previousIdentify = identifyIndicator_;
-    bool retainedPwmRoutes[MAX_COMPONENTS] = {};
     for (uint8_t oldIndex = 0; oldIndex < componentCount_; ++oldIndex) {
         const Component& oldComponent = components_[oldIndex];
-        // PWM channels belong to component slots, not GPIOs. Release the old
-        // route before reusing a pin or slot for another component/driver.
+        // Retained physical routes keep their channels across component order
+        // changes. Release every other route before attaching any new one.
         if (oldComponent.driver == Driver::PwmOutput) {
-            const bool retained = oldIndex < parsedCount &&
-                parsed[oldIndex].driver == Driver::PwmOutput &&
-                parsed[oldIndex].pin == oldComponent.pin;
-            retainedPwmRoutes[oldIndex] = retained;
+            bool retained = false;
+            for (uint8_t newIndex = 0; newIndex < parsedCount; ++newIndex) {
+                if (retainedPwmRoutes[newIndex] && parsed[newIndex].pin == oldComponent.pin &&
+                    parsed[newIndex].pwmChannel == oldComponent.pwmChannel) retained = true;
+            }
             if (!retained) {
-                writePwm(oldIndex, 0);
+                writePwm(oldComponent.pwmChannel, 0);
                 detachPwm(oldComponent.pin);
             }
         }
@@ -733,10 +768,10 @@ void UniversalDevice::configurePins(const bool* retainedPwmRoutes) {
                 if (retainedPwmRoutes != nullptr && retainedPwmRoutes[index]) {
                     // A label/range edit must not briefly drop an unchanged
                     // hardware route to zero or restart its PWM timer.
-                    writePwm(index, component.integerValue);
+                    writePwm(component.pwmChannel, component.integerValue);
                 } else {
                     pinMode(component.pin, OUTPUT);
-                    configurePwm(component.pin, index, component.integerValue);
+                    configurePwm(component.pin, component.pwmChannel, component.integerValue);
                 }
                 break;
         }
@@ -976,7 +1011,7 @@ bool UniversalDevice::setParameter(
                 return false;
             }
             component.integerValue = requested.as<int>();
-            writePwm(index, component.integerValue);
+            writePwm(component.pwmChannel, component.integerValue);
             applied.set(component.integerValue);
             return true;
         }

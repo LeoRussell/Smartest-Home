@@ -70,8 +70,8 @@ jobs:
           restore-keys: ${{ runner.os }}-pio-6.2.0-
       - name: Use placeholder network settings
         run: cp esp32/shared/include/secrets.example.h esp32/shared/include/secrets.h
-      - name: Build universal firmware
-        run: pio run -d esp32/universal
+      - name: Build S3 and C3 universal firmware
+        run: pio run -d esp32/universal -e esp32-s3-devkitc-1 -e esp32-c3-supermini
       - name: Build all LED profiles
         run: pio run -d esp32/examples/led -e esp32-s3-devkitc-1 -e esp32-s3-devkitc-1-v1_0-neopixel -e esp32-s3-devkitc-1-v1_1 -e adafruit_feather_esp32s3
       - name: Test command cache core and storage adapter

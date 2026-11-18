@@ -10,10 +10,13 @@
         if (className) element.className = className;
         return element;
     };
-    const button = (caption, action) => {
-        const element = node("button", caption); element.type = "button";
+    const button = (caption, action, icon) => {
+        const element = node("button", null, "connection-history-button"); element.type = "button";
+        if (icon) element.append(window.GatewayIcons.create(icon));
+        element.append(node("span", caption, "connection-button-caption"));
         element.addEventListener("click", action); return element;
     };
+    const buttonCaption = (element, caption) => { element.querySelector(".connection-button-caption").textContent = caption; };
     const deviceName = id => { const device = context.getDevices().find(item => item.device === id); return device?.display_name || device?.name || id; };
     const time = value => value ? context.formatTime(value) : "—";
     const number = value => Number.isFinite(value) ? new Intl.NumberFormat(context.language(), { maximumFractionDigits: 1 }).format(value) : "—";
@@ -102,12 +105,12 @@
     function renderHeader() {
         if (!view) return;
         view.heading.textContent = t(`История соединений · ${deviceName(view.device)}`, `Connection history · ${deviceName(view.device)}`);
-        view.refresh.textContent = t("Обновить", "Refresh");
-        view.download.textContent = t("Скачать отчёт", "Download report");
+        buttonCaption(view.refresh, t("Обновить", "Refresh"));
+        buttonCaption(view.download, t("Скачать отчёт", "Download report"));
         view.download.title = t("JSON с загруженными сессиями и измерениями. Для полной истории сначала загрузите более ранние подключения.", "JSON containing loaded sessions and measurements. Load older connections first to include more history.");
         view.download.disabled = !view.sessions.length || Boolean(view.pending);
-        view.more.textContent = t("Более ранние подключения", "Older connections");
-        view.close.textContent = t("Закрыть", "Close");
+        buttonCaption(view.more, t("Более ранние подключения", "Older connections"));
+        buttonCaption(view.close, t("Закрыть", "Close"));
         view.explanation.textContent = help();
         view.refresh.disabled = !context.isConnected() || view.unsupported || Boolean(view.pending);
         view.more.disabled = !context.isConnected() || view.unsupported || Boolean(view.pending) || view.sessions.length >= 100;
@@ -142,22 +145,28 @@
             summary.append(node("strong", time(session.started_at)), status, duration);
             const content = node("div", null, "connection-session-content");
             const reason = node("p", session.status === "active" ? t("Текущая сессия", "Current session") : categories()[session.category] || t("Соединение завершено", "Connection ended"), "connection-session-reason");
+            reason.hidden = session.status === "active" && session.close_code == null && !session.close_reason;
             if (session.close_code != null || session.close_reason) {
                 reason.append(node("small", [session.close_code != null ? `WebSocket ${session.close_code}` : "", session.close_reason].filter(Boolean).join(" · ")));
             }
             const stats = node("dl", null, "connection-session-stats");
-            function stat(label, value) { const row = node("div"); row.append(node("dt", label), node("dd", value)); stats.append(row); }
+            function stat(label, value, description) {
+                const row = node("div"), term = node("dt", null, "connection-stat-label");
+                term.append(node("span", label));
+                if (description) term.append(window.GatewayHelp.create(description, label));
+                row.append(term, node("dd", value)); stats.append(row);
+            }
             stat(t("Завершение", "Ended"), session.status === "active" ? t("Сессия продолжается", "Session is active") : time(session.ended_at));
             stat(t("Последнее сообщение", "Last message"), time(session.last_message_at));
             stat(t("Последние показания", "Last readings"), time(session.last_data_at));
             stat(t("Последний Wi-Fi", "Last Wi-Fi"), Number.isFinite(session.wifi_rssi_last) ? `${session.wifi_rssi_last} dBm` : "—");
-            stat(t("Wi-Fi за сессию: min…max", "Session Wi-Fi: min…max"), Number.isFinite(session.wifi_rssi_min) && Number.isFinite(session.wifi_rssi_max) ? `${session.wifi_rssi_min}…${session.wifi_rssi_max} dBm` : "—");
-            stat(t("Время работы ESP32: начало → конец", "ESP32 uptime: start → end"), `${session.uptime_start == null ? "—" : context.formatDuration(session.uptime_start)} → ${session.uptime_last == null ? "—" : context.formatDuration(session.uptime_last)}`);
-            stat(t("Причина запуска ESP32", "ESP32 boot reason"), session.reset_reason || "—");
-            stat(t("Последний разрыв по отчёту ESP32", "Last disconnect reported by ESP32"), session.device_disconnect_reason || "—");
-            stat(t("Время ответа Ping", "Ping round-trip time"), session.probe_rtt_ms == null ? "—" : `${number(session.probe_rtt_ms)} ${t("мс", "ms")}`);
-            stat(t("Проверок без ответа Pong", "Probes without a Pong"), String(session.failed_probes || 0));
-            stat(t("Макс. задержка цикла Gateway", "Maximum Gateway loop delay"), session.gateway_loop_lag_ms == null ? "—" : `${number(session.gateway_loop_lag_ms)} ${t("мс", "ms")}`);
+            stat(t("Wi-Fi за сессию: min…max", "Session Wi-Fi: min…max"), Number.isFinite(session.wifi_rssi_min) && Number.isFinite(session.wifi_rssi_max) ? `${session.wifi_rssi_min}…${session.wifi_rssi_max} dBm` : "—", t("Самый слабый и самый сильный RSSI из отчётов устройства за эту сессию. Ближе к нулю — сильнее сигнал.", "The weakest and strongest RSSI reported by the device during this session. Closer to zero means a stronger signal."));
+            stat(t("Время работы ESP32: начало → конец", "ESP32 uptime: start → end"), `${session.uptime_start == null ? "—" : context.formatDuration(session.uptime_start)} → ${session.uptime_last == null ? "—" : context.formatDuration(session.uptime_last)}`, t("Время с последней загрузки платы в начале и конце наблюдения. Уменьшение между сессиями помогает заметить перезагрузку ESP32.", "Time since the board last booted, at the beginning and end of observation. A lower value in a later session can indicate an ESP32 reboot."));
+            stat(t("Причина запуска ESP32", "ESP32 boot reason"), session.reset_reason || "—", t("Причина последней загрузки, сообщённая прошивкой. unknown означает, что причина не распознана.", "The last boot reason reported by firmware. unknown means the reason was not recognized."));
+            stat(t("Последний разрыв по отчёту ESP32", "Last disconnect reported by ESP32"), session.device_disconnect_reason || "—", t("Последняя причина потери Wi-Fi или WebSocket, которую сообщила сама плата. Она может относиться к более раннему соединению.", "The latest Wi-Fi or WebSocket loss reported by the board itself. It may refer to an earlier connection."));
+            stat(t("Время ответа Ping", "Ping round-trip time"), session.probe_rtt_ms == null ? "—" : `${number(session.probe_rtt_ms)} ${t("мс", "ms")}`, t("Последнее измеренное время от Ping Gateway до ответа Pong. Если отдельная проверка связи не требовалась, значения может не быть.", "The last measured time from a Gateway Ping to its Pong reply. It may be empty if a separate connection probe was not needed."));
+            stat(t("Проверок без ответа Pong", "Probes without a Pong"), String(session.failed_probes || 0), t("Число проверок, на которые Gateway не получил Pong вовремя. Само по себе не доказывает причину разрыва.", "The number of probes for which the Gateway did not receive a Pong in time. It does not by itself prove why a connection was lost."));
+            stat(t("Макс. задержка цикла Gateway", "Maximum Gateway loop delay"), session.gateway_loop_lag_ms == null ? "—" : `${number(session.gateway_loop_lag_ms)} ${t("мс", "ms")}`, t("Наибольшая задержка обработки на компьютере Gateway за эту сессию. Это показатель работы шлюза, а не скорости Wi-Fi устройства.", "The largest scheduling delay on the Gateway computer during this session. It describes the Gateway, not the device's Wi-Fi speed."));
             content.append(reason, stats); details.append(summary, content); view.list.append(details);
         }
         updateDurations(); renderHeader();
@@ -181,16 +190,19 @@
         const root = node("dialog", null, "management-dialog connection-history-dialog"); root.dataset.deviceId = deviceId;
         const heading = node("h2", "", "management-dialog-title"); context.labelDialog(root, heading);
         const body = node("div", null, "management-dialog-body");
+        const overview = node("div", null, "connection-history-overview");
         const tools = node("div", null, "connection-history-tools");
-        const refresh = button("", () => request());
-        const download = button("", downloadReport); download.dataset.role = "connection-report";
-        const summary = node("p", "", "management-help");
-        const status = node("p", "", "management-feedback"); status.setAttribute("role", "status");
+        const refresh = button("", () => request(), "refresh"); refresh.dataset.role = "connection-refresh";
+        const download = button("", downloadReport, "download"); download.dataset.role = "connection-report";
+        const summary = node("p", "", "management-help connection-history-summary");
+        const status = node("p", "", "management-feedback connection-history-status"); status.setAttribute("role", "status");
         const list = node("div", null, "connection-session-list");
-        const more = button("", () => request(true));
-        const explanation = node("p", help(), "management-help");
-        const actions = node("div", null, "management-dialog-actions"); const close = button("", () => root.close());
-        tools.append(download, refresh); actions.append(close); body.append(tools, summary, status, list, more, explanation, actions); root.append(heading, body);
+        const more = button("", () => request(true), "list"); more.classList.add("connection-history-more");
+        const explanation = node("p", "", "management-help");
+        const note = node("div", null, "connection-history-footer-note"); note.append(explanation);
+        const actions = node("div", null, "management-dialog-actions connection-history-footer"); const close = button("", () => root.close(), "close");
+        close.dataset.role = "connection-close";
+        tools.append(download, refresh); overview.append(summary, tools); actions.append(note, close); body.append(overview, status, list, more, actions); root.append(heading, body);
         const data = cache.get(deviceId) || null;
         const current = { root, heading, body, refresh, download, more, close, summary, status, list, explanation, device: deviceId, pending: null, timeout: null, sessions: (data?.sessions || []).map(session => ({ ...session })), data, live: false, paged: false, notice: "", noticeState: "info", unsupported: false };
         view = current;

@@ -5,7 +5,7 @@ import json
 import math
 import re
 from device_management import validate_schema_common_commands
-from device_configuration import validate_device_configuration
+from device_configuration import supported_board_profile, validate_device_configuration
 from history import valid_history_definition
 
 
@@ -660,12 +660,12 @@ class SchemaMixin:
             return None, None, None, [{
                 "path": "device", "message": "Устройство не поддерживает универсальную конфигурацию."
             }]
-        if metadata.get("board_profile") != "esp32-s3-devkitc-1":
+        if not supported_board_profile(metadata.get("board_profile")):
             return None, None, None, [{
-                "path": "device", "message": "Для этой версии конструктора поддерживается профиль ESP32-S3 DevKitC-1."
+                "path": "device", "message": "Профиль этой платы не поддерживается конструктором."
             }]
         normalized, schema, error = validate_device_configuration(
-            configuration, metadata.get("driver_ids", [])
+            configuration, metadata.get("driver_ids", []), metadata.get("board_profile")
         )
         if error is not None:
             return None, None, None, [{

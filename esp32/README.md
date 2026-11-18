@@ -71,6 +71,19 @@ pio run -d esp32/universal -t upload
 pio device monitor -d esp32/universal
 ```
 
+Для **ESP32-C3 SuperMini** в универсальном проекте используйте отдельный
+профиль (по умолчанию остаётся ESP32-S3):
+
+```powershell
+pio run -d esp32/universal -e esp32-c3-supermini
+pio run -d esp32/universal -e esp32-c3-supermini -t upload
+pio device monitor -d esp32/universal -e esp32-c3-supermini
+```
+
+В PlatformIO Project Tasks выбирайте `esp32-c3-supermini → General → Upload`.
+Это профиль C3 SuperMini с 4 МБ flash, нативным USB и собственными ограничениями
+GPIO/ADC/PWM. [Подробности и первый запуск](../docs/UNIVERSAL_FIRMWARE.md#esp32-c3-supermini).
+
 Пользовательская LED-прошивка:
 
 ```powershell

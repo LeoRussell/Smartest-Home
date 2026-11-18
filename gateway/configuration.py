@@ -86,6 +86,28 @@ class ConfigurationMixin:
         if record is None:
             await self.send_json(target, {"type": "device_config_request"})
             return False
+        _, _, validation_error = validate_device_configuration(
+            record["config"], metadata.get("driver_ids", []), metadata.get("board_profile")
+        )
+        if validation_error:
+            # The same logical ID may reconnect from another board family.
+            # Never transmit GPIO assignments accepted for a different board.
+            self.cancel_configuration_apply(device_id)
+            self.configuration_confirmed_devices.discard(device_id)
+            error = f"Сохранённая конфигурация несовместима с профилем платы: {validation_error}"
+            self.update_device_configuration_status(device_id, "failed", error=error)
+            await self.finish_pending_commands_for_device(device_id, "unavailable", error, retry=False)
+            self.write_device_configuration_export(device_id)
+            if record["status"] != "failed" or record["last_error"] != error:
+                self.save_device_event(device_id, "configuration", error)
+                await self.send_event_history()
+            await self.send_device_list()
+            await self.broadcast({
+                "type": "device_configuration_apply_result", "device": device_id,
+                "config_version": record["config_version"], "success": False,
+                "status": "failed", "message": error,
+            })
+            return False
         self.cancel_configuration_apply(device_id)
         self.configuration_confirmed_devices.discard(device_id)
         self.update_device_configuration_status(device_id, "applying")
@@ -133,7 +155,7 @@ class ConfigurationMixin:
 
         if version == 0 and record is None:
             _, expected_schema, validation_error = validate_device_configuration(
-                {"format_version": 1, "components": []}, metadata.get("driver_ids", [])
+                {"format_version": 1, "components": []}, metadata.get("driver_ids", []), metadata.get("board_profile")
             )
             schema = message.get("schema")
             if (
@@ -166,7 +188,7 @@ class ConfigurationMixin:
         self.cancel_configuration_apply(device_id)
 
         normalized, expected_schema, validation_error = validate_device_configuration(
-            record["config"], metadata.get("driver_ids", [])
+            record["config"], metadata.get("driver_ids", []), metadata.get("board_profile")
         )
         reported_schema = message.get("schema")
         if success and (
@@ -253,7 +275,7 @@ class ConfigurationMixin:
             return
 
         normalized, expected_schema, validation_error = validate_device_configuration(
-            message.get("configuration"), metadata.get("driver_ids", [])
+            message.get("configuration"), metadata.get("driver_ids", []), metadata.get("board_profile")
         )
         reported_schema = message.get("schema")
         config_hash = message["config_hash"]

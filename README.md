@@ -129,6 +129,12 @@ py -m http.server 8080 --directory web
 
 Скопируй `esp32/shared/include/secrets.example.h` в `esp32/shared/include/secrets.h` и укажи Wi-Fi и IP компьютера, где запущен Gateway. Эти настройки используются обоими проектами прошивок; `secrets.h` исключён из Git.
 
+Для универсальной прошивки **ESP32-C3 SuperMini** выбирай окружение
+`esp32-c3-supermini`: `pio run -d esp32/universal -e esp32-c3-supermini -t upload`.
+По умолчанию проект продолжает собираться для S3. Для C3 добавлены отдельные
+GPIO/ADC-ограничения и шесть PWM-каналов.
+[Настройка и загрузка C3](docs/UNIVERSAL_FIRMWARE.md#esp32-c3-supermini).
+
 Рабочий пример пользовательской прошивки находится в `esp32/examples/led`. Он собирается PlatformIO, профиль по умолчанию — `esp32-s3-devkitc-1`.
 
 Профиль `esp32-s3-devkitc-1` управляет обычным светодиодом на GPIO 48 прямым цифровым сигналом; команда включения держит пин в активном состоянии, а `identify` мигает им пять раз. Это подходит для внешнего светодиода, подключённого к GPIO 48 через токоограничивающий резистор. Адресный RGB-светодиод ESP32-S3 DevKitC-1 требует NeoPixel-протокола: на v1.0 он подключён к GPIO 48, на v1.1 — к GPIO 38. Для адресных индикаторов выбери профиль `esp32-s3-devkitc-1-v1_0-neopixel` или `esp32-s3-devkitc-1-v1_1`. Для Adafruit Feather ESP32-S3 выбери `adafruit_feather_esp32s3`: он управляет красным GPIO-светодиодом на GPIO 13. В Serial выводятся тип драйвера и GPIO. Чтобы прошить плату, из корня репозитория запусти `pio run -d esp32/examples/led -e esp32-s3-devkitc-1 -t upload`; для остальных плат укажи соответствующий профиль. Serial monitor запускается командой `pio device monitor -d esp32/examples/led -e esp32-s3-devkitc-1` на скорости 115200 бод. Пин и драйвер выбираются профилем в `esp32/examples/led/platformio.ini`; для платы без индикатора установи `DEVICE_HAS_IDENTIFY_INDICATOR` в `0`. В Schema доступны `capabilities.built_in_indicator`, `capabilities.identify` и `actions.identify`.
@@ -323,7 +329,7 @@ Gateway; старые события в сессии не преобразуют
 
 В [GitHub Actions](.github/workflows/checks.yml) проверки запускаются при push,
 pull request и вручную. Проверяются сервер и браузер в Windows/Linux,
-короткий прогон переподключений и все пять профилей прошивок. Для сборок
+короткий прогон переподключений и все профили прошивок, включая C3 SuperMini. Для сборок
 используются фиктивные сетевые настройки; личный `secrets.h` не нужен.
 Кэш команд дополнительно проверяется native C++-тестами, включая адаптер NVS.
 После добавления workflow первый облачный запуск произойдёт при отправке коммита.

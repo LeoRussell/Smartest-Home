@@ -10,7 +10,7 @@ import uuid
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from device_configuration import public_driver_catalog
+from device_configuration import public_configuration_limits, public_driver_catalog
 from settings import EVENTS_PAGE_SIZE
 from history import ParameterHistory
 from connection_history import ConnectionHistory
@@ -1903,7 +1903,8 @@ class StorageMixin:
                 "pending_schema": self.public_schema_proposal(device_id),
                 "device_profile": metadata.get("device_profile"),
                 "board_profile": metadata.get("board_profile"),
-                "driver_catalog": public_driver_catalog(metadata.get("driver_ids", [])),
+                "driver_catalog": public_driver_catalog(metadata.get("driver_ids", []), metadata.get("board_profile")),
+                "configuration_limits": public_configuration_limits(metadata.get("board_profile")),
                 "hardware_configuration": configurations.get(device_id, {}).get("config"),
                 "configuration_version": configurations.get(device_id, {}).get("version", 0),
                 "configuration_applied_version": configurations.get(device_id, {}).get("applied_version", 0),
@@ -1949,7 +1950,8 @@ class StorageMixin:
                     "pending_schema": self.public_schema_proposal(device_id),
                     "device_profile": metadata.get("device_profile"),
                     "board_profile": metadata.get("board_profile"),
-                    "driver_catalog": public_driver_catalog(metadata.get("driver_ids", [])),
+                    "driver_catalog": public_driver_catalog(metadata.get("driver_ids", []), metadata.get("board_profile")),
+                    "configuration_limits": public_configuration_limits(metadata.get("board_profile")),
                     "hardware_configuration": configurations.get(device_id, {}).get("config"),
                     "configuration_version": configurations.get(device_id, {}).get("version", 0),
                     "configuration_applied_version": configurations.get(device_id, {}).get("applied_version", 0),

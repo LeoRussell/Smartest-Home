@@ -3,11 +3,11 @@
 #include <GatewayClient.h>
 #include "secrets.h"
 #include "UniversalDevice.h"
+#include "BoardProfile.h"
 
 namespace {
 constexpr uint16_t GATEWAY_PORT = 8765;
-constexpr char BOARD_PROFILE[] = "esp32-s3-devkitc-1";
-constexpr char FIRMWARE_VERSION[] = "1.0.2";
+constexpr char FIRMWARE_VERSION[] = "1.0.3";
 
 GatewayClient gateway;
 UniversalDevice device;
@@ -25,7 +25,7 @@ void sendHello() {
     message["command_dedup"] = device.commandDedupReady();
     message["command_replay_guard"] = device.commandDedupReady();
     message["device_profile"] = "universal";
-    message["board_profile"] = BOARD_PROFILE;
+    message["board_profile"] = UniversalBoard::PROFILE_ID;
     message["firmware_version"] = FIRMWARE_VERSION;
     gateway.appendHealth(message["health"].to<JsonObject>());
     JsonArray driverCatalog = message["driver_catalog"].to<JsonArray>();

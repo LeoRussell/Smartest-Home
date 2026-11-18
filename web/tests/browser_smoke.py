@@ -84,6 +84,19 @@ class Browser:
             await asyncio.sleep(0.05)
         raise RuntimeError("The interface did not become ready.")
 
+    async def reload(self):
+        previous = (await self.call("Page.getFrameTree"))["frameTree"]["frame"]["loaderId"]
+        await self.call("Page.reload", ignoreCache=True)
+        # Page.reload can return while the previous document is still ready.
+        # Wait for its replacement before checking the application functions.
+        for _ in range(150):
+            current = (await self.call("Page.getFrameTree"))["frameTree"]["frame"]["loaderId"]
+            if current != previous:
+                await self.ready()
+                return
+            await asyncio.sleep(0.05)
+        raise RuntimeError("The interface did not navigate after reload.")
+
 
 def find_browser(explicit):
     candidates = [explicit, os.environ.get("CHROME_PATH"), shutil.which("google-chrome"), shutil.which("chromium"), shutil.which("chromium-browser")]
@@ -127,6 +140,7 @@ async def run(options):
                     browser = Browser(websocket)
                     await browser.call("Page.enable")
                     await browser.call("Runtime.enable")
+                    await browser.call("Emulation.setFocusEmulationEnabled", enabled=True)
                     await browser.call("Page.addScriptToEvaluateOnNewDocument", source=MOCK_SOCKET)
                     await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
                     await browser.call("Page.navigate", url=f"http://127.0.0.1:{server.server_port}/")
@@ -135,6 +149,22 @@ async def run(options):
                     print("Interactions:", await browser.evaluate("runGatewaySmoke()"))
                     await browser.evaluate((Path(__file__).with_name("management-smoke.js")).read_text(encoding="utf-8"))
                     print("Management replies:", await browser.evaluate("runManagementSmoke()"))
+                    await browser.evaluate((Path(__file__).with_name("c3-smoke.js")).read_text(encoding="utf-8"))
+                    print("C3 configuration:", await browser.evaluate("runC3ConfigurationSmoke()"))
+                    for filename, function in (
+                        ("help-smoke.js", "runGatewayHelpSmoke"),
+                        ("settings-layout-smoke.js", "runSettingsLayoutSmoke"),
+                        ("connections-layout-smoke.js", "runConnectionsLayoutSmoke"),
+                        ("ui-polish-smoke.js", "runContextualCardsSmoke"),
+                    ):
+                        await browser.evaluate((Path(__file__).with_name(filename)).read_text(encoding="utf-8"))
+                        print(function + ":", await browser.evaluate(function + "()"))
+                    for width in (375, 320):
+                        await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=1000, deviceScaleFactor=1, mobile=False)
+                        for function in ("runGatewayHelpSmoke", "runSettingsLayoutSmoke", "runConnectionsLayoutSmoke", "runContextualCardsSmoke"):
+                            await browser.evaluate(function + "()")
+                    await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
+                    print("Contextual help and modal layouts: desktop, 375 px and 320 px passed.")
                     layouts = 0
                     for language in ("ru", "en"):
                         for navigation in ("top", "side"):
@@ -154,8 +184,17 @@ async def run(options):
                                         options.screenshots.mkdir(parents=True, exist_ok=True)
                                         (options.screenshots / f"{name}-{width}.png").write_bytes(base64.b64decode(screenshot["data"]))
                     print(f"Layouts: {layouts}; no overflow or JavaScript errors.")
+                    if options.screenshots:
+                        await browser.evaluate("uiSettings.language='ru';uiSettings.navigation='top';document.body.classList.remove('nav-side');applyLanguage()")
+                        for width in (1440, 320):
+                            await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=1000, deviceScaleFactor=1, mobile=False)
+                            for kind in ("devices", "settings", "connections", "hardware"):
+                                await browser.evaluate(f"prepareUiPolishPreview({json.dumps(kind)})")
+                                screenshot = await browser.call("Page.captureScreenshot", format="png", captureBeyondViewport=False)
+                                (options.screenshots / f"dialog-{kind}-{width}.png").write_bytes(base64.b64decode(screenshot["data"]))
+                        await browser.evaluate("GatewayHelp.closeAll();for(const dialog of document.querySelectorAll('dialog[open]'))dialog.close();new Promise(resolve=>setTimeout(resolve,0))")
                     await browser.evaluate("setActivePage('automations');document.querySelector('[data-role=discard-automation-draft]')?.click();document.getElementById('automation-name').value='Recovery smoke';document.getElementById('automation-name').dispatchEvent(new Event('input'));AutomationDraft.flush()")
-                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.reload()
                     await browser.ready()
                     restored = await browser.evaluate("""(()=>{
                         setActivePage('automations');
@@ -172,7 +211,7 @@ async def run(options):
                     check = await browser.evaluate("({socket:__smokeSockets[0].url,configured:GatewayConnection.url(),download:databaseBackupDownloadUrl('check.sqlite3')})")
                     if check["socket"] != check["configured"] or ":18765/" in check["download"]:
                         raise AssertionError(("Changing storage mixed active Gateway addresses", check))
-                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.reload()
                     await browser.ready()
                     state = await browser.evaluate("({socket:__smokeSockets[0].url,backup:databaseBackupDownloadUrl('test.sqlite3'),schema:deviceConfigurationExportUrl('lamp')})")
                     if state != {"socket": "ws://127.0.0.1:18765/", "backup": "http://127.0.0.1:18765/gateway-backups/test.sqlite3", "schema": "http://127.0.0.1:18765/gateway-schemas/lamp.json"}:
@@ -181,7 +220,7 @@ async def run(options):
                         raise AssertionError("A draft from another Gateway appeared in the editor")
                     print("Persisted Gateway address: WebSocket, backup and Schema URLs agree.")
                     await browser.evaluate("localStorage.removeItem('iot-gateway-connection-v1');localStorage.removeItem('iot-gateway-notifications-v2:'+encodeURIComponent('ws://'+location.hostname+':8765/'));localStorage.setItem('iot-gateway-notifications-v1',JSON.stringify({unread:[],readIds:['42'],lastReadEventId:42}))")
-                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.reload()
                     await browser.ready()
                     if not await browser.evaluate("lastReadEventId===42 && readNotificationIds.has('42')"):
                         raise AssertionError("Default Gateway notification read markers did not migrate")
@@ -190,7 +229,7 @@ async def run(options):
                     # custom WS port without copying localhost from the server.
                     await browser.evaluate("localStorage.removeItem('iot-gateway-connection-v1');localStorage.removeItem('iot-gateway-notifications-v2:'+encodeURIComponent('ws://'+location.hostname+':18777/'))")
                     QuietHandler.runtime_config = {"gateway_port": 18777}
-                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.reload()
                     await browser.ready()
                     custom = await browser.evaluate("({socket:__smokeSockets[0].url,backup:databaseBackupDownloadUrl('test.sqlite3'),schema:deviceConfigurationExportUrl('lamp'),default:GatewayConnection.isDefault(),legacy:GatewayConnection.isLegacyDefault(),readMarker:lastReadEventId,hasLegacyReadId:readNotificationIds.has('42'),help:document.getElementById('gateway-address-help').textContent})")
                     if custom["socket"] != "ws://127.0.0.1:18777/" or custom["backup"] != "http://127.0.0.1:18777/gateway-backups/test.sqlite3" or custom["schema"] != "http://127.0.0.1:18777/gateway-schemas/lamp.json" or not custom["default"] or "18777" not in custom["help"]:
@@ -201,20 +240,20 @@ async def run(options):
                     if frozen != {"socket": "ws://127.0.0.1:18777/", "default": True}:
                         raise AssertionError(("Runtime mutation changed the active Gateway", frozen))
                     await browser.evaluate("localStorage.setItem('iot-gateway-connection-v1',JSON.stringify({url:'ws://127.0.0.1:18765/'}))")
-                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.reload()
                     await browser.ready()
                     override = await browser.evaluate("({socket:GatewayConnection.url(),default:GatewayConnection.isDefault()})")
                     if override != {"socket": "ws://127.0.0.1:18765/", "default": False}:
                         raise AssertionError(("Explicit Gateway address lost precedence over launch config", override))
                     await browser.evaluate("localStorage.setItem('iot-gateway-connection-v1',JSON.stringify({url:'ws://'+location.hostname+':8765/'}));localStorage.removeItem('iot-gateway-notifications-v2:'+encodeURIComponent('ws://'+location.hostname+':8765/'))")
-                    await browser.call("Page.reload", ignoreCache=True)
+                    await browser.reload()
                     await browser.ready()
                     if not await browser.evaluate("!GatewayConnection.isDefault() && GatewayConnection.isLegacyDefault() && lastReadEventId===42 && readNotificationIds.has('42')"):
                         raise AssertionError("Explicit legacy endpoint did not retain notification migration on a custom-port page")
                     await browser.evaluate("localStorage.removeItem('iot-gateway-connection-v1')")
                     for invalid_port in (0, 65536, "18777", True):
                         QuietHandler.runtime_config = {"gateway_port": invalid_port}
-                        await browser.call("Page.reload", ignoreCache=True)
+                        await browser.reload()
                         await browser.ready()
                         if await browser.evaluate("GatewayConnection.url()") != "ws://127.0.0.1:8765/":
                             raise AssertionError(("Invalid runtime port was trusted", invalid_port))

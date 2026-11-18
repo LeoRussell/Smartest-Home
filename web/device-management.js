@@ -15,6 +15,7 @@
     let retentionDirty = false;
     const retentionRequest = { pending: null };
     let dialogSequence = 0;
+    let fieldSequence = 0;
     const healthBaselines = new Map();
     const byId = id => document.getElementById(id);
     const t = (ru, en) => context?.localized(ru, en) || ru;
@@ -78,8 +79,11 @@
     }
 
     function label(caption, input) {
-        const result = node("label", null, "management-field");
-        result.append(node("span", caption), input);
+        const result = node("div", null, "management-field");
+        const text = node("label", caption);
+        if (!input.id) input.id = `management-field-${++fieldSequence}`;
+        text.htmlFor = input.id;
+        result.append(text, input);
         return result;
     }
 
@@ -376,24 +380,31 @@
         const common = node("section", null, "device-settings-section");
         common.dataset.role = "device-settings-common";
         const options = node("div", null, "device-settings-options");
-        options.append(group, common);
+        const sidebar = node("div", null, "device-settings-sidebar");
         const history = node("section", null, "device-settings-section");
         history.dataset.role = "device-settings-schema";
         const connections = node("section", null, "device-settings-section device-settings-connections");
-        const connectionTitle = node("h3"), connectionHelp = node("p", null, "management-help");
-        const connectionHistory = button("", () => window.ConnectionDiagnostics?.open(deviceSettingsDialog?.device || device.device));
-        for (const [element, ru, en] of [
-            [connectionTitle, "Связь и подключения", "Connection diagnostics"],
-            [connectionHelp, "Сессии, причины разрывов, Wi-Fi и задержки Gateway.", "Sessions, disconnect reasons, Wi-Fi and Gateway delays."],
-            [connectionHistory, "История соединений", "Connection history"]
-        ]) { element.dataset.ru = ru; element.dataset.en = en; element.textContent = t(ru, en); }
-        connections.append(connectionTitle, connectionHelp, connectionHistory);
+        connections.dataset.role = "device-settings-connections";
+        const connectionHeading = node("div", null, "device-settings-heading");
+        const connectionTitle = node("h3", t("Связь и подключения", "Connection diagnostics"));
+        const connectionHelp = window.GatewayHelp.create(
+            t("В истории доступны сессии, причины разрывов, Wi-Fi и задержки Gateway.", "History contains sessions, disconnect reasons, Wi-Fi and Gateway delays."),
+            t("О диагностике соединений", "About connection diagnostics")
+        );
+        connectionHeading.append(connectionTitle, connectionHelp);
+        const connectionStatus = node("p", "", "device-settings-connection-status");
+        const connectionHistory = window.GatewayIcons.action("list", t("История соединений", "Connection history"),
+            () => window.ConnectionDiagnostics?.open(deviceSettingsDialog?.device || device.device), "device-settings-history-link");
+        connections.append(connectionHeading, connectionStatus, connectionHistory);
+        sidebar.append(group, connections);
+        options.append(sidebar, common);
         const footer = node("div", null, "management-dialog-actions");
-        const close = button(t("Закрыть", "Close"), () => view.root.close());
+        const close = window.GatewayIcons.action("close", t("Закрыть", "Close"), () => view.root.close());
         footer.append(close);
-        view.body.append(identity, notice, identityEditor, options, connections, history, footer);
+        view.body.append(identity, notice, identityEditor, options, history, footer);
         deviceSettingsDialog = {
             ...view, device: device.device, identity, identityEditor, notice, group, common, history, close,
+            connectionTitle, connectionHelp, connectionStatus, connectionHistory,
             formDirty: false, mappingRevision: 0, savePending: null, membershipPending: null,
         };
         createIdentityEditor(device);
@@ -429,20 +440,30 @@
         id.dataset.role = "identity-id";
         id.value = device.device;
         const nameField = label(t("Отображаемое имя", "Display name"), name);
-        const idField = label(t("ID Gateway (используется в Blockly)", "Gateway ID (used in Blockly)"), id);
+        const idField = label(t("ID Gateway", "Gateway ID"), id);
+        idField.classList.add("device-settings-id-field");
+        const idCaption = idField.firstChild;
+        const idHelp = window.GatewayHelp.create(
+            t("ID используется в Blockly и должен быть уникальным. Начните с английской буквы; затем допустимы буквы, цифры, дефис и подчёркивание. Смена ID сохраняет связь с ID прошивки.",
+                "The ID is used in Blockly and must be unique. Start with an English letter, then use letters, digits, hyphens or underscores. Changing it retains the link to the firmware ID."),
+            t("Правила ID устройства", "Device ID rules")
+        );
+        idField.insertBefore(idHelp, id);
         const help = node("p", "", "management-help");
         const feedback = node("p", "", "management-feedback");
         feedback.dataset.role = "identity-feedback";
         feedback.setAttribute("aria-live", "polite");
         const actions = node("div", null, "management-dialog-actions");
-        const save = button(t("Сохранить имя и ID", "Save name and ID"));
+        const save = window.GatewayIcons.action("save", t("Сохранить имя и ID", "Save name and ID"));
         save.type = "submit";
         save.dataset.role = "identity-save";
         actions.append(save);
-        form.append(nameField, idField, help, feedback, actions);
+        const identityFooter = node("div", null, "device-identity-footer");
+        identityFooter.append(help, actions);
+        form.append(nameField, idField, identityFooter, feedback);
         view.identityEditor.append(title, form);
         view.identityState = {
-            name, id, save, title, nameField, idField, help, feedback,
+            name, id, save, title, nameField, idField, idCaption, idHelp, help, feedback,
             nameDirty: false, idDirty: false, pending: null,
             savedName: device.display_name || "", savedId: device.device,
         };
@@ -487,8 +508,13 @@
         if (!state) return;
         state.title.textContent = t("Имя и ID устройства", "Device name and ID");
         state.nameField.firstChild.textContent = t("Отображаемое имя", "Display name");
-        state.idField.firstChild.textContent = t("ID Gateway (используется в Blockly)", "Gateway ID (used in Blockly)");
-        state.save.textContent = t("Сохранить имя и ID", "Save name and ID");
+        state.idCaption.textContent = t("ID Gateway", "Gateway ID");
+        window.GatewayHelp.update(state.idHelp,
+            t("ID используется в Blockly и должен быть уникальным. Начните с английской буквы; затем допустимы буквы, цифры, дефис и подчёркивание. Смена ID сохраняет связь с ID прошивки.",
+                "The ID is used in Blockly and must be unique. Start with an English letter, then use letters, digits, hyphens or underscores. Changing it retains the link to the firmware ID."),
+            t("Правила ID устройства", "Device ID rules")
+        );
+        window.GatewayIcons.labelAction(state.save, t("Сохранить имя и ID", "Save name and ID"));
         if (!state.nameDirty && !state.pending) state.name.value = device.display_name || "";
         if (!state.idDirty && !state.pending) state.id.value = device.device;
         state.savedName = device.display_name || "";
@@ -497,9 +523,11 @@
         state.name.disabled = !online || Boolean(state.pending);
         state.id.disabled = !online || Boolean(device.connected) || Boolean(state.pending);
         state.save.disabled = !online || deviceMutationPending(deviceSettingsDialog);
-        state.help.textContent = device.connected
-            ? t("Чтобы изменить ID, сначала отключите устройство. Имя можно сохранить и сейчас.", "Disconnect the device before changing its ID. You can save its name now.")
-            : t("ID уникален: английская буква в начале, затем буквы, цифры, дефис или подчёркивание. Gateway сохранит связь с ID прошивки.", "The unique ID starts with an English letter, followed by letters, digits, hyphens or underscores. Gateway retains its link to the firmware ID.");
+        state.help.textContent = !online
+            ? t("Нет связи с Gateway. Сохранение временно недоступно.", "Gateway is offline. Saving is temporarily unavailable.")
+            : device.connected
+                ? t("ID можно изменить после отключения устройства. Имя доступно для изменения.", "Disconnect the device to change its ID. Its name can be changed now.")
+                : t("Устройство отключено: можно изменить имя и ID.", "The device is offline: its name and ID can be changed.");
     }
 
     function identityResult(message) {
@@ -547,7 +575,14 @@
                 refreshDeviceSettings(); context.send("get_devices");
             })) { view.groupSignature = null; refreshDeviceSettings(); }
         });
-        return label(t("Группа", "Group"), select);
+        const result = label(t("Группа", "Group"), select);
+        result.classList.add("device-settings-group-field");
+        result.insertBefore(window.GatewayHelp.create(
+            t("У каждого устройства одна группа. Выбор сохраняется сразу; «Без группы» убирает устройство из комнаты, сохраняя его настройки.",
+                "Each device belongs to one group. The selection is saved immediately; Ungrouped removes it from a room without losing its settings."),
+            t("О группах устройств", "About device groups")
+        ), select);
+        return result;
     }
 
     function refreshDeviceSettings() {
@@ -562,7 +597,17 @@
         view.root.querySelector(".management-dialog-title").textContent = t(`Настройки устройства · ${deviceName(device)}`, `Device settings · ${deviceName(device)}`);
         view.root.setAttribute("aria-label", view.root.querySelector(".management-dialog-title").textContent);
         view.identity.textContent = `${device.device} · ${device.connected ? t("Подключено", "Online") : t("Отключено", "Offline")}`;
-        view.close.textContent = t("Закрыть", "Close");
+        window.GatewayIcons.labelAction(view.close, t("Закрыть", "Close"));
+        view.connectionTitle.textContent = t("Связь и подключения", "Connection diagnostics");
+        window.GatewayHelp.update(view.connectionHelp,
+            t("В истории доступны сессии, причины разрывов, Wi-Fi и задержки Gateway.", "History contains sessions, disconnect reasons, Wi-Fi and Gateway delays."),
+            t("О диагностике соединений", "About connection diagnostics")
+        );
+        window.GatewayIcons.labelAction(view.connectionHistory, t("История соединений", "Connection history"));
+        const rssi = device.health?.wifi_rssi;
+        const active = Boolean(device.connected && online);
+        view.connectionStatus.textContent = `${active ? t("На связи", "Online") : t("Нет связи", "Offline")}${Number.isInteger(rssi) && rssi <= 0 && rssi >= -127 ? ` · ${active ? "Wi-Fi" : t("Последний Wi-Fi", "Last Wi-Fi")} ${rssi} dBm` : ""}`;
+        view.connectionStatus.dataset.state = active ? "success" : "info";
         refreshIdentityEditor(device);
         const groupSignature = JSON.stringify([device.group_id, groups, online, groupsReady,
             view.membershipPending?.id, view.identityState?.pending?.id, view.savePending?.id, t("Группа", "Group")]);
@@ -572,7 +617,13 @@
         }
         const commonSignature = JSON.stringify([device.schema, device.common_commands, device.common_command_sources, t("Общее выключение", "Common off")]);
         if (view.commonSignature !== commonSignature && !view.formDirty && !view.savePending) {
-            view.common.replaceChildren(node("h3", t("Общее выключение", "Common off")));
+            const heading = node("div", null, "device-settings-heading");
+            heading.append(node("h3", t("Общее выключение", "Common off")), window.GatewayHelp.create(
+                t("Назначьте фактическую операцию: например, реле = ложь или скорость = 0. Gateway выполняет это назначение при выключении комнаты или всех устройств и не выбирает значение по имени параметра.",
+                    "Assign the actual operation, for example relay = false or speed = 0. Gateway uses it when turning off a room or all devices; parameter names do not determine the value."),
+                t("Как работает общее выключение", "How common off works")
+            ));
+            view.common.replaceChildren(heading);
             renderCommonCommandEditor(device, view.common);
             view.commonSignature = commonSignature;
         }
@@ -605,11 +656,11 @@
         const fields = node("div", null, "management-operation-fields");
         const feedback = node("p", "", "management-feedback");
         feedback.setAttribute("aria-live", "polite");
-        const save = button(t("Сохранить", "Save"));
+        const save = window.GatewayIcons.action("save", t("Сохранить", "Save"));
         save.type = "submit";
         const actions = node("div", null, "management-dialog-actions");
         actions.append(save);
-        form.append(label(t("Что означает «выключить» для этого устройства", "What off means for this device"), mode), fields, node("p", t("Назначьте фактическую операцию: например, реле = ложь или скорость = 0. Gateway не выбирает значение по имени параметра.", "Assign the actual operation, for example relay = false or speed = 0. Gateway does not infer values from parameter names."), "management-help"), feedback, actions);
+        form.append(label(t("Действие при общем выключении", "Operation for common off"), mode), fields, feedback, actions);
         container.append(form);
         deviceSettingsDialog.feedback = feedback;
         deviceSettingsDialog.save = save;
@@ -625,7 +676,7 @@
             if (mode.value === "schema") {
                 fields.append(node("p", inherited
                     ? operationDescription(device, inherited)
-                    : t("Прошивка не объявила общее выключение. До его появления устройство не участвует.", "The firmware has not declared a common off operation. The device will not participate until one is declared."), "management-help"));
+                    : t("В прошивке не задано. Устройство пропускается при общем выключении.", "Not assigned in firmware. Common off skips this device."), "management-help"));
                 readOperation = () => null;
                 save.disabled = !online;
                 return;
@@ -911,6 +962,7 @@
                     device.health = message.health;
                     const panel = [...document.querySelectorAll(".device-panel")].find(item => item.dataset.deviceId === device.device);
                     if (panel) updateHealth(device, panel);
+                    if (deviceSettingsDialog?.device === device.device) refreshDeviceSettings();
                 }
                 return true;
             }

@@ -1,4 +1,4 @@
-"""Validation and Schema generation for the supported ESP32-S3 profile."""
+"""Board-specific hardware validation and logical Schema generation."""
 
 from copy import deepcopy
 import json
@@ -63,6 +63,40 @@ DEVICE_ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 ALLOWED_PULLS = {"none", "up", "down"}
 MAX_COMPONENTS = 8
 MAX_CONFIGURATION_BYTES = 3000
+DEFAULT_BOARD_PROFILE = "esp32-s3-devkitc-1"
+BOARD_PROFILES = {
+    DEFAULT_BOARD_PROFILE: {
+        "gpio_pins": GPIO_PINS,
+        "adc_pins": ADC_PINS,
+        "max_components": MAX_COMPONENTS,
+        "max_pwm_channels": 8,
+        "identify_gpio_pins": GPIO_PINS,
+        "identify_neopixel_pins": [38, 48],
+    },
+    "esp32-c3-supermini": {
+        # Exclude boot straps, flash, USB and UART. GPIO8 is available only
+        # as an explicitly configured indicator, never as a component pin.
+        "gpio_pins": [0, 1, 3, 4, 5, 6, 7, 10],
+        "adc_pins": [0, 1, 3, 4],
+        "max_components": MAX_COMPONENTS,
+        "max_pwm_channels": 6,
+        "identify_gpio_pins": [0, 1, 3, 4, 5, 6, 7, 8, 10],
+        "identify_neopixel_pins": [],
+    },
+}
+
+
+def supported_board_profile(board_profile):
+    return isinstance(board_profile, str) and board_profile in BOARD_PROFILES
+
+
+def public_configuration_limits(board_profile=DEFAULT_BOARD_PROFILE):
+    if not supported_board_profile(board_profile):
+        return {}
+    profile = BOARD_PROFILES[board_profile]
+    return deepcopy({key: profile[key] for key in (
+        "max_components", "max_pwm_channels", "identify_gpio_pins", "identify_neopixel_pins"
+    )})
 
 
 class ConfigurationValidationError(str):
@@ -78,21 +112,27 @@ def configuration_error(path, message):
     return None, None, ConfigurationValidationError(message, path)
 
 
-def public_driver_catalog(driver_ids):
+def public_driver_catalog(driver_ids, board_profile=DEFAULT_BOARD_PROFILE):
     """Return only known drivers actually advertised by this firmware."""
-    if not isinstance(driver_ids, list):
+    if not isinstance(driver_ids, list) or not supported_board_profile(board_profile):
         return []
     result = []
     seen = set()
     for driver_id in driver_ids:
         if isinstance(driver_id, str) and driver_id in DRIVERS and driver_id not in seen:
-            result.append(deepcopy(DRIVERS[driver_id]))
+            driver = deepcopy(DRIVERS[driver_id])
+            pins = "adc_pins" if driver_id == "analog_input" else "gpio_pins"
+            driver["pins"] = list(BOARD_PROFILES[board_profile][pins])
+            result.append(driver)
             seen.add(driver_id)
     return result
 
 
-def validate_device_configuration(configuration, driver_ids):
+def validate_device_configuration(configuration, driver_ids, board_profile=DEFAULT_BOARD_PROFILE):
     """Return (normalized_config, generated_schema, error); reject unsafe data."""
+    if not supported_board_profile(board_profile):
+        return configuration_error("board_profile", "Неподдерживаемый профиль платы.")
+    profile = BOARD_PROFILES[board_profile]
     if (
         not isinstance(configuration, dict)
         or not {"format_version", "components"}.issubset(configuration)
@@ -103,8 +143,8 @@ def validate_device_configuration(configuration, driver_ids):
         return configuration_error("format_version", "Поддерживается только версия конфигурации 1.")
 
     components = configuration.get("components")
-    if not isinstance(components, list) or len(components) > MAX_COMPONENTS:
-        return configuration_error("components", f"Можно настроить от 0 до {MAX_COMPONENTS} компонентов.")
+    if not isinstance(components, list) or len(components) > profile["max_components"]:
+        return configuration_error("components", f"Можно настроить от 0 до {profile['max_components']} компонентов.")
 
     advertised = {
         driver_id for driver_id in driver_ids
@@ -114,6 +154,7 @@ def validate_device_configuration(configuration, driver_ids):
     parameter_ids = set()
     used_pins = set()
     normalized = []
+    pwm_count = 0
     identify_indicator = configuration.get("identify_indicator")
     normalized_indicator = None
     if identify_indicator is not None:
@@ -128,10 +169,10 @@ def validate_device_configuration(configuration, driver_ids):
             if (
                 set(identify_indicator) - {"driver", "pin", "active_high", "built_in"}
                 or not {"driver", "pin", "active_high"}.issubset(identify_indicator)
-                or type(indicator_pin) is not int or indicator_pin not in GPIO_PINS
+                or type(indicator_pin) is not int or indicator_pin not in profile["identify_gpio_pins"]
                 or type(identify_indicator.get("active_high")) is not bool
             ):
-                path = "identify_indicator.pin" if type(indicator_pin) is not int or indicator_pin not in GPIO_PINS else "identify_indicator.active_high"
+                path = "identify_indicator.pin" if type(indicator_pin) is not int or indicator_pin not in profile["identify_gpio_pins"] else "identify_indicator.active_high"
                 return configuration_error(path, "GPIO identify indicator requires a supported GPIO and boolean active_high.")
             normalized_indicator = {
                 "driver": "gpio", "pin": indicator_pin,
@@ -142,12 +183,12 @@ def validate_device_configuration(configuration, driver_ids):
             if (
                 set(identify_indicator) - {"driver", "pin", "brightness", "built_in"}
                 or not {"driver", "pin", "brightness"}.issubset(identify_indicator)
-                or type(indicator_pin) is not int or indicator_pin not in (38, 48)
+                or type(indicator_pin) is not int or indicator_pin not in profile["identify_neopixel_pins"]
                 or type(identify_indicator.get("brightness")) is not int
                 or not 1 <= identify_indicator["brightness"] <= 255
             ):
-                path = "identify_indicator.pin" if type(indicator_pin) is not int or indicator_pin not in (38, 48) else "identify_indicator.brightness"
-                return configuration_error(path, "NeoPixel identify indicator requires GPIO 38 or 48 and brightness 1..255.")
+                path = "identify_indicator.pin" if type(indicator_pin) is not int or indicator_pin not in profile["identify_neopixel_pins"] else "identify_indicator.brightness"
+                return configuration_error(path, "NeoPixel identify indicator requires a supported board GPIO and brightness 1..255.")
             normalized_indicator = {
                 "driver": "neopixel", "pin": indicator_pin,
                 "brightness": identify_indicator["brightness"],
@@ -176,6 +217,10 @@ def validate_device_configuration(configuration, driver_ids):
         driver = DRIVERS.get(driver_id)
         if driver is None or driver_id not in advertised:
             return configuration_error(f"{prefix}.driver", f"Компонент {index}: прошивка не объявила драйвер {driver_id!r}.")
+        if driver_id == "pwm_output":
+            pwm_count += 1
+            if pwm_count > profile["max_pwm_channels"]:
+                return configuration_error(f"{prefix}.driver", f"Плата поддерживает не более {profile['max_pwm_channels']} PWM-каналов.")
 
         allowed_keys = {
             "id", "driver", "label", "parameter_id", "parameter_label", "pin"
@@ -213,7 +258,8 @@ def validate_device_configuration(configuration, driver_ids):
             return configuration_error(prefix, f"Компонент {component_id}: каждое название должно занимать не более 80 байт UTF-8.")
 
         pin = raw.get("pin")
-        if type(pin) is not int or pin not in driver["pins"]:
+        driver_pins = profile["adc_pins" if driver_id == "analog_input" else "gpio_pins"]
+        if type(pin) is not int or pin not in driver_pins:
             return configuration_error(f"{prefix}.pin", f"Компонент {component_id}: GPIO не поддерживается драйвером {driver_id}.")
         if pin in used_pins:
             return configuration_error(f"{prefix}.pin", f"GPIO {pin} назначен нескольким компонентам.")

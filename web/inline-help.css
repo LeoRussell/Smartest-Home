@@ -1,0 +1,83 @@
+/* Contextual help follows the classic desktop palette and stays out of flow. */
+.gateway-help {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    vertical-align: middle;
+    margin-inline-start: 5px;
+    line-height: 1;
+    font-weight: 400;
+}
+.gateway-help[hidden], .gateway-help-panel[hidden] { display: none !important; }
+body .gateway-help > .gateway-help-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    flex: 0 0 auto;
+    width: 24px;
+    min-width: 24px;
+    height: 24px;
+    min-height: 24px;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: #000080;
+    box-shadow: none;
+    cursor: help;
+    font: 700 14px Georgia, "Times New Roman", serif;
+    letter-spacing: 0;
+    text-indent: 0;
+}
+.gateway-help-trigger > span {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: 17px;
+    height: 17px;
+    border: 1.5px solid currentColor;
+    border-radius: 50%;
+    line-height: 1;
+}
+body .gateway-help > .gateway-help-trigger:hover,
+body .gateway-help > .gateway-help-trigger[aria-expanded="true"] {
+    background: #fffbe0;
+    color: #000080;
+    box-shadow: none;
+}
+body .gateway-help > .gateway-help-trigger:active { border: 0; box-shadow: none; }
+body .gateway-help > .gateway-help-trigger:focus-visible { outline: 1px dotted #111; outline-offset: 1px; }
+:is(.device-config-form > h3, .management-dialog-title, .action-dialog-form > h3) .gateway-help > .gateway-help-trigger { color: #fff; }
+:is(.device-config-form > h3, .management-dialog-title, .action-dialog-form > h3) .gateway-help > .gateway-help-trigger:hover,
+:is(.device-config-form > h3, .management-dialog-title, .action-dialog-form > h3) .gateway-help > .gateway-help-trigger[aria-expanded="true"] { color: #000080; background: #fffbe0; }
+:is(.device-config-form > h3, .management-dialog-title, .action-dialog-form > h3) .gateway-help > .gateway-help-trigger:focus-visible { outline-color: #fff; }
+.gateway-help-panel {
+    position: fixed;
+    inset: auto;
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(360px, calc(100vw - 16px));
+    margin: 0;
+    padding: 10px 12px;
+    overflow: auto;
+    border: 1px solid #111;
+    border-radius: 0;
+    background: #ffffe1;
+    color: #111;
+    box-shadow: 3px 3px 0 rgb(0 0 0 / 32%);
+    font: 400 13px/1.5 Tahoma, "MS Sans Serif", Arial, sans-serif;
+    text-align: start;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+    z-index: 1000;
+}
+.gateway-action-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.gateway-action-button > svg { display: block; flex: 0 0 auto; width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: square; stroke-linejoin: miter; }
+.gateway-action-button > [data-icon-label] { min-width: 0; }
+@media (pointer: coarse) {
+    body .gateway-help > .gateway-help-trigger { width: 30px; min-width: 30px; height: 30px; min-height: 30px; }
+}

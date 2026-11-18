@@ -57,6 +57,7 @@ void GatewayClient::begin(
                   static_cast<unsigned long>(ESP.getFreeHeap()),
                   GATEWAY_WIFI_POWER_SAVE ? "on" : "off");
     Serial.println("[NET] Connecting to Wi-Fi...");
+    Serial.printf("[NET] Gateway target ws://%s:%u/\n", gatewayIp, static_cast<unsigned int>(gatewayPort));
     webSocket_.begin(gatewayIp, gatewayPort, "/");
     webSocket_.onEvent(dispatchWebSocketEvent);
     webSocket_.setReconnectInterval(5000);

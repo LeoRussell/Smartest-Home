@@ -447,6 +447,21 @@ body.nav-side .navigation-icon {
     line-height: 1.35;
 }
 
+.device-component-title,
+.device-parameter-title {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    min-width: 0;
+}
+
+.device-component-title { margin-bottom: 2px; }
+.device-component-group .device-parameter { padding: 8px 0; gap: 8px 12px; }
+.device-component-title .device-component-heading { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.device-parameter-title .device-parameter-label { min-width: 0; overflow-wrap: anywhere; }
+.device-action-item { display: flex; align-items: center; gap: 3px; min-width: 0; max-width: 100%; }
+.device-action-item > button { max-width: 100%; white-space: normal; }
+
 .device-parameter-name {
     display: grid;
     gap: 3px;
@@ -2000,6 +2015,10 @@ body.nav-side .main-navigation {
     font-size: 14px;
 }
 
+.device-config-title { display: flex; align-items: center; gap: 8px; }
+.device-config-field-caption { display: flex; align-items: center; gap: 3px; min-height: 24px; min-width: 0; }
+.device-config-field-caption > label { min-width: 0; overflow-wrap: anywhere; }
+
 .device-config-form p {
     margin: 0;
     color: #202020;
@@ -2198,6 +2217,14 @@ body.nav-side .main-navigation {
 .device-config-files[open] > :not(summary) { margin-top: 8px; }
 .device-config-actions { position: sticky; bottom: 0; z-index: 1; flex-wrap: wrap; padding: 8px 0 0; border-top: 1px solid #808080; background: #c0c0c0; }
 .device-config-actions button { flex: 1 1 150px; }
+@media (max-width: 540px) {
+    .device-config-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .device-config-actions button { min-width: 0; white-space: normal; }
+    .device-config-actions .device-config-save { grid-column: 1 / -1; }
+    .device-config-actions button[data-compact-label] { flex-direction: column; gap: 3px; padding: 5px 3px; }
+    .device-config-actions button[data-compact-label] > [data-icon-label] { display: none; }
+    .device-config-actions button[data-compact-label]::after { content: attr(data-compact-label); font-size: 12px; }
+}
 .device-config-actions .device-config-save:hover:not(:disabled) { background: #0000a0; color: #fff; }
 .device-config-card-status { margin: 4px 0 0; color: #333; font-size: 12px; }
 .device-config-card-status[data-state="failed"] { color: #800000; font-weight: 700; }
