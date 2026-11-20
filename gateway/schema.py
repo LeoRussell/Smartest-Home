@@ -10,6 +10,12 @@ from history import valid_history_definition
 
 
 class SchemaMixin:
+    def parameter_events_enabled(self, device_id, parameter_id):
+        """Control the state journal independently of readings and automation."""
+        metadata = self.device_metadata.get(device_id) or self.load_device_metadata(device_id)
+        definition = (metadata or {}).get("schema", {}).get("parameters", {}).get(parameter_id, {})
+        return definition.get("events", True) is not False
+
     def schema_values_match(self, actual, expected):
         """Compare JSON values without treating booleans as the numbers 0 and 1."""
         pairs = [(actual, expected)]
@@ -297,7 +303,7 @@ class SchemaMixin:
         supported_types = {"boolean", "integer", "number", "string", "enum", "json"}
         allowed_parameter_fields = {
             "label", "description", "component", "type", "access", "unit",
-            "precision", "min", "max", "step", "options", "control", "history"
+            "precision", "min", "max", "step", "options", "control", "history", "events"
         }
         for key, definition in parameters.items():
             parameter_type = definition.get("type") if isinstance(definition, dict) else None
@@ -318,6 +324,9 @@ class SchemaMixin:
                 return False
 
             if not valid_history_definition(definition):
+                return False
+
+            if "events" in definition and type(definition["events"]) is not bool:
                 return False
 
             if "control" in definition:

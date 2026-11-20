@@ -9,7 +9,7 @@
 const char* const MANUAL_CONFLICTS[] = {"blink", nullptr};
 const char* const BLINK_CONFLICTS[] = {"manual", nullptr};
 const DeviceModeRegistration deviceModes[] = {
-    {"manual", "Ручной", "Постоянный свет управляется параметром «Светодиод».",
+    {"manual", "Ручной", "Постоянный свет управляется параметром «Включение».",
      MODE_CAN_SELECT, selectManualLedMode, nullptr, nullptr,
      MANUAL_CONFLICTS, "manual_active", true, manualLedModeIsActive},
     {"blink", "Мигание", "Мигает раз в секунду без блокировки связи с Gateway.",
@@ -187,6 +187,9 @@ void appendRegisteredDeviceModes(JsonObject schema) {
                 status["label"] = registration.label;
                 status["type"] = "boolean";
                 status["access"] = "read_only";
+                // A mode is a policy, not the physical output waveform.
+                // Explicitly declared status parameters keep author metadata.
+                status["history"] = false;
             }
             if (compatible) {
                 mode["status_parameter"] = registration.statusParameter;

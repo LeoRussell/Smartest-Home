@@ -216,7 +216,11 @@ class CommandsMixin:
         if result_future is not None and not result_future.done():
             result_future.set_result(dict(result_record))
         automation_state_change = pending.pop("automation_state_change", None)
-        if replayed:
+        event_history_changed = False
+        if replayed or (
+            automation_state_change is not None
+            and not self.parameter_events_enabled(pending["device"], automation_state_change["parameter"])
+        ):
             automation_state_change = None
         if (
             not replayed
@@ -224,6 +228,7 @@ class CommandsMixin:
             and self.is_automation_command(pending["command_id"], pending.get("automation_id"))
             and status in ("succeeded", "failed")
             and operation["kind"] == "parameter"
+            and self.parameter_events_enabled(pending["device"], operation["name"])
             and value is not None
             and any(
                 state_event["parameter"] == operation["name"]
@@ -237,6 +242,8 @@ class CommandsMixin:
             }
         deferred_state_events = pending.pop("deferred_state_events", [])
         for state_event in deferred_state_events:
+            if not self.parameter_events_enabled(pending["device"], state_event["parameter"]):
+                continue
             is_confirmed_command_state = (
                 not replayed
                 and status in ("succeeded", "failed")
@@ -254,6 +261,7 @@ class CommandsMixin:
                     state_event["event_value"],
                     timestamp=state_event["timestamp"]
                 )
+                event_history_changed = True
             except Exception as log_error:
                 print(f"[ОШИБКА] Не удалось сохранить изменение состояния: {log_error}")
 
@@ -275,6 +283,7 @@ class CommandsMixin:
                     state_event_type,
                     state_event_value
                 )
+                event_history_changed = True
             except Exception as log_error:
                 print(f"[ОШИБКА] Не удалось записать изменение состояния сценария: {log_error}")
 
@@ -297,7 +306,9 @@ class CommandsMixin:
                     command_event["automation_id"] = pending["automation_id"]
                     command_event["run_id"] = pending.get("automation_run_id")
                 self.save_device_event(pending["device"], "command", json.dumps(command_event, ensure_ascii=False))
-            await self.send_event_history()
+                event_history_changed = True
+            if event_history_changed:
+                await self.send_event_history()
         except Exception as log_error:
             print(f"[ОШИБКА] Не удалось сохранить результат команды: {log_error}")
 

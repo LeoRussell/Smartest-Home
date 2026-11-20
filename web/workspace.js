@@ -3,6 +3,8 @@
     "use strict";
     const LAYOUT_KEY = "iot-gateway-dashboard-v1";
     const HISTORY_RANGE_KEY = "iot-gateway-history-range-v1";
+    const HISTORY_PERIOD_KEY = "iot-gateway-history-period-v1";
+    const HISTORY_PERIODS = ["minute", "hour", "day", "week"];
     const MAX_TILES = 24;
     let context, layout = null, catalogKey = "", tileKey = "", selected = "", pending = null;
     let historyTimer = null, settingsTimer = null, settingsRequest = null, settings = null, settingsDirty = false;
@@ -10,7 +12,9 @@
     let resizeFrame = null, selectedPointTimestamp = null;
     let historyUnsupported = false;
     let showHistoryRange = false;
+    let preferredHistoryPeriod = null;
     try { showHistoryRange = localStorage.getItem(HISTORY_RANGE_KEY) === "true"; } catch (_) { /* Storage is optional. */ }
+    try { const period = localStorage.getItem(HISTORY_PERIOD_KEY); if (HISTORY_PERIODS.includes(period)) preferredHistoryPeriod = period; } catch (_) { /* Use defaults. */ }
     const tiles = new Map();
     let draggedTileKey = null, pointerDrag = null;
     const ui = {}, settingsUi = {};
@@ -35,6 +39,7 @@
     const name = device => device.display_name || device.name || device.device;
     const key = item => JSON.stringify([item.kind, item.device || "", item.id]);
     const scalar = definition => ["number", "integer", "boolean"].includes(definition?.type);
+    const historyEligible = definition => scalar(definition) && definition.history !== false && definition.history?.enabled !== false;
     const devices = () => context.getDevices();
     const id = () => window.crypto?.randomUUID?.() || `history-${Date.now()}-${Math.random()}`;
     const connected = () => context.isConnected();
@@ -345,7 +350,7 @@
                 });
             }
         }
-        if (scalar(definition)) {
+        if (historyEligible(definition)) {
             const history = window.GatewayIcons.button("chart", `${t("График показаний", "Readings chart")} · ${definition.label || item.id} · ${name(device)}`,
                 () => openHistory(item.device, item.id), "history-open-button");
             history.dataset.workspaceControl = "history"; record.tools.prepend(history);
@@ -431,11 +436,14 @@
     function buildHistory() {
         const host = document.getElementById("parameter-history-panel");
         const heading = node("h2", t("История показаний", "Parameter history")); heading.id = "history-title";
+        ui.historyHelp = window.GatewayHelp.create("", t("Как читать график", "How to read the chart"));
+        heading.append(ui.historyHelp);
         const tools = node("div", null, "history-tools");
         ui.parameter = node("select"); ui.range = node("select");
-        for (const [value, ru, en] of [["hour", "Час", "Hour"], ["day", "Сутки", "Day"], ["week", "Неделя", "Week"]]) {
+        for (const [value, ru, en] of [["minute", "Минута", "Minute"], ["hour", "Час", "Hour"], ["day", "Сутки", "Day"], ["week", "Неделя", "Week"]]) {
             const option = node("option", t(ru, en)); option.value = value; option.dataset.ru = ru; option.dataset.en = en; ui.range.append(option);
         }
+        ui.range.value = preferredHistoryPeriod || "hour";
         ui.reload = button(t("Обновить", "Refresh"), () => requestHistory());
         ui.export = button(t("Скачать CSV", "Download CSV"), exportHistory);
         tools.append(field(t("Устройство и параметр", "Device and parameter"), ui.parameter), field(t("Период", "Period"), ui.range), ui.reload, ui.export);
@@ -443,37 +451,52 @@
         ui.rangeToggle = node("input"); ui.rangeToggle.type = "checkbox"; ui.rangeToggle.checked = showHistoryRange;
         ui.rangeControl = node("label", null, "history-range-control");
         ui.rangeControl.append(ui.rangeToggle, node("span", t("Показывать колебания внутри интервала (min/max)", "Show variation within each interval (min/max)")));
-        ui.legend = node("p", "", "history-legend");
-        ui.legend.id = "history-legend";
         ui.chart = node("div", null, "history-chart");
-        ui.cursor = node("input"); ui.cursor.type = "range"; ui.cursor.min = "0"; ui.cursor.step = "1"; ui.cursor.setAttribute("aria-label", t("Выбрать точку графика", "Select chart point"));
         ui.readout = node("p", "", "history-readout"); ui.readout.setAttribute("aria-live", "polite");
+        ui.readout.id = "history-readout";
         ui.tableDetails = node("details", null, "history-table-details");
         ui.tableDetails.append(node("summary", t("Таблица показаний", "Readings table"))); ui.table = node("div", null, "history-table-scroll"); ui.tableDetails.append(ui.table);
-        host.append(heading, tools, ui.status, ui.rangeControl, ui.legend, ui.chart, ui.cursor, ui.readout, ui.tableDetails);
+        host.append(heading, tools, ui.status, ui.rangeControl, ui.chart, ui.readout, ui.tableDetails);
         ui.parameter.addEventListener("change", () => { selected = ui.parameter.value; selectedSchemaKey = selectionSchemaSignature(); requestHistory(); });
-        ui.range.addEventListener("change", () => requestHistory());
+        ui.range.addEventListener("change", () => {
+            preferredHistoryPeriod = ui.range.value;
+            try { localStorage.setItem(HISTORY_PERIOD_KEY, preferredHistoryPeriod); } catch (_) { /* Current selection still works. */ }
+            requestHistory();
+        });
         ui.rangeToggle.addEventListener("change", () => {
             showHistoryRange = ui.rangeToggle.checked;
             try { localStorage.setItem(HISTORY_RANGE_KEY, String(showHistoryRange)); } catch (_) { /* Current view still works. */ }
             renderHistory();
         });
-        ui.cursor.addEventListener("input", () => { selectedPointTimestamp = points[Number(ui.cursor.value)]?.timestamp || null; updateReadout(); });
         ui.chart.addEventListener("click", event => {
-            if (!points.length) return;
-            const svg = ui.chart.querySelector("svg"), rect = svg?.getBoundingClientRect();
-            if (!rect?.width) return;
-            const width = svg.viewBox.baseVal.width;
-            const relative = Math.max(0, Math.min(1, ((event.clientX - rect.left) / rect.width * width - 64) / (width - 80)));
-            const timestamp = Date.parse(points[0].timestamp) + relative * (Date.parse(points.at(-1).timestamp) - Date.parse(points[0].timestamp));
+            const matrix = ui.svg?.getScreenCTM();
+            if (!ui.plotPoints?.length || !matrix) return;
+            // Compare in screen pixels: SVG can be scaled and letterboxed on a narrow screen.
             let closest = 0;
-            for (let index = 1; index < points.length; index++) if (Math.abs(Date.parse(points[index].timestamp) - timestamp) < Math.abs(Date.parse(points[closest].timestamp) - timestamp)) closest = index;
-            ui.cursor.value = String(closest); selectedPointTimestamp = points[closest].timestamp; updateReadout();
+            let distance = Infinity;
+            for (const [index, point] of ui.plotPoints.entries()) {
+                const screen = new DOMPoint(point.x, point.y).matrixTransform(matrix);
+                const next = Math.hypot(screen.x - event.clientX, screen.y - event.clientY);
+                if (next < distance) { closest = index; distance = next; }
+            }
+            selectHistoryPoint(closest); ui.svg.focus({ preventScroll: true });
+        });
+        ui.chart.addEventListener("keydown", event => {
+            if (!points.length || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const current = selectedPointTimestamp == null ? points.length - 1 : points.findIndex(point => point.timestamp === selectedPointTimestamp);
+            const next = event.key === "Home" ? 0 : event.key === "End" ? points.length - 1 : current + (event.key === "ArrowLeft" ? -1 : 1);
+            selectHistoryPoint(Math.max(0, Math.min(points.length - 1, next)));
         });
     }
 
+    function selectHistoryPoint(index) {
+        selectedPointTimestamp = points[index]?.timestamp || null;
+        updateReadout();
+    }
+
     function historyCatalog() {
-        const options = choices().filter(item => item.kind === "parameter" && scalar(devices().find(device => device.device === item.device)?.schema?.parameters?.[item.id]));
+        const options = choices().filter(item => item.kind === "parameter" && historyEligible(devices().find(device => device.device === item.device)?.schema?.parameters?.[item.id]));
         const signature = JSON.stringify([context.language(), options.map(item => [item, devices().find(device => device.device === item.device)?.schema?.parameters?.[item.id]])]);
         if (signature === catalogKey) return;
         catalogKey = signature;
@@ -497,6 +520,7 @@
         if (historyUnsupported) { renderHistory(); return; }
         if (!selected || !connected()) { clearHistory(); renderHistory(); return; }
         const [, device, parameter] = JSON.parse(selected);
+        if (!preferredHistoryPeriod) ui.range.value = devices().find(item => item.device === device)?.schema?.parameters?.[parameter]?.type === "boolean" ? "minute" : "hour";
         // A previous parameter/range must not appear under a new selector while loading.
         if (response && (response.device !== device || response.parameter !== parameter || response.range !== ui.range.value)) {
             points = []; response = null; chartKey = ""; selectedPointTimestamp = null;
@@ -516,23 +540,27 @@
         ui.status.dataset.state = historyUnsupported ? "error" : historyState;
         const hasVariation = points.some(point => point.min !== point.max);
         ui.rangeControl.hidden = !points.length || !hasVariation;
-        ui.legend.hidden = !points.length;
-        ui.legend.textContent = response?.value_type === "boolean"
+        let explanation = response?.value_type === "boolean"
             ? t("Синяя линия — последнее состояние в интервале: 0 — выключено, 1 — включено.", "The blue line is the last state in each interval: 0 is off, 1 is on.")
             : t("Синяя линия — среднее значение в интервале.", "The blue line is the average value in each interval.");
-        if (hasVariation) ui.legend.textContent += showHistoryRange
+        if (response?.value_type === "boolean") explanation += t(" Для быстрых переключений выберите период «Минута»: при объединении замеров линия не показывает каждое переключение. Число замеров и min/max доступны в таблице.", "Choose Minute for rapid switching: aggregated intervals do not show every transition. Sample counts and min/max are available in the table.");
+        if (hasVariation) explanation += showHistoryRange
             ? t(" Голубые полосы — минимум и максимум внутри интервала.", " Light blue bars show the minimum and maximum within each interval.")
             : response?.value_type === "boolean"
                 ? t(" Внутри некоторых интервалов были переключения; их диапазон можно показать флажком min/max.", "Some intervals contain state changes; select min/max to see their range.")
                 : t(" Диапазон колебаний внутри интервала можно показать флажком min/max.", "Select min/max to see the variation within each interval.");
+        explanation += t(" Нажмите на график, чтобы узнать значение. С клавиатуры: ←/→, Home/End.", "Select a point to see its value. Keyboard: ←/→, Home/End.");
+        window.GatewayHelp.update(ui.historyHelp, points.length ? explanation : "", t("Как читать график", "How to read the chart"));
         const host = document.getElementById("parameter-history-panel");
         const hostStyle = getComputedStyle(host);
         const width = Math.max(160, Math.floor(ui.chart.clientWidth || host.clientWidth - parseFloat(hostStyle.paddingLeft) - parseFloat(hostStyle.paddingRight) - 4 || 800));
         const signature = JSON.stringify([context.language(), selected, ui.range.value, points, response?.unit, response?.value_type, context.timezone(), width, showHistoryRange]);
         if (chartKey === signature) return;
+        const restoreFocus = document.activeElement === ui.svg;
         chartKey = signature; ui.chart.replaceChildren(); ui.table.replaceChildren();
-        ui.cursor.hidden = ui.readout.hidden = ui.tableDetails.hidden = !points.length;
-        if (!points.length) return;
+        ui.svg = null; ui.plotPoints = []; ui.readout.textContent = "";
+        ui.readout.hidden = ui.tableDetails.hidden = !points.length;
+        if (!points.length) { selectedPointTimestamp = null; return; }
         const svgNode = (tag, attributes, text) => {
             const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
             for (const [attribute, value] of Object.entries(attributes)) element.setAttribute(attribute, value);
@@ -551,7 +579,8 @@
         const x = point => left + (finish === start ? .5 : (Date.parse(point.timestamp) - start) / (finish - start)) * (right - left);
         const y = value => 210 - (value / scale - scaledLow) / (scaledHigh - scaledLow) * 180;
         const caption = `${ui.parameter.selectedOptions[0]?.textContent || ""}${response?.unit ? ` · ${response.unit}` : ""}`;
-        const svg = svgNode("svg", { viewBox: `0 0 ${width} 260`, role: "img", "aria-describedby": "history-legend", "aria-label": caption + ". " + t("Точные значения доступны в таблице ниже.", "Exact readings are available in the table below.") });
+        const helpId = ui.historyHelp.querySelector(".gateway-help-panel").id;
+        const svg = svgNode("svg", { viewBox: `0 0 ${width} 260`, role: "group", tabindex: "0", "aria-roledescription": t("Интерактивный график", "Interactive chart"), "aria-describedby": `${helpId} history-readout`, "aria-keyshortcuts": "ArrowLeft ArrowRight Home End", "aria-label": caption });
         const axisValue = value => {
             if (Math.abs(value) >= 1e6 || value !== 0 && Math.abs(value) < .001) return value.toExponential(1);
             return new Intl.NumberFormat(context.language(), { maximumSignificantDigits: 4 }).format(value);
@@ -569,13 +598,27 @@
         if (points.length === 1) svg.append(svgNode("circle", { cx: x(points[0]), cy: y(points[0].value), r: 4, class: "history-point" }));
         const timeLabel = timestamp => new Intl.DateTimeFormat(context.language(), {
             ...(ui.range.value === "week" ? { day: "2-digit", month: "2-digit" } : { hour: "2-digit", minute: "2-digit" }),
+            ...(ui.range.value === "minute" ? { second: "2-digit" } : {}),
             ...(context.timezone() && context.timezone() !== "local" ? { timeZone: context.timezone() } : {})
         }).format(new Date(timestamp));
         svg.append(svgNode("text", { x: left, y: 240, class: "history-axis" }, timeLabel(points[0].timestamp)));
         if (points.length > 1) svg.append(svgNode("text", { x: right, y: 240, "text-anchor": "end", class: "history-axis" }, timeLabel(points.at(-1).timestamp)));
-        ui.chart.append(svg); ui.cursor.max = String(points.length - 1);
-        const pointIndex = selectedPointTimestamp && points.findIndex(point => point.timestamp === selectedPointTimestamp);
-        ui.cursor.value = String(pointIndex != null && pointIndex >= 0 ? pointIndex : points.length - 1); updateReadout();
+        ui.selection = svgNode("g", { class: "history-selection", visibility: "hidden", "aria-hidden": "true" });
+        ui.crosshair = svgNode("line", { y1: 30, y2: 210, class: "history-crosshair" });
+        ui.marker = svgNode("circle", { r: 5, class: "history-selected-point" });
+        ui.selection.append(ui.crosshair, ui.marker); svg.append(ui.selection);
+        ui.tooltip = node("div", null, "history-tooltip"); ui.tooltip.hidden = true; ui.tooltip.setAttribute("aria-hidden", "true");
+        ui.tooltipValue = node("strong"); ui.tooltipTime = node("span"); ui.tooltipRange = node("span", "", "history-tooltip-range");
+        ui.tooltip.append(ui.tooltipValue, ui.tooltipTime, ui.tooltipRange);
+        ui.svg = svg; ui.plotPoints = points.map(point => ({ x: x(point), y: y(point.value) }));
+        ui.chart.append(svg, ui.tooltip);
+        if (selectedPointTimestamp != null) {
+            const timestamp = Date.parse(selectedPointTimestamp);
+            let closest = 0;
+            for (let index = 1; index < points.length; index++) if (Math.abs(Date.parse(points[index].timestamp) - timestamp) < Math.abs(Date.parse(points[closest].timestamp) - timestamp)) closest = index;
+            selectHistoryPoint(closest);
+        }
+        if (restoreFocus) svg.focus({ preventScroll: true });
         const table = node("table");
         const tableCaption = node("caption", t("Сохранённые точки; при объединении показаны минимум и максимум интервала.", "Stored points; aggregated intervals include their minimum and maximum."));
         const head = node("thead"), row = node("tr");
@@ -586,9 +629,24 @@
     }
 
     function updateReadout() {
-        const point = points[Number(ui.cursor.value)]; if (!point) return;
-        const value = response?.value_type === "boolean" ? (point.value ? t("Вкл", "On") : t("Выкл", "Off")) : `${point.value}${response?.unit ? ` ${response.unit}` : ""}`;
-        ui.readout.textContent = `${context.formatTime(point.timestamp)} · ${value}`;
+        const index = points.findIndex(point => point.timestamp === selectedPointTimestamp);
+        const point = points[index], position = ui.plotPoints?.[index], matrix = ui.svg?.getScreenCTM();
+        if (!point || !position || !matrix) return;
+        const value = response?.value_type === "boolean" ? `${point.value ? t("Вкл", "On") : t("Выкл", "Off")} (${point.value})` : `${point.value}${response?.unit ? ` ${response.unit}` : ""}`;
+        const range = point.min !== point.max ? `${t("Мин", "Min")}: ${point.min} · ${t("Макс", "Max")}: ${point.max}` : "";
+        ui.readout.textContent = `${context.formatTime(point.timestamp)} · ${value}${range ? ` · ${range}` : ""}`;
+        ui.tooltipValue.textContent = value; ui.tooltipTime.textContent = context.formatTime(point.timestamp);
+        ui.tooltipRange.textContent = range; ui.tooltipRange.hidden = !range; ui.tooltip.hidden = false;
+        ui.selection.setAttribute("visibility", "visible");
+        ui.crosshair.setAttribute("x1", position.x); ui.crosshair.setAttribute("x2", position.x);
+        ui.marker.setAttribute("cx", position.x); ui.marker.setAttribute("cy", position.y);
+        const screen = new DOMPoint(position.x, position.y).matrixTransform(matrix), rect = ui.chart.getBoundingClientRect();
+        const x = screen.x - rect.left - ui.chart.clientLeft, y = screen.y - rect.top - ui.chart.clientTop;
+        const width = ui.tooltip.offsetWidth, height = ui.tooltip.offsetHeight, gap = 12, inset = 6;
+        const left = x + gap + width <= ui.chart.clientWidth - inset ? x + gap : x - width - gap;
+        const top = y - height - gap >= inset ? y - height - gap : y + gap;
+        ui.tooltip.style.left = `${Math.max(inset, Math.min(left, ui.chart.clientWidth - width - inset))}px`;
+        ui.tooltip.style.top = `${Math.max(inset, Math.min(top, ui.chart.clientHeight - height - inset))}px`;
     }
 
     function exportHistory() {
@@ -674,6 +732,7 @@
     }
 
     function openHistory(device, parameter) {
+        if (!historyEligible(devices().find(item => item.device === device)?.schema?.parameters?.[parameter])) return;
         selected = JSON.stringify(["parameter", device, parameter]);
         selectedSchemaKey = selectionSchemaSignature();
         context.setActivePage("overview"); historyCatalog(); ui.parameter.value = selected;
@@ -806,8 +865,14 @@
         attachDevice(device, panel) {
             for (const row of panel.querySelectorAll(".device-parameter")) {
                 const parameter = row.dataset.parameterId;
-                if (!scalar(device.schema?.parameters?.[parameter])) continue;
-                if (row.querySelector('[data-role="parameter-history"]')) continue;
+                const existing = row.querySelector('[data-role="parameter-history"]');
+                if (!historyEligible(device.schema?.parameters?.[parameter])) {
+                    existing?.remove(); row.classList.remove("has-history");
+                    const reading = row.querySelector(".device-parameter-reading");
+                    if (reading) reading.replaceWith(...reading.childNodes);
+                    continue;
+                }
+                if (existing) continue;
                 const open = window.GatewayIcons.button("chart", `${t("График показаний", "Readings chart")} · ${device.schema.parameters[parameter].label || parameter} · ${name(device)}`,
                     () => openHistory(device.device, parameter), "history-open-button");
                 open.dataset.role = "parameter-history"; open.dataset.parameterId = parameter;

@@ -160,13 +160,28 @@ async def run(options):
                         ("settings-layout-smoke.js", "runSettingsLayoutSmoke"),
                         ("connections-layout-smoke.js", "runConnectionsLayoutSmoke"),
                         ("ui-polish-smoke.js", "runContextualCardsSmoke"),
+                        ("history-chart-smoke.js", "runHistoryChartSmoke"),
                     ):
                         await browser.evaluate((Path(__file__).with_name(filename)).read_text(encoding="utf-8"))
                         print(function + ":", await browser.evaluate(function + "()"))
                     for width in (375, 320):
                         await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=1000, deviceScaleFactor=1, mobile=False)
-                        for function in ("runGatewayHelpSmoke", "runSettingsLayoutSmoke", "runConnectionsLayoutSmoke", "runContextualCardsSmoke", "runDS18B20ConfigurationSmoke", "runParameterFreshnessSmoke"):
+                        for function in ("runGatewayHelpSmoke", "runSettingsLayoutSmoke", "runConnectionsLayoutSmoke", "runContextualCardsSmoke", "runDS18B20ConfigurationSmoke", "runParameterFreshnessSmoke", "runHistoryChartSmoke"):
                             await browser.evaluate(function + "()")
+                    touch_devices = await browser.evaluate("JSON.parse(JSON.stringify(devices))")
+                    for width in (375, 320):
+                        await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=1000, deviceScaleFactor=1, mobile=False)
+                        await browser.call("Emulation.setTouchEmulationEnabled", enabled=True)
+                        target = await browser.evaluate("prepareHistoryTouchSmoke()")
+                        await browser.call("Input.dispatchTouchEvent", type="touchStart", touchPoints=[target])
+                        await browser.call("Input.dispatchTouchEvent", type="touchEnd", touchPoints=[])
+                        touch = await browser.evaluate("new Promise(resolve=>setTimeout(()=>{const tip=document.querySelector('.history-tooltip');const chart=tip.closest('.history-chart').getBoundingClientRect();const box=tip.getBoundingClientRect();resolve({visible:!tip.hidden,value:tip.querySelector('strong').textContent,inside:box.left>=chart.left&&box.right<=chart.right+.5,overflow:document.documentElement.scrollWidth>innerWidth+1})},50))")
+                        if not touch["visible"] or "(1)" not in touch["value"] or not touch["inside"] or touch["overflow"]:
+                            raise AssertionError(("Native chart touch", width, touch))
+                        await browser.call("Emulation.setTouchEmulationEnabled", enabled=False)
+                    await browser.evaluate("socket.receive({type:'device_list',devices:" + json.dumps(touch_devices) + "})")
+                    print("History period preferences:", await browser.evaluate("runHistoryPeriodPreferenceSmoke()"))
+                    print("History chart: desktop, 375/320 px and native touch passed.")
                     await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
                     print("Contextual help and modal layouts: desktop, 375 px and 320 px passed.")
                     layouts = 0
@@ -200,6 +215,8 @@ async def run(options):
                     await browser.evaluate("setActivePage('automations');document.querySelector('[data-role=discard-automation-draft]')?.click();document.getElementById('automation-name').value='Recovery smoke';document.getElementById('automation-name').dispatchEvent(new Event('input'));AutomationDraft.flush()")
                     await browser.reload()
                     await browser.ready()
+                    if not await browser.evaluate("document.querySelectorAll('.history-tools select')[1].value==='day'"):
+                        raise AssertionError("An explicit history period was lost after page reload.")
                     restored = await browser.evaluate("""(()=>{
                         setActivePage('automations');
                         const restore=document.querySelector('[data-role=restore-automation-draft]');

@@ -154,6 +154,106 @@ class EventPresenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(failures), 1)
         self.assertEqual(json.loads(failures[0]["event_value"])["status"], "failed")
 
+    def quiet_parameter_schema(self, access="read_only"):
+        schema = {"parameters": {"enabled": {
+            "type": "boolean", "access": access, "events": False,
+        }}, "actions": {}}
+        gateway.save_device_metadata("lamp", {
+            "schema": schema, "schema_version": 1, "protocol_version": 2,
+            "firmware_id": "lamp", "trust_policy": "allow",
+        })
+        return schema
+
+    async def test_silent_telemetry_keeps_state_history_freshness_and_automation(self):
+        schema = self.quiet_parameter_schema()
+        snapshots = []
+        messages = [
+            {"type": "hello", "device": "lamp", "schema": schema, "schema_version": 1},
+            {"type": "state", "device": "lamp", "data": {"parameters": {"enabled": False}}},
+            {"type": "state", "device": "lamp", "data": {"parameters": {"enabled": True}}},
+        ]
+
+        class ObservedSocket(TestSocket):
+            def __aiter__(self):
+                async def iterate():
+                    for message in messages:
+                        yield json.dumps(message)
+                        snapshots.append((message["type"], history_broadcast.await_count,
+                                          gateway.parameter_value_is_fresh("lamp", "enabled")))
+                return iterate()
+
+        with (
+            patch.object(gateway, "send_event_history") as history_broadcast,
+            patch.object(gateway, "evaluate_automations") as evaluate,
+        ):
+            await gateway.handle_client(ObservedSocket())
+        self.assertEqual([item[1] for item in snapshots], [snapshots[0][1]] * 3)
+        self.assertTrue(all(item[2] for item in snapshots if item[0] == "state"))
+        self.assertEqual(evaluate.await_args_list[-1].args,
+                         ("lamp", {"enabled": False}, {"enabled": True}))
+        self.assertFalse(any(event["event_type"] == "parameter" for event in gateway.get_event_page()[0]))
+        with gateway.database_connection() as connection:
+            state, telemetry_at = connection.execute(
+                "SELECT state_json, last_telemetry_at FROM devices WHERE device_id = 'lamp'"
+            ).fetchone()
+            readings = connection.execute(
+                "SELECT value FROM parameter_history WHERE device_id = 'lamp' ORDER BY id"
+            ).fetchall()
+        self.assertEqual(json.loads(state), {"enabled": True})
+        self.assertIsNotNone(telemetry_at)
+        self.assertEqual(readings, [(0.0,), (1.0,)])
+
+    async def test_silent_state_changes_do_not_defer_events(self):
+        self.quiet_parameter_schema()
+        gateway.save_device_state("lamp", {"enabled": False})
+        _, changed, deferred, _ = gateway.save_device_state(
+            "lamp", {"enabled": True}, defer_parameters={"enabled"}, record_telemetry=True
+        )
+        self.assertFalse(changed)
+        self.assertEqual(deferred, [])
+        self.assertEqual(gateway.get_event_page()[3], 0)
+
+    async def test_silent_scenario_result_keeps_outcome_without_state_event_or_broadcast(self):
+        self.quiet_parameter_schema(access="read_write")
+        pending = self.command("auto-silent", "scenario-id")
+        pending["browser"] = browser = TestSocket()
+        pending["result_future"] = result = asyncio.get_running_loop().create_future()
+        pending["automation_state_change"] = {"parameter": "enabled", "value": True}
+        # A deferred echo may predate a Schema change that disables events.
+        pending["deferred_state_events"] = [{
+            "parameter": "enabled", "value": False, "event_type": "parameter",
+            "event_value": json.dumps({"parameter": "enabled", "value": False}),
+            "timestamp": gateway.current_time(),
+        }]
+        with patch.object(gateway, "send_event_history") as history_broadcast:
+            await gateway.send_pending_command_result(pending, "succeeded", True, None)
+        history_broadcast.assert_not_awaited()
+        self.assertEqual(gateway.get_event_page()[3], 0)
+        self.assertEqual(result.result(), {"status": "succeeded", "value": True, "error": None})
+        self.assertEqual(browser.messages[0]["type"], "command_result")
+        self.assertTrue(browser.messages[0]["success"])
+        with gateway.database_connection() as connection:
+            self.assertEqual(connection.execute(
+                "SELECT status FROM command_queue WHERE command_id = 'auto-silent'"
+            ).fetchone()[0], "succeeded")
+
+    async def test_silent_parameters_keep_manual_outcomes_and_scenario_errors(self):
+        self.quiet_parameter_schema(access="read_write")
+        for command_id, automation_id, status in (
+            ("manual-silent", None, "succeeded"),
+            ("auto-silent-failed", "scenario-id", "failed"),
+        ):
+            pending = self.command(command_id, automation_id)
+            pending["automation_state_change"] = {"parameter": "enabled", "value": True}
+            await gateway.send_pending_command_result(
+                pending, status, True, "partially applied" if status == "failed" else None
+            )
+        events = gateway.get_event_page()[0]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(event["event_type"] == "command" for event in events))
+        self.assertEqual({json.loads(event["event_value"])["status"] for event in events},
+                         {"succeeded", "failed"})
+
     async def test_historical_visibility_counts_pagination_search_and_raw_records(self):
         rows = [
             ("command", {"command_id": "manual-1", "status": "succeeded"}),

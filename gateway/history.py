@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 DEFAULT_HISTORY_SETTINGS = {"enabled": True, "retention_days": 30, "interval_seconds": 30}
 HISTORY_MAX_SAMPLES = 250_000
-HISTORY_RANGES = {"hour": 3600, "day": 86400, "week": 604800}
+HISTORY_RANGES = {"minute": 60, "hour": 3600, "day": 86400, "week": 604800}
 HISTORY_TYPES = {"number", "integer", "boolean"}
 
 
@@ -216,7 +216,7 @@ class ParameterHistory:
             or not isinstance(period, str) or period not in HISTORY_RANGES
             or type(maximum) is not int or not 10 <= maximum <= 500
         ):
-            raise ValueError("Choose a device, parameter, range hour/day/week and max_points=10..500.")
+            raise ValueError("Choose a device, parameter, range minute/hour/day/week and max_points=10..500.")
         metadata = self.gateway.device_metadata.get(device_id) or self.gateway.load_device_metadata(device_id)
         definition = (metadata or {}).get("schema", {}).get("parameters", {}).get(parameter_id)
         if not definition or definition.get("type") not in HISTORY_TYPES:

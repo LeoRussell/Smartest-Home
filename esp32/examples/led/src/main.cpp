@@ -21,6 +21,10 @@ CommandResultCache commandCache;
 unsigned long lastStateSentAt = 0;
 uint32_t stateSequence = 0;
 bool ledState = false;
+// The command remains stable during a mode; history follows the level actually
+// written to the output, including temporary identify pulses.
+bool ledOutputState = false;
+bool ledOutputDirty = false;
 bool gatewayRegistered = false;
 bool identifyRunning = false;
 bool identifyOn = false;
@@ -45,6 +49,10 @@ void writeLedOutput(bool enabled) {
     const int inactiveLevel = LED_ACTIVE_LEVEL == HIGH ? LOW : HIGH;
     digitalWrite(LED_PIN, enabled ? LED_ACTIVE_LEVEL : inactiveLevel);
 #endif
+    if (ledOutputState != enabled) {
+        ledOutputState = enabled;
+        ledOutputDirty = true;
+    }
 }
 
 void setLedOutput(bool enabled) {
@@ -101,21 +109,22 @@ void sendHello() {
     doc["protocol_version"] = 2;
     doc["command_dedup"] = commandCache.available();
     doc["command_replay_guard"] = commandCache.available();
-    doc["firmware_version"] = "1.7.0";
-    doc["schema_version"] = 9;
+    doc["firmware_version"] = "1.8.0";
+    doc["schema_version"] = 10;
     gateway.appendHealth(doc["health"].to<JsonObject>());
 
     buildDeviceSchema(doc["schema"].to<JsonObject>());
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
-    doc["data"]["firmware"] = "1.7.0";
+    doc["data"]["firmware"] = "1.8.0";
     doc["data"]["protocol"] = 2;
 
     gateway.sendJson(doc);
 }
 
 void sendState(bool ledOn, bool logMessage = true) {
+    if (!gatewayRegistered || !gateway.isConnected()) return;
     JsonDocument doc;
 
     doc["type"] = "state";
@@ -124,11 +133,13 @@ void sendState(bool ledOn, bool logMessage = true) {
     gateway.appendHealth(doc["health"].to<JsonObject>());
     JsonObject parameters = doc["data"]["parameters"].to<JsonObject>();
     parameters["led"] = ledOn;
+    parameters["led_output"] = ledOutputState;
     appendRegisteredDeviceModeStates(parameters);
 
     String message;
     serializeJson(doc, message);
-    gateway.sendText(message);
+    if (!gateway.sendText(message)) return;
+    ledOutputDirty = false;
 
     if (logMessage) {
         Serial.print("State sent: ");
@@ -432,8 +443,10 @@ void loop() {
     }
     if (
         gatewayRegistered && gateway.isConnected() &&
-        now - lastStateSentAt >= STATE_INTERVAL_MS
+        (ledOutputDirty || now - lastStateSentAt >= STATE_INTERVAL_MS)
     ) {
+        // Send every driven edge rather than sampling a blink at heartbeat rate.
+        // Unchanged logical `led` values do not restart its saved automations.
         sendState(ledState, false);
         lastStateSentAt = now;
     }

@@ -1,36 +1,48 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-11-20T03:41:55+03:00",
-  "device_id": "esp32-01",
-  "schema_version": 9,
-  "firmware_version": "1.7.0",
+  "exported_at": "2026-11-20T23:34:38+03:00",
+  "device_id": "esp32-01-led",
+  "schema_version": 10,
+  "firmware_version": "1.8.0",
   "schema": {
     "format_version": 1,
     "components": {
       "status_led": {
-        "label": "Встроенный светодиод",
+        "label": "Светодиод",
         "category": "actuator",
-        "description": "Индикатор платы, управляемый прошивкой."
+        "description": "Светодиод, подключённый к выходу, указанному в профиле платы."
       }
     },
     "parameters": {
       "led": {
-        "label": "Светодиод",
+        "label": "Включение",
         "component": "status_led",
         "type": "boolean",
         "access": "read_write",
-        "control": "toggle"
+        "control": "toggle",
+        "history": false
+      },
+      "led_output": {
+        "label": "Светодиод",
+        "component": "status_led",
+        "description": "Фактическое состояние выхода: 1 — включён, 0 — выключен.",
+        "type": "boolean",
+        "access": "read_only",
+        "history": true,
+        "events": false
       },
       "manual_active": {
         "label": "Ручной",
         "type": "boolean",
-        "access": "read_only"
+        "access": "read_only",
+        "history": false
       },
       "blink_active": {
         "label": "Мигание",
         "type": "boolean",
-        "access": "read_only"
+        "access": "read_only",
+        "history": false
       }
     },
     "common_commands": {
@@ -43,11 +55,11 @@
     "actions": {
       "identify": {
         "label": "Найти устройство",
-        "description": "Пять раз мигает встроенным индикатором."
+        "description": "Пять раз мигает подключённым светодиодом."
       },
       "mode_manual_select": {
         "label": "Выбрать режим",
-        "description": "Постоянный свет управляется параметром «Светодиод»."
+        "description": "Постоянный свет управляется параметром «Включение»."
       },
       "mode_blink_select": {
         "label": "Выбрать режим",
@@ -69,7 +81,7 @@
     "modes": {
       "manual": {
         "label": "Ручной",
-        "description": "Постоянный свет управляется параметром «Светодиод».",
+        "description": "Постоянный свет управляется параметром «Включение».",
         "operations": {
           "select": "mode_manual_select"
         },

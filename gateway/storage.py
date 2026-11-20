@@ -1550,6 +1550,7 @@ class StorageMixin:
                 if (
                     parameter_id not in saved_parameters
                     or self.schema_values_match(saved_parameters[parameter_id], value)
+                    or not self.parameter_events_enabled(device_id, parameter_id)
                 ):
                     continue
 

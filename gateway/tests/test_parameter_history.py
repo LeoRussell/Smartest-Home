@@ -108,6 +108,32 @@ class ParameterHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.schema["parameters"]["note"]["history"] = False
         self.assertTrue(self.gateway.validate_schema(self.schema))
 
+    def test_schema_event_flag_is_optional_and_strictly_boolean(self):
+        self.assertTrue(self.gateway.validate_schema(self.schema))
+        for option in (True, False):
+            schema = copy.deepcopy(self.schema)
+            schema["parameters"]["enabled"]["events"] = option
+            self.assertTrue(self.gateway.validate_schema(schema), option)
+        for option in (None, 0, 1, "false", {}, []):
+            schema = copy.deepcopy(self.schema)
+            schema["parameters"]["enabled"]["events"] = option
+            self.assertFalse(self.gateway.validate_schema(schema), option)
+
+    def test_minute_range_preserves_half_second_boolean_edges(self):
+        self.schema["parameters"]["enabled"]["events"] = False
+        for index in range(120):
+            self.history.record("sensor", {"enabled": bool(index % 2)},
+                                sampled_at=self.now - 59.75 + index * 0.5)
+        response = self.history.query({
+            "device": "sensor", "parameter": "enabled", "range": "minute", "max_points": 360,
+        })
+        self.assertEqual(response["range"], "minute")
+        self.assertEqual(len(response["points"]), 120)
+        self.assertEqual([point["value"] for point in response["points"]],
+                         [index % 2 for index in range(120)])
+        self.assertTrue(all(point["count"] == 1 and point["min"] == point["max"]
+                            for point in response["points"]))
+
     def test_downsampling_preserves_extrema_count_and_boolean_last_value(self):
         self.history.save_settings({"enabled": True, "retention_days": 30, "interval_seconds": 1})
         for index in range(120):
