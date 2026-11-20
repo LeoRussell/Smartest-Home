@@ -405,6 +405,11 @@
         const definition = device?.schema?.parameters?.[item.id];
         const value = device?.parameters?.[item.id];
         record.value.textContent = definition ? context.formatValue(value, definition) : "—";
+        const freshness = context.parameterFreshness?.(device, item.id);
+        record.status.dataset.readingState = freshness?.state || "legacy";
+        if (freshness && freshness.state !== "fresh" && connected() && device?.connected) {
+            record.status.textContent = freshness.label;
+        }
         const busy = context.commandBusy(item.device, item.id);
         if (busy && connected()) record.status.textContent = t("Ожидается подтверждение команды…", "Waiting for command confirmation…");
         if (record.toggle) {
@@ -812,6 +817,9 @@
                 const reading = node("div", null, "device-parameter-reading");
                 value.replaceWith(reading); reading.append(value, open);
             }
+        },
+        refreshReadings() {
+            if (context) for (const record of tiles.values()) updateTile(record);
         },
         refresh, openHistory
     };

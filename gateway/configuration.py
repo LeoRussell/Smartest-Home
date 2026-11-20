@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 from websockets.exceptions import ConnectionClosed
-from device_configuration import validate_device_configuration
+from device_configuration import driver_requires_initial_sample, validate_device_configuration
 
 
 class ConfigurationMixin:
@@ -22,10 +22,35 @@ class ConfigurationMixin:
 
 
     def device_configuration_is_pending(self, device_id):
-        return device_id in self.configuration_apply_tasks or (
-            device_id in self.deferred_connection_automations
-            and self.device_metadata.get(device_id, {}).get("device_profile") == "universal"
-        )
+        if device_id in self.configuration_apply_tasks:
+            return True
+        metadata = self.device_metadata.get(device_id, {})
+        if (
+            device_id not in self.deferred_connection_automations
+            or metadata.get("device_profile") != "universal"
+        ):
+            return False
+        if device_id not in self.configuration_confirmed_devices:
+            return True
+
+        parameters = set(metadata.get("schema", {}).get("parameters", {}))
+        record = self.load_device_configuration(device_id)
+        if record is not None:
+            # Only the configuration confirmed in this session may exempt an
+            # optional sensor. A newer pending document is not the active one.
+            if (
+                record["status"] != "applied"
+                or record["config_version"] != record["applied_version"]
+                or record["config_version"] != metadata.get("schema_version")
+            ):
+                return True
+            optional = {
+                component["parameter_id"]
+                for component in record["config"].get("components", [])
+                if not driver_requires_initial_sample(component.get("driver"))
+            }
+            parameters.difference_update(optional)
+        return not all(self.parameter_value_is_fresh(device_id, key) for key in parameters)
 
 
     async def resume_device_configuration(self, device_id):
@@ -33,13 +58,18 @@ class ConfigurationMixin:
             return
         connected_event_pending = device_id in self.deferred_connection_automations
         if connected_event_pending:
-            if device_id not in self.configuration_confirmed_devices:
+            if self.device_configuration_is_pending(device_id):
                 return
+        # Missing optional sensor data must not hold all output controls or a
+        # recoverable manual command forever after the configuration ACK.
+        await self.deliver_queued_commands(device_id)
+        if connected_event_pending:
             parameters = self.device_metadata.get(device_id, {}).get("schema", {}).get("parameters", {})
             if not all(self.parameter_value_is_fresh(device_id, parameter) for parameter in parameters):
                 return
+            if device_id not in self.deferred_connection_automations:
+                return
             self.deferred_connection_automations.discard(device_id)
-        await self.deliver_queued_commands(device_id)
         if connected_event_pending and self.device_is_connected(device_id):
             self.fire_automation_event("device_connected", device_id)
 

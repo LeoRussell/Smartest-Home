@@ -66,6 +66,7 @@ let deviceSort = ["recent", "name", "status"].includes(storedDeviceSort)
     ? storedDeviceSort
     : "recent";
 const deviceDrafts = new Map();
+const parameterAgeSnapshots = new WeakMap();
 let overviewRenderSignature = "";
 
 const savedUiSettings = readLocalState(UI_SETTINGS_KEY, {});
@@ -2442,6 +2443,7 @@ function handleGatewayMessage(message) {
             devices = Array.isArray(message.devices)
                 ? message.devices
                 : [];
+            for (const device of devices) rememberParameterAges(device, device);
 
             deviceConfigurationDialog?.configurationEditor?.refreshSavedState();
             renderDevices();
@@ -2590,6 +2592,7 @@ function handleGatewayMessage(message) {
 
                 devices.push(device);
             }
+            rememberParameterAges(device, message);
 
             if (isNewDevice) {
                 renderDevices();
@@ -3990,7 +3993,7 @@ function renderDevices() {
             currentValue.className = "device-parameter-value";
             currentValue.dataset.role = "parameter-value";
             currentValue.dataset.parameterId = parameterId;
-            currentValue.textContent = formatDisplayedParameterValue(value, definition);
+            updateParameterValueNode(currentValue, device, parameterId, definition);
 
             parameter.append(labelBlock, currentValue);
 
@@ -4244,7 +4247,73 @@ function renderDevices() {
     restoreFocus();
 }
 
+function rememberParameterAges(device, message) {
+    if (!Object.prototype.hasOwnProperty.call(message, "parameter_ages_seconds")) return;
+    const ages = message.parameter_ages_seconds;
+    device.parameter_ages_seconds = ages && typeof ages === "object" && !Array.isArray(ages)
+        ? { ...ages } : {};
+    parameterAgeSnapshots.set(device, { receivedAt: Date.now(), ages: device.parameter_ages_seconds });
+}
+
+function parameterTelemetryFreshness(device, parameterId) {
+    // An omitted field identifies an older Gateway. Preserve its presentation.
+    if (!device || !Object.prototype.hasOwnProperty.call(device, "parameter_ages_seconds")) return null;
+    if (!parameterAgeSnapshots.has(device)) rememberParameterAges(device, device);
+    const snapshot = parameterAgeSnapshots.get(device);
+    const reportedAge = snapshot.ages[parameterId];
+    if (!device.connected || !isGatewayConnected() || typeof reportedAge !== "number" || !Number.isFinite(reportedAge) || reportedAge < 0) {
+        return { state: "unknown", label: localized("Нет свежих показаний", "No fresh readings"), ageSeconds: null };
+    }
+    const ageSeconds = reportedAge + Math.max(0, (Date.now() - snapshot.receivedAt) / 1000);
+    const staleAfter = Number(device.telemetry_stale_after_seconds) || 45;
+    return {
+        state: ageSeconds > staleAfter ? "stale" : "fresh",
+        label: ageSeconds > staleAfter ? localized("Устарело", "Stale") : "",
+        ageSeconds
+    };
+}
+
+function updateParameterValueNode(valueNode, device, parameterId, definition) {
+    const formatted = formatDisplayedParameterValue(device.parameters?.[parameterId], definition);
+    const freshness = parameterTelemetryFreshness(device, parameterId);
+    valueNode.dataset.readingState = freshness?.state || "legacy";
+    if (!freshness || freshness.state === "fresh") {
+        if (valueNode.textContent !== formatted || valueNode.childElementCount) valueNode.textContent = formatted;
+        valueNode.removeAttribute("title");
+        return;
+    }
+    let value = valueNode.querySelector('[data-role="parameter-value-text"]');
+    let status = valueNode.querySelector('[data-role="parameter-freshness"]');
+    if (!value || !status) {
+        value = document.createElement("span");
+        value.dataset.role = "parameter-value-text";
+        status = document.createElement("small");
+        status.dataset.role = "parameter-freshness";
+        status.className = "parameter-reading-status";
+        valueNode.replaceChildren(value, status);
+    }
+    value.textContent = formatted;
+    status.textContent = freshness.label;
+    if (freshness.ageSeconds !== null) valueNode.title = localized(
+        `Последнее показание: ${formatDatabaseDuration(Math.floor(freshness.ageSeconds))} назад.`,
+        `Last reading: ${formatDatabaseDuration(Math.floor(freshness.ageSeconds))} ago.`
+    );
+    else valueNode.title = localized("В текущем подключении нет свежего показания; показано последнее известное значение.", "No fresh reading in this connection; showing the last known value.");
+}
+
 function deviceTelemetryFreshness(device) {
+    const parameterIds = Object.keys(device.schema?.parameters || {});
+    if (parameterIds.length && Object.prototype.hasOwnProperty.call(device, "parameter_ages_seconds")) {
+        const states = parameterIds.map(parameter => parameterTelemetryFreshness(device, parameter));
+        const unavailable = states.filter(item => item.state !== "fresh");
+        if (unavailable.length) return {
+            state: unavailable.some(item => item.state === "stale") ? "stale" : "unknown",
+            label: unavailable.length === states.length
+                ? localized("Нет свежих показаний", "No fresh readings")
+                : localized(`Нет свежих показаний: ${unavailable.length} из ${states.length}`, `No fresh readings: ${unavailable.length} of ${states.length}`)
+        };
+        return { state: "fresh", label: localized("Все показания свежие", "All readings are fresh") };
+    }
     const timestamp = Date.parse(device.last_telemetry_at || "");
     if (!Number.isFinite(timestamp)) {
         return {
@@ -4291,8 +4360,14 @@ function updateDeviceFreshnessHints() {
         if (panel) {
             updateDeviceHint(device, panel);
             window.DeviceManagement?.updateHealth(device, panel);
+            for (const node of panel.querySelectorAll('[data-role="parameter-value"]')) {
+                const parameterId = node.dataset.parameterId;
+                const definition = device.schema?.parameters?.[parameterId];
+                if (definition) updateParameterValueNode(node, device, parameterId, definition);
+            }
         }
     }
+    window.GatewayWorkspace?.refreshReadings();
 }
 
 function updateDevicePanel(device, deferViews = false) {
@@ -4312,10 +4387,8 @@ function updateDevicePanel(device, deferViews = false) {
     for (const valueNode of panel.querySelectorAll('[data-role="parameter-value"]')) {
         const parameterId = valueNode.dataset.parameterId;
         const definition = device.schema?.parameters?.[parameterId];
-        valueNode.textContent = formatDisplayedParameterValue(
-            device.parameters?.[parameterId],
-            definition || { type: typeof device.parameters?.[parameterId] }
-        );
+        updateParameterValueNode(valueNode, device, parameterId,
+            definition || { type: typeof device.parameters?.[parameterId] });
     }
 
     for (const input of panel.querySelectorAll('[data-role="parameter-input"]')) {
@@ -5486,6 +5559,10 @@ function openDeviceConfigurationDialog(device) {
             component.min_value ??= 0;
             component.max_value ??= 255;
         }
+        if (component.driver === "ds18b20") {
+            component.interval_ms ??= 2000;
+            component.unit ??= "°C";
+        }
     }
     const dialog = document.createElement("dialog");
     dialog.className = "action-dialog device-config-dialog";
@@ -5532,6 +5609,7 @@ function openDeviceConfigurationDialog(device) {
         { id: "relay", driver: "gpio_output", label: localized("Реле", "Relay"), parameter: localized("Включено", "Enabled") },
         { id: "button", driver: "digital_input", label: localized("Кнопка", "Button"), parameter: localized("Сигнал кнопки", "Button signal") },
         { id: "sensor", driver: "analog_input", label: localized("Аналоговый датчик (ADC)", "Analog sensor (ADC)"), parameter: localized("Показание датчика", "Sensor reading") },
+        { id: "temperature", driver: "ds18b20", label: localized("Температура DS18B20", "DS18B20 temperature"), parameter: localized("Температура", "Temperature") },
         { id: "brightness", driver: "pwm_output", label: localized("Яркость (PWM)", "Brightness (PWM)"), parameter: localized("Яркость", "Brightness") }
     ].filter(preset => drivers.some(driver => driver.id === preset.driver));
     const addRow = document.createElement("div");
@@ -5646,6 +5724,7 @@ function openDeviceConfigurationDialog(device) {
         if (options.min !== undefined) input.min = String(options.min);
         if (options.max !== undefined) input.max = String(options.max);
         if (options.step !== undefined) input.step = String(options.step);
+        if (options.readOnly) input.readOnly = true;
         if (type === "select" && options.required && !options.boolean) {
             const empty = document.createElement("option");
             empty.value = "";
@@ -5708,6 +5787,7 @@ function openDeviceConfigurationDialog(device) {
                     value_min: 0, value_max: 4095
                 }
                 : {}),
+            ...(driver.id === "ds18b20" ? { interval_ms: 2000, unit: "°C" } : {}),
             ...(driver.id === "pwm_output"
                 ? { initial_value: 0, min_value: 0, max_value: 255 }
                 : {})
@@ -5738,6 +5818,9 @@ function openDeviceConfigurationDialog(device) {
                     replacement.id = component.id;
                     replacement.parameter_id = component.parameter_id;
                     replacement.parameter_label = component.parameter_label;
+                    if (drivers.find(item => item.id === value)?.pins?.includes(component.pin)
+                        && !components.some((other, otherIndex) => otherIndex !== index && other.pin === component.pin)
+                        && identifyIndicator?.pin !== component.pin) replacement.pin = component.pin;
                     components[index] = replacement;
                     renderComponents();
                 },
@@ -5848,6 +5931,16 @@ function openDeviceConfigurationDialog(device) {
                     localized("Единица измерения", "Unit"), component.unit, "text",
                     value => { component.unit = value; }, { key: "unit", maxLength: 24 }
                 ));
+            } else if (component.driver === "ds18b20") {
+                component.interval_ms ??= 2000;
+                component.unit ??= "°C";
+                fields.appendChild(field(
+                    localized("Единица измерения", "Unit"), component.unit, "text",
+                    () => {}, {
+                        key: "unit", readOnly: true,
+                        help: localized("DS18B20 передаёт температуру в °C. Аналоговая калибровка и подстановка другой единицы не требуются.", "DS18B20 reports temperature in °C. ADC calibration and another unit label are not needed.")
+                    }
+                ));
             }
 
             if (component.driver === "gpio_output") {
@@ -5887,6 +5980,14 @@ function openDeviceConfigurationDialog(device) {
                     localized("Опрос, мс", "Polling interval, ms"), component.interval_ms,
                     "number", value => { component.interval_ms = value; },
                     { key: "interval_ms", number: true, min: 250, max: 60000, step: 1, required: true }
+                ));
+            } else if (component.driver === "ds18b20") {
+                fields.appendChild(field(
+                    localized("Опрос, мс", "Polling interval, ms"), component.interval_ms,
+                    "number", value => { component.interval_ms = value; }, {
+                        key: "interval_ms", number: true, min: 1000, max: 3600000, step: 1, required: true,
+                        help: localized("Интервал между измерениями: 1000–3600000 мс. Преобразование занимает до 750 мс и выполняется без остановки связи с Gateway.", "Measurement interval: 1000–3600000 ms. Conversion takes up to 750 ms without stopping communication with Gateway.")
+                    }
                 ));
             } else if (component.driver === "pwm_output") {
                 fields.appendChild(field(
@@ -6047,6 +6148,9 @@ function openDeviceConfigurationDialog(device) {
                     base.raw_max = component.raw_max ?? 4095;
                     base.value_min = component.value_min ?? 0;
                     base.value_max = component.value_max ?? 4095;
+                } else if (component.driver === "ds18b20") {
+                    base.interval_ms = component.interval_ms ?? 2000;
+                    base.unit = component.unit ?? "°C";
                 } else if (component.driver === "pwm_output") {
                     base.initial_value = component.initial_value;
                     base.min_value = component.min_value ?? 0;
@@ -6075,6 +6179,7 @@ function openDeviceConfigurationDialog(device) {
             gpio_output: localized("Цифровой выход", "Digital output"),
             digital_input: localized("Цифровой вход", "Digital input"),
             analog_input: localized("Аналоговый вход (ADC)", "Analog input (ADC)"),
+            ds18b20: localized("Температура DS18B20 (1-Wire)", "DS18B20 temperature (1-Wire)"),
             pwm_output: localized("PWM-выход", "PWM output")
         };
         return labels[id] || drivers.find(driver => driver.id === id)?.label || id;
@@ -6085,6 +6190,7 @@ function openDeviceConfigurationDialog(device) {
             gpio_output: localized("Для обычного светодиода или управляющего входа реле. Выберите GPIO и проверьте, какой уровень включает компонент: HIGH или LOW.", "For a regular LED or relay control input. Choose a GPIO and the active HIGH or LOW level."),
             digital_input: localized("Считывает электрический уровень 0/1. При Pull-up кнопка между GPIO и GND даёт 0 при нажатии. Интервал опроса определяет, какие нажатия успеет заметить устройство.", "Reads the electrical 0/1 level. With pull-up, a button between GPIO and GND reads 0 when pressed. The polling interval determines which presses the device can detect."),
             analog_input: localized("Считывает ADC и линейно переводит исходный диапазон в итоговый. Название единицы само по себе не измеряет люксы или температуру: диапазоны нужно откалибровать для вашего датчика.", "Reads ADC and maps the raw range linearly to the output range. A unit label does not measure lux or temperature by itself: calibrate the ranges for your sensor."),
+            ds18b20: localized("Один DS18B20 на выбранном GPIO: DATA — к GPIO, VDD — к 3.3 V, GND — к общей земле. Нужна внешняя подтяжка 4.7 кОм между DATA и 3.3 V; у готового модуля она может быть установлена. Паразитное питание не поддерживается. Измеряет −55…125 °C по 1-Wire; это не аналоговый вход.", "One DS18B20 on the selected GPIO: DATA to GPIO, VDD to 3.3 V, GND to common ground. Use an external 4.7 kΩ pull-up from DATA to 3.3 V; a module may already include it. Parasitic power is not supported. Measures −55…125 °C over 1-Wire; this is not an ADC input."),
             pwm_output: localized("Регулирует заполнение PWM в диапазоне 0–255. Подходит для яркости совместимой нагрузки; минимальное и максимальное значения задают доступный пользователю диапазон.", "Controls PWM duty within 0–255. Use it for compatible brightness control; the minimum and maximum define the range available to the user.")
         };
         return descriptions[id] || "";
@@ -6175,6 +6281,9 @@ function openDeviceConfigurationDialog(device) {
             }
             if (component.driver === "pwm_output" && (component.initial_value < component.min_value || component.initial_value > component.max_value)) {
                 addError(`${path}.initial_value`, localized("Начальное значение должно быть внутри выбранного диапазона.", "The initial value must be within the selected range."));
+            }
+            if (component.driver === "ds18b20" && component.unit !== "°C") {
+                addError(`${path}.unit`, localized("DS18B20 поддерживает только °C. Исправьте единицу в импортируемом JSON.", "DS18B20 supports only °C. Correct the unit in the imported JSON."));
             }
         });
         if (components.length > maxComponents) addError("components", localized(`Плата поддерживает не более ${maxComponents} компонентов.`, `This board supports at most ${maxComponents} components.`));
@@ -6275,6 +6384,8 @@ function openDeviceConfigurationDialog(device) {
                 value.append(`${component.initial_value ?? "—"} (${component.min_value ?? 0}…${component.max_value ?? 255})`);
             } else if (component.driver === "analog_input") {
                 value.textContent = `${component.value_min ?? 0}…${component.value_max ?? 4095} ${String(component.unit || "raw")} · ` + localized("только чтение", "read only");
+            } else if (component.driver === "ds18b20") {
+                value.textContent = "−55…125 °C · " + localized("только чтение", "read only");
             } else value.textContent = localized("Сигнал 0/1 · только чтение", "Signal 0/1 · read only");
             item.append(name, metadata, value);
             list.append(item);
@@ -6972,6 +7083,7 @@ window.GatewayWorkspace?.initialize({
     isConnected: isGatewayConnected, activePage: () => activePage, setActivePage,
     send: sendGatewayAction, labelDialog,
     formatValue: formatDisplayedParameterValue, formatTime: formatEventTime,
+    parameterFreshness: parameterTelemetryFreshness,
     command: sendParameterCommand, commandBusy: hasPendingParameterCommand,
     actionBusy: (device, action) => Boolean(findPendingCommand(device, "actionId", action)),
     canControl: device => device.connected && isGatewayConnected() && !device.pending_schema && !isDeviceConfigurationBusy(device),

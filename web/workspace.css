@@ -25,6 +25,7 @@
 .workspace-tile-value[hidden] { display: none; }
 .workspace-tile-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: auto; }
 .workspace-tile-status { margin-top: 10px; color: #333; font-size: 12px; }
+.workspace-tile-status:is([data-reading-state="stale"], [data-reading-state="unknown"]) { color: #800000; font-weight: 700; }
 .workspace-tile[data-online="false"] { border-left-color: #808080; }
 .workspace-tile .workspace-primary { background: #216b21; color: #fff; font-weight: 700; }
 .workspace-tile .workspace-primary:disabled { background: #c0c0c0; color: #555; }

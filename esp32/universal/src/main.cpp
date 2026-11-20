@@ -7,7 +7,7 @@
 
 namespace {
 constexpr uint16_t GATEWAY_PORT = 8765;
-constexpr char FIRMWARE_VERSION[] = "1.0.3";
+constexpr char FIRMWARE_VERSION[] = "1.1.0";
 
 GatewayClient gateway;
 UniversalDevice device;
@@ -33,6 +33,7 @@ void sendHello() {
     driverCatalog.add("digital_input");
     driverCatalog.add("analog_input");
     driverCatalog.add("pwm_output");
+    driverCatalog.add("ds18b20");
     message["schema_version"] = device.configurationVersion() == 0
         ? 1 : device.configurationVersion();
     JsonObject schema = message["schema"].to<JsonObject>();
@@ -58,7 +59,7 @@ void onGatewayEvent(WStype_t type, uint8_t* payload, size_t length) {
             if (message["type"] == "hello_ack") {
                 gateway.setGatewayDeviceId(message["device"]);
                 gatewayRegistered = true;
-                device.sendState(gateway);
+                device.onGatewayRegistered(gateway);
             } else if (gatewayRegistered) {
                 device.handleMessage(message, gateway);
             }

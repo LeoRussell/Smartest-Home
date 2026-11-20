@@ -8,6 +8,7 @@
 #include "secrets.h"
 #include <GatewayClient.h>
 #include "DeviceModes.h"
+#include "LedModes.h"
 #include "DeviceSchema.h"
 #include <CommandResultCache.h>
 
@@ -48,14 +49,14 @@ void writeLedOutput(bool enabled) {
 
 void setLedOutput(bool enabled) {
     ledState = enabled;
-    if (!identifyRunning) writeLedOutput(enabled);
+    if (!identifyRunning) writeLedOutput(ledModeOutput(enabled));
 }
 
 void startIdentify() {
     identifyPulsesRemaining = IDENTIFY_PULSE_COUNT;
     identifyRunning = identifyPulsesRemaining > 0;
     identifyOn = identifyRunning;
-    writeLedOutput(identifyRunning ? true : ledState);
+    writeLedOutput(identifyRunning ? true : ledModeOutput(ledState));
     identifyNextAt = millis() + IDENTIFY_PULSE_DURATION_MS;
 }
 
@@ -64,7 +65,7 @@ void updateIdentify() {
     identifyOn = !identifyOn;
     if (!identifyOn && --identifyPulsesRemaining == 0) {
         identifyRunning = false;
-        writeLedOutput(ledState);
+        writeLedOutput(ledModeOutput(ledState));
         Serial.println("[IDENTIFY] complete");
         return;
     }
@@ -100,15 +101,15 @@ void sendHello() {
     doc["protocol_version"] = 2;
     doc["command_dedup"] = commandCache.available();
     doc["command_replay_guard"] = commandCache.available();
-    doc["firmware_version"] = "1.6.1";
-    doc["schema_version"] = 8;
+    doc["firmware_version"] = "1.7.0";
+    doc["schema_version"] = 9;
     gateway.appendHealth(doc["health"].to<JsonObject>());
 
     buildDeviceSchema(doc["schema"].to<JsonObject>());
 
     // Оставляем прежние поля для устройств и Gateway старой версии.
     doc["data"]["model"] = DEVICE_MODEL;
-    doc["data"]["firmware"] = "1.6.1";
+    doc["data"]["firmware"] = "1.7.0";
     doc["data"]["protocol"] = 2;
 
     gateway.sendJson(doc);
@@ -322,6 +323,9 @@ void onWebSocketEvent(
                             action, modeError
                         );
                         if (success) {
+                            // The mode callback owns its policy; the physical
+                            // phase remains subordinate to an active identify.
+                            setLedOutput(ledState);
                             sendState(ledState, false);
                             lastStateSentAt = millis();
                         }
@@ -347,6 +351,7 @@ void onWebSocketEvent(
                         break;
                     }
                     const bool value = requestedValue.as<bool>();
+                    stopLedModeForManualControl();
                     setLedOutput(value);
                     const bool appliedValue = ledState;
 
@@ -365,6 +370,9 @@ void onWebSocketEvent(
                         true,
                         appliedValue
                     );
+                    // Manual writes also leave blink mode. Report its status
+                    // immediately instead of waiting for the 10-second heartbeat.
+                    sendState(ledState, false);
                 } else {
                     sendCommandResult(
                         commandId,
@@ -403,6 +411,7 @@ void setup() {
         Serial.println("[COMMAND] Durable cache unavailable; new hardware commands will be rejected.");
     }
     initializeLedOutput();
+    initializeLedModes(setLedOutput);
 
     gateway.begin(
         GATEWAY_IP,
@@ -415,8 +424,12 @@ void setup() {
 
 void loop() {
     gateway.loop();
-    updateIdentify();
     const unsigned long now = millis();
+    const bool modeOutputChanged = updateLedModes(now);
+    updateIdentify();
+    if (modeOutputChanged && !identifyRunning) {
+        writeLedOutput(ledModeOutput(ledState));
+    }
     if (
         gatewayRegistered && gateway.isConnected() &&
         now - lastStateSentAt >= STATE_INTERVAL_MS

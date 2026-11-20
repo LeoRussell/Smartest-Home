@@ -1886,6 +1886,7 @@ class StorageMixin:
                 "last_telemetry_at": row["last_telemetry_at"],
                 "telemetry_stale_after_seconds": self.DEVICE_STALE_SECONDS,
                 "parameters": parameters,
+                "parameter_ages_seconds": self.parameter_ages_seconds(device_id, metadata["schema"]),
                 "schema": metadata["schema"],
                 "protocol_version": metadata.get("protocol_version"),
                 "firmware_version": metadata.get("firmware_version"),
@@ -1910,7 +1911,7 @@ class StorageMixin:
                 "configuration_applied_version": configurations.get(device_id, {}).get("applied_version", 0),
                 "configuration_updated_at": configurations.get(device_id, {}).get("updated_at"),
                 "configuration_applied_at": configurations.get(device_id, {}).get("applied_at"),
-                "configuration_sync_pending": device_id in self.deferred_connection_automations and metadata.get("device_profile") == "universal",
+                "configuration_sync_pending": self.device_configuration_is_pending(device_id),
                 "configuration_status": configurations.get(device_id, {}).get(
                     "status", "not_configured" if metadata.get("device_profile") == "universal" else None
                 ),
@@ -1933,6 +1934,7 @@ class StorageMixin:
                     "last_telemetry_at": None,
                     "telemetry_stale_after_seconds": self.DEVICE_STALE_SECONDS,
                     "parameters": self.device_states.get(device_id, {}),
+                    "parameter_ages_seconds": self.parameter_ages_seconds(device_id, metadata["schema"]),
                     "schema": metadata["schema"],
                     "protocol_version": metadata.get("protocol_version"),
                     "firmware_version": metadata.get("firmware_version"),
@@ -1957,7 +1959,7 @@ class StorageMixin:
                     "configuration_applied_version": configurations.get(device_id, {}).get("applied_version", 0),
                     "configuration_updated_at": configurations.get(device_id, {}).get("updated_at"),
                     "configuration_applied_at": configurations.get(device_id, {}).get("applied_at"),
-                    "configuration_sync_pending": device_id in self.deferred_connection_automations and metadata.get("device_profile") == "universal",
+                    "configuration_sync_pending": self.device_configuration_is_pending(device_id),
                     "configuration_status": configurations.get(device_id, {}).get(
                         "status", "not_configured" if metadata.get("device_profile") == "universal" else None
                     ),

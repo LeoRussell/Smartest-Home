@@ -52,6 +52,7 @@ class DeviceConfigurationTests(unittest.TestCase):
             "gpio_output": "GpioOutput",
             "digital_input": "DigitalInput",
             "analog_input": "AnalogInput",
+            "ds18b20": "Ds18b20",
             "pwm_output": "PwmOutput",
         }
         for driver_id, case_name in driver_cases.items():

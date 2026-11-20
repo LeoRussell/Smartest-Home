@@ -1,10 +1,10 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-11-18T22:04:20+03:00",
+  "exported_at": "2026-11-20T03:41:55+03:00",
   "device_id": "esp32-01",
-  "schema_version": 8,
-  "firmware_version": "1.6.0",
+  "schema_version": 9,
+  "firmware_version": "1.7.0",
   "schema": {
     "format_version": 1,
     "components": {
@@ -21,6 +21,16 @@
         "type": "boolean",
         "access": "read_write",
         "control": "toggle"
+      },
+      "manual_active": {
+        "label": "Ручной",
+        "type": "boolean",
+        "access": "read_only"
+      },
+      "blink_active": {
+        "label": "Мигание",
+        "type": "boolean",
+        "access": "read_only"
       }
     },
     "common_commands": {
@@ -34,11 +44,55 @@
       "identify": {
         "label": "Найти устройство",
         "description": "Пять раз мигает встроенным индикатором."
+      },
+      "mode_manual_select": {
+        "label": "Выбрать режим",
+        "description": "Постоянный свет управляется параметром «Светодиод»."
+      },
+      "mode_blink_select": {
+        "label": "Выбрать режим",
+        "description": "Мигает раз в секунду без блокировки связи с Gateway."
+      },
+      "mode_blink_enable": {
+        "label": "Включить режим",
+        "description": "Мигает раз в секунду без блокировки связи с Gateway."
+      },
+      "mode_blink_disable": {
+        "label": "Выключить режим",
+        "description": "Мигает раз в секунду без блокировки связи с Gateway."
       }
     },
     "capabilities": {
       "built_in_indicator": true,
       "identify": true
+    },
+    "modes": {
+      "manual": {
+        "label": "Ручной",
+        "description": "Постоянный свет управляется параметром «Светодиод».",
+        "operations": {
+          "select": "mode_manual_select"
+        },
+        "conflicts_with": [
+          "blink"
+        ],
+        "status_parameter": "manual_active",
+        "status_value": true
+      },
+      "blink": {
+        "label": "Мигание",
+        "description": "Мигает раз в секунду без блокировки связи с Gateway.",
+        "operations": {
+          "select": "mode_blink_select",
+          "enable": "mode_blink_enable",
+          "disable": "mode_blink_disable"
+        },
+        "conflicts_with": [
+          "manual"
+        ],
+        "status_parameter": "blink_active",
+        "status_value": true
+      }
     }
   },
   "device_profile": null,

@@ -1824,6 +1824,15 @@ body.nav-side .main-navigation {
     color: #333;
 }
 
+.parameter-reading-status {
+    display: block;
+    margin-top: 3px;
+    color: #800000;
+    font-size: 11px;
+    line-height: 1.4;
+    font-weight: 700;
+}
+
 .event-automation-link {
     align-self: flex-end;
     min-width: 30px;

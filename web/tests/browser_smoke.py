@@ -151,6 +151,10 @@ async def run(options):
                     print("Management replies:", await browser.evaluate("runManagementSmoke()"))
                     await browser.evaluate((Path(__file__).with_name("c3-smoke.js")).read_text(encoding="utf-8"))
                     print("C3 configuration:", await browser.evaluate("runC3ConfigurationSmoke()"))
+                    await browser.evaluate((Path(__file__).with_name("ds18b20-smoke.js")).read_text(encoding="utf-8"))
+                    print("DS18B20 configuration:", await browser.evaluate("runDS18B20ConfigurationSmoke()"))
+                    await browser.evaluate((Path(__file__).with_name("parameter-freshness-smoke.js")).read_text(encoding="utf-8"))
+                    print("Parameter freshness:", await browser.evaluate("runParameterFreshnessSmoke()"))
                     for filename, function in (
                         ("help-smoke.js", "runGatewayHelpSmoke"),
                         ("settings-layout-smoke.js", "runSettingsLayoutSmoke"),
@@ -161,7 +165,7 @@ async def run(options):
                         print(function + ":", await browser.evaluate(function + "()"))
                     for width in (375, 320):
                         await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=1000, deviceScaleFactor=1, mobile=False)
-                        for function in ("runGatewayHelpSmoke", "runSettingsLayoutSmoke", "runConnectionsLayoutSmoke", "runContextualCardsSmoke"):
+                        for function in ("runGatewayHelpSmoke", "runSettingsLayoutSmoke", "runConnectionsLayoutSmoke", "runContextualCardsSmoke", "runDS18B20ConfigurationSmoke", "runParameterFreshnessSmoke"):
                             await browser.evaluate(function + "()")
                     await browser.call("Emulation.setDeviceMetricsOverride", width=1440, height=1000, deviceScaleFactor=1, mobile=False)
                     print("Contextual help and modal layouts: desktop, 375 px and 320 px passed.")

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import signal
 import sys
 from datetime import datetime, timezone
@@ -156,6 +157,32 @@ class Gateway(StorageMixin, SchemaMixin, ConfigurationMixin, CommandsMixin, Auto
         ):
             return False
         return 0 <= asyncio.get_running_loop().time() - timestamp <= self.DEVICE_STALE_SECONDS
+
+
+    def parameter_ages_seconds(self, device_id, schema=None):
+        """Expose only current-session monotonic sample ages, never cached dates."""
+        if schema is None:
+            schema = self.device_metadata.get(device_id, {}).get("schema", {})
+        ages = {key: None for key in schema.get("parameters", {})}
+        timestamps = self.last_parameter_telemetry.get(device_id, {})
+        fresh = self.fresh_device_parameters.get(device_id, set())
+        if not ages or not self.device_is_connected(device_id) or not timestamps or not fresh:
+            return ages
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return ages
+        for key in ages:
+            timestamp = timestamps.get(key)
+            if key not in fresh or type(timestamp) not in (int, float):
+                continue
+            try:
+                age = now - timestamp
+            except OverflowError:
+                continue
+            if math.isfinite(age) and age >= 0:
+                ages[key] = age
+        return ages
 
 
     async def console_loop(self):

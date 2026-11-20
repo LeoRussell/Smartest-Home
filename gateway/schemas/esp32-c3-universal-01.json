@@ -1,30 +1,30 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-11-18T22:20:28+03:00",
+  "exported_at": "2026-11-20T03:41:55+03:00",
   "device_id": "esp32-c3-universal-01",
-  "schema_version": 2,
-  "firmware_version": "1.0.3",
+  "schema_version": 4,
+  "firmware_version": "1.1.0",
   "schema": {
     "format_version": 1,
     "components": {
       "temperature": {
         "label": "Температурный датчик",
         "category": "sensor",
-        "description": "Считывает ADC и линейно преобразует настроенный raw-диапазон в заданные значения."
+        "description": "Измеряет температуру DS18B20 по шине 1-Wire."
       }
     },
     "parameters": {
       "temp_value": {
-        "label": "Показание датчика",
+        "label": "Температура",
         "component": "temperature",
-        "type": "integer",
+        "type": "number",
         "access": "read_only",
-        "min": 0,
-        "max": 100,
-        "step": 1,
-        "precision": 0,
-        "unit": "raw"
+        "min": -55,
+        "max": 125,
+        "step": 0.0625,
+        "precision": 4,
+        "unit": "°C"
       }
     },
     "actions": {},
@@ -37,27 +37,23 @@
   "hardware_configuration": {
     "components": [
       {
-        "driver": "analog_input",
+        "driver": "ds18b20",
         "id": "temperature",
-        "interval_ms": 500,
+        "interval_ms": 2000,
         "label": "Температурный датчик",
         "parameter_id": "temp_value",
-        "parameter_label": "Показание датчика",
-        "pin": 3,
-        "raw_max": 4095,
-        "raw_min": 0,
-        "unit": "raw",
-        "value_max": 100,
-        "value_min": 0
+        "parameter_label": "Температура",
+        "pin": 4,
+        "unit": "°C"
       }
     ],
     "format_version": 1
   },
   "ui_preferences": {},
-  "configuration_version": 3,
-  "configuration_hash": "f5b57417a9baa8cec0430012104237a37f1b06f83f69417aa33a9b5e1e9ec73c",
-  "configuration_status": "failed",
-  "configuration_applied_version": 2,
-  "configuration_updated_at": "2026-11-18T22:20:08+03:00",
-  "configuration_applied_at": "2026-11-18T22:19:16+03:00"
+  "configuration_version": 4,
+  "configuration_hash": "11d89fcf01a5c8feb8bf06e069598ac86e7633c17b715bd2a561c051590c0796",
+  "configuration_status": "applied",
+  "configuration_applied_version": 4,
+  "configuration_updated_at": "2026-11-19T22:40:40+03:00",
+  "configuration_applied_at": "2026-11-20T03:41:55+03:00"
 }

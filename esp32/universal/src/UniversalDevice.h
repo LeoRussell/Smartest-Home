@@ -6,6 +6,8 @@
 #include <CommandResultCache.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <DallasTemperature.h>
+#include <OneWire.h>
 #include "BoardProfile.h"
 #include "PwmChannels.h"
 #include "user_config.h"
@@ -16,6 +18,7 @@ public:
     void loop(GatewayClient& gateway, bool registered);
     void handleMessage(JsonDocument& message, GatewayClient& gateway);
     void fillSchema(JsonObject schema) const;
+    void onGatewayRegistered(GatewayClient& gateway);
     void sendState(GatewayClient& gateway, bool logMessage = false);
     uint32_t configurationVersion() const;
     bool commandDedupReady() const;
@@ -39,6 +42,7 @@ private:
         GpioOutput,
         DigitalInput,
         AnalogInput,
+        Ds18b20,
         PwmOutput
     };
 
@@ -54,6 +58,7 @@ private:
         uint32_t intervalMs = 1000;
         uint32_t lastPollAt = 0;
         int32_t integerValue = 0;
+        double numberValue = 0;
         int32_t minimumValue = 0;
         int32_t maximumValue = 255;
         int32_t rawMinimum = 0;
@@ -64,10 +69,23 @@ private:
         int32_t initialInteger = 0;
         uint8_t pull = INPUT;
         bool hasValue = false;
+        bool pendingSample = false;
     };
 
     static constexpr uint8_t MAX_COMPONENTS = 8;
     static constexpr size_t MAX_CONFIGURATION_BYTES = 3000;
+    // Component is copied as a flat configuration. Bus objects stay at stable
+    // addresses outside it, so reconfiguration never memcpy-copies a driver.
+    struct TemperatureRuntime {
+        OneWire wire;
+        DallasTemperature sensor{&wire};
+        DeviceAddress address = {};
+        uint32_t conversionStartedAt = 0;
+        bool active = false;
+        bool found = false;
+        bool converting = false;
+        bool warned = false;
+    };
     bool parseAndValidate(JsonVariantConst configuration, Component* output,
                           uint8_t& count, IdentifyIndicator& identify,
                           String& error) const;
@@ -83,6 +101,12 @@ private:
                       JsonVariant& applied, String& error);
     int32_t scaleAnalogValue(const Component& component, int32_t rawValue) const;
     bool readComponent(Component& component);
+    bool pollTemperature(Component& component, TemperatureRuntime& runtime,
+                         uint32_t now);
+    bool findTemperatureSensor(Component& component, TemperatureRuntime& runtime);
+    void invalidateTemperature(Component& component, TemperatureRuntime& runtime,
+                               const char* reason);
+    void releaseTemperatureBuses();
     void configurePins(const bool* retainedPwmRoutes = nullptr);
     bool startIdentify(String& error);
     void updateIdentify();
@@ -96,6 +120,7 @@ private:
     // No pin is driven before a validated indicator configuration is applied.
     Adafruit_NeoPixel identifyPixel_{1, -1, NEO_GRB + NEO_KHZ800};
     Component components_[MAX_COMPONENTS];
+    TemperatureRuntime temperatures_[MAX_COMPONENTS];
     IdentifyIndicator identifyIndicator_;
     uint8_t componentCount_ = 0;
     uint32_t configurationVersion_ = 0;

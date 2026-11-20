@@ -1,10 +1,21 @@
 #include "DeviceModes.h"
+#include "LedModes.h"
 
 #include <cstring>
 
-// Add user-owned mode callbacks here. Keep their IDs stable: saved Gateway
-// automations refer to the action IDs generated from these mode IDs.
+// Keep these IDs stable: saved Gateway programs refer to the generated
+// mode_<id>_<operation> action IDs. Execution belongs to LedModes.cpp, while
+// this registry describes the modes and the callbacks exposed to Gateway.
+const char* const MANUAL_CONFLICTS[] = {"blink", nullptr};
+const char* const BLINK_CONFLICTS[] = {"manual", nullptr};
 const DeviceModeRegistration deviceModes[] = {
+    {"manual", "Ручной", "Постоянный свет управляется параметром «Светодиод».",
+     MODE_CAN_SELECT, selectManualLedMode, nullptr, nullptr,
+     MANUAL_CONFLICTS, "manual_active", true, manualLedModeIsActive},
+    {"blink", "Мигание", "Мигает раз в секунду без блокировки связи с Gateway.",
+     MODE_CAN_SELECT | MODE_CAN_ENABLE | MODE_CAN_DISABLE,
+     enableBlinkLedMode, enableBlinkLedMode, disableBlinkLedMode,
+     BLINK_CONFLICTS, "blink_active", true, blinkLedModeIsActive},
     {nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, nullptr,
      nullptr, false, nullptr}
 };

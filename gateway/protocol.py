@@ -1789,6 +1789,7 @@ class ProtocolMixin:
                             "type": "device_state",
                             "device": device_id,
                             "parameters": self.device_states[device_id],
+                            "parameter_ages_seconds": self.parameter_ages_seconds(device_id),
                             "last_seen": last_seen
                         })
                         if parameter not in previous_parameters or not self.schema_values_match(previous_parameters[parameter], value):
@@ -1940,6 +1941,7 @@ class ProtocolMixin:
                         "type": "device_state",
                         "device": device_id,
                         "parameters": self.device_states[device_id],
+                        "parameter_ages_seconds": self.parameter_ages_seconds(device_id),
                         "last_seen": last_seen,
                         "last_telemetry_at": last_telemetry_at
                     }

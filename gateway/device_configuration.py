@@ -47,6 +47,17 @@ DRIVERS = {
             "value_min", "value_max"
         ]
     },
+    "ds18b20": {
+        "id": "ds18b20",
+        "label": "Датчик температуры DS18B20",
+        "category": "sensor",
+        "description": "Измеряет температуру DS18B20 по шине 1-Wire.",
+        "parameter_type": "number",
+        "access": "read_only",
+        "pins": GPIO_PINS,
+        "fields": ["interval_ms", "unit"],
+        "requires_initial_sample": False
+    },
     "pwm_output": {
         "id": "pwm_output",
         "label": "PWM-выход",
@@ -90,6 +101,13 @@ def supported_board_profile(board_profile):
     return isinstance(board_profile, str) and board_profile in BOARD_PROFILES
 
 
+def driver_requires_initial_sample(driver_id):
+    """Outputs and legacy inputs gate controls; optional sensors may be absent."""
+    if not isinstance(driver_id, str):
+        return True
+    return DRIVERS.get(driver_id, {}).get("requires_initial_sample", True)
+
+
 def public_configuration_limits(board_profile=DEFAULT_BOARD_PROFILE):
     if not supported_board_profile(board_profile):
         return {}
@@ -121,6 +139,7 @@ def public_driver_catalog(driver_ids, board_profile=DEFAULT_BOARD_PROFILE):
     for driver_id in driver_ids:
         if isinstance(driver_id, str) and driver_id in DRIVERS and driver_id not in seen:
             driver = deepcopy(DRIVERS[driver_id])
+            driver.pop("requires_initial_sample", None)
             pins = "adc_pins" if driver_id == "analog_input" else "gpio_pins"
             driver["pins"] = list(BOARD_PROFILES[board_profile][pins])
             result.append(driver)
@@ -351,6 +370,13 @@ def validate_device_configuration(configuration, driver_ids, board_profile=DEFAU
                 "min_value": minimum,
                 "max_value": maximum
             })
+        elif driver_id == "ds18b20":
+            interval = raw.get("interval_ms", 2000)
+            if type(interval) is not int or not 1000 <= interval <= 3_600_000:
+                return configuration_error(f"{prefix}.interval_ms", f"Компонент {component_id}: интервал DS18B20 должен быть от 1000 до 3600000 мс.")
+            if raw.get("unit", "°C") != "°C":
+                return configuration_error(f"{prefix}.unit", f"Компонент {component_id}: DS18B20 передаёт температуру в °C.")
+            component.update({"interval_ms": interval, "unit": "°C"})
 
         component_ids.add(component_id)
         parameter_ids.add(parameter_id)
@@ -385,6 +411,14 @@ def validate_device_configuration(configuration, driver_ids, board_profile=DEFAU
                 "precision": 0,
                 "unit": "raw",
                 "control": "slider"
+            })
+        elif driver_id == "ds18b20":
+            definition.update({
+                "min": -55,
+                "max": 125,
+                "step": 0.0625,
+                "precision": 4,
+                "unit": "°C"
             })
         schema["parameters"][parameter_id] = definition
 

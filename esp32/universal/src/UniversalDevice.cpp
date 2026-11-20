@@ -1,6 +1,7 @@
 #include "UniversalDevice.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <utility>
 #include <mbedtls/sha256.h>
@@ -291,6 +292,8 @@ bool UniversalDevice::keyIsAllowed(const char* key, Driver driver) const {
             return strcmp(key, "interval_ms") == 0 || strcmp(key, "unit") == 0 ||
                    strcmp(key, "raw_min") == 0 || strcmp(key, "raw_max") == 0 ||
                    strcmp(key, "value_min") == 0 || strcmp(key, "value_max") == 0;
+        case Driver::Ds18b20:
+            return strcmp(key, "interval_ms") == 0 || strcmp(key, "unit") == 0;
         case Driver::PwmOutput:
             return strcmp(key, "initial_value") == 0 ||
                    strcmp(key, "min_value") == 0 ||
@@ -435,6 +438,8 @@ bool UniversalDevice::parseAndValidate(
             component.driver = Driver::AnalogInput;
         } else if (strcmp(driverName, "pwm_output") == 0) {
             component.driver = Driver::PwmOutput;
+        } else if (strcmp(driverName, "ds18b20") == 0) {
+            component.driver = Driver::Ds18b20;
         } else {
             error = "unknown driver";
             return false;
@@ -543,6 +548,19 @@ bool UniversalDevice::parseAndValidate(
             component.rawMaximum = rawMaximum;
             component.minimumValue = valueMinimum;
             component.maximumValue = valueMaximum;
+        } else if (component.driver == Driver::Ds18b20) {
+            const JsonVariantConst intervalValue = source["interval_ms"];
+            const JsonVariantConst unitValue = source["unit"];
+            const int interval = intervalValue.isUnbound() ? 2000 : intervalValue.as<int>();
+            if ((!intervalValue.isUnbound() && !isInteger(intervalValue)) ||
+                interval < 1000 || interval > 3600000 ||
+                (!unitValue.isUnbound() &&
+                 (!unitValue.is<const char*>() || strcmp(unitValue.as<const char*>(), "°C") != 0))) {
+                error = "DS18B20 requires an interval of 1000..3600000 ms and unit °C";
+                return false;
+            }
+            component.intervalMs = static_cast<uint32_t>(interval);
+            strlcpy(component.unit, "°C", sizeof(component.unit));
         } else {
             if (++pwmCount > UniversalBoard::PWM_CHANNELS) {
                 error = "too many PWM outputs for this board profile";
@@ -727,6 +745,7 @@ bool UniversalDevice::applyConfiguration(
         }
     }
 
+    releaseTemperatureBuses();
     memcpy(components_, parsed, sizeof(components_));
     componentCount_ = parsedCount;
     identifyIndicator_ = parsedIdentify;
@@ -764,6 +783,22 @@ void UniversalDevice::configurePins(const bool* retainedPwmRoutes) {
                 );
                 component.hasValue = true;
                 break;
+            case Driver::Ds18b20: {
+                // Delay conversion/discovery until loop(), keeping config ACK
+                // independent from a missing or slowly responding sensor.
+                TemperatureRuntime& runtime = temperatures_[index];
+                runtime.wire.begin(component.pin);
+                runtime.sensor.setOneWire(&runtime.wire);
+                runtime.sensor.setWaitForConversion(false);
+                runtime.sensor.setAutoSaveScratchPad(false);
+                runtime.active = true;
+                runtime.found = false;
+                runtime.converting = false;
+                runtime.warned = false;
+                component.hasValue = false;
+                component.lastPollAt = millis() - component.intervalMs;
+                break;
+            }
             case Driver::PwmOutput:
                 if (retainedPwmRoutes != nullptr && retainedPwmRoutes[index]) {
                     // A label/range edit must not briefly drop an unchanged
@@ -775,7 +810,7 @@ void UniversalDevice::configurePins(const bool* retainedPwmRoutes) {
                 }
                 break;
         }
-        component.lastPollAt = millis();
+        if (component.driver != Driver::Ds18b20) component.lastPollAt = millis();
     }
     if (identifyIndicator_.driver == IdentifyDriver::Gpio) {
         const int inactive = identifyIndicator_.activeHigh ? LOW : HIGH;
@@ -866,6 +901,10 @@ void UniversalDevice::fillSchema(JsonObject schema) const {
                 componentSchema["category"] = "sensor";
                 componentSchema["description"] = "Считывает ADC и линейно преобразует настроенный raw-диапазон в заданные значения.";
                 break;
+            case Driver::Ds18b20:
+                componentSchema["category"] = "sensor";
+                componentSchema["description"] = "Измеряет температуру DS18B20 по шине 1-Wire.";
+                break;
             case Driver::PwmOutput:
                 componentSchema["category"] = "actuator";
                 componentSchema["description"] = "Устанавливает заполнение PWM в заданном диапазоне.";
@@ -890,6 +929,14 @@ void UniversalDevice::fillSchema(JsonObject schema) const {
             parameter["step"] = 1;
             parameter["precision"] = 0;
             if (component.unit[0] != '\0') parameter["unit"] = component.unit;
+        } else if (component.driver == Driver::Ds18b20) {
+            parameter["type"] = "number";
+            parameter["access"] = "read_only";
+            parameter["min"] = -55;
+            parameter["max"] = 125;
+            parameter["step"] = 0.0625;
+            parameter["precision"] = 4;
+            parameter["unit"] = "°C";
         } else {
             parameter["type"] = "integer";
             parameter["access"] = "read_write";
@@ -903,6 +950,21 @@ void UniversalDevice::fillSchema(JsonObject schema) const {
     }
 }
 
+void UniversalDevice::onGatewayRegistered(GatewayClient& gateway) {
+    const uint32_t now = millis();
+    for (uint8_t index = 0; index < componentCount_; ++index) {
+        Component& component = components_[index];
+        if (component.driver != Driver::Ds18b20) continue;
+        // A temperature sampled before hello_ack belongs to the previous
+        // session. Force a new conversion even for an hour-long poll interval.
+        component.hasValue = false;
+        component.pendingSample = false;
+        component.lastPollAt = now - component.intervalMs;
+        temperatures_[index].converting = false;
+    }
+    sendState(gateway);
+}
+
 void UniversalDevice::sendState(GatewayClient& gateway, bool logMessage) {
     if (!gateway.isConnected()) return;
     JsonDocument message;
@@ -913,15 +975,21 @@ void UniversalDevice::sendState(GatewayClient& gateway, bool logMessage) {
     JsonObject parameters = message["data"]["parameters"].to<JsonObject>();
     for (uint8_t index = 0; index < componentCount_; ++index) {
         Component& component = components_[index];
-        JsonVariant value = parameters[component.parameterId];
+        if (component.driver == Driver::Ds18b20 &&
+            (!component.hasValue || !component.pendingSample)) continue;
         if (component.driver == Driver::GpioOutput ||
             component.driver == Driver::DigitalInput) {
-            value.set(component.booleanValue);
+            parameters[component.parameterId].set(component.booleanValue);
+        } else if (component.driver == Driver::Ds18b20) {
+            parameters[component.parameterId].set(component.numberValue);
         } else {
-            value.set(component.integerValue);
+            parameters[component.parameterId].set(component.integerValue);
         }
     }
     if (!gateway.sendJson(message)) return;
+    for (uint8_t index = 0; index < componentCount_; ++index) {
+        if (components_[index].driver == Driver::Ds18b20) components_[index].pendingSample = false;
+    }
     lastHeartbeatAt_ = millis();
     if (logMessage) {
         String serialized;
@@ -950,6 +1018,120 @@ bool UniversalDevice::readComponent(Component& component) {
     return false;
 }
 
+void UniversalDevice::releaseTemperatureBuses() {
+    for (TemperatureRuntime& runtime : temperatures_) {
+        if (runtime.active) runtime.wire.depower();
+        runtime.active = false;
+        runtime.found = false;
+        runtime.converting = false;
+        runtime.warned = false;
+    }
+}
+
+void UniversalDevice::invalidateTemperature(
+    Component& component,
+    TemperatureRuntime& runtime,
+    const char* reason
+) {
+    component.hasValue = false;
+    component.pendingSample = false;
+    runtime.found = false;
+    runtime.converting = false;
+    if (!runtime.warned) {
+        Serial.printf("[SENSOR] %s GPIO%u: %s; temperature unavailable.\n",
+                      component.id, component.pin, reason);
+        runtime.warned = true;
+    }
+}
+
+bool UniversalDevice::findTemperatureSensor(
+    Component& component,
+    TemperatureRuntime& runtime
+) {
+    // DallasTemperature::begin() sleeps up to 150 ms when no sensor exists.
+    // Search at most two ROMs here: this driver supports exactly one DS18B20
+    // per configured GPIO and never blocks the network on discovery retries.
+    runtime.wire.reset_search();
+    DeviceAddress address;
+    DeviceAddress extra;
+    if (!runtime.wire.search(address) ||
+        !runtime.sensor.validAddress(address) || address[0] != DS18B20MODEL) {
+        invalidateTemperature(component, runtime, "DS18B20 not found or invalid ROM CRC");
+        return false;
+    }
+    if (runtime.wire.search(extra)) {
+        invalidateTemperature(component, runtime, "more than one 1-Wire device on GPIO");
+        return false;
+    }
+    if (runtime.sensor.readPowerSupply(address)) {
+        invalidateTemperature(component, runtime, "parasite power is not supported; use external VDD");
+        return false;
+    }
+    // The setting is volatile scratchpad RAM; autoSaveScratchPad was disabled
+    // before this call, so rediscovery never wears the sensor's EEPROM.
+    if (!runtime.sensor.setResolution(address, 12)) {
+        invalidateTemperature(component, runtime, "invalid scratchpad or resolution write");
+        return false;
+    }
+    memcpy(runtime.address, address, sizeof(runtime.address));
+    runtime.found = true;
+    return true;
+}
+
+bool UniversalDevice::pollTemperature(
+    Component& component,
+    TemperatureRuntime& runtime,
+    uint32_t now
+) {
+    if (!runtime.active) return false;
+    if (runtime.converting) {
+        const uint32_t elapsed = now - runtime.conversionStartedAt;
+        if (elapsed < 750) return false;
+        if (!runtime.sensor.isConversionComplete()) {
+            if (elapsed < 1000) return false;
+            const bool hadValue = component.hasValue;
+            invalidateTemperature(component, runtime, "conversion did not finish");
+            component.lastPollAt = now;
+            return hadValue;
+        }
+        runtime.converting = false;
+        // DallasTemperature validates the scratchpad CRC and returns distinct
+        // negative sentinels for unplugged, power-on and power-failure states.
+        // A completed real conversion of +85°C remains a legitimate value.
+        const double sampled = runtime.sensor.getTempC(runtime.address);
+        if (!std::isfinite(sampled) || sampled < -55.0 || sampled > 125.0) {
+            const bool hadValue = component.hasValue;
+            invalidateTemperature(component, runtime, "invalid temperature, CRC or sensor power");
+            component.lastPollAt = now;
+            return hadValue;
+        }
+        component.numberValue = sampled;
+        component.hasValue = true;
+        component.pendingSample = true;
+        if (runtime.warned) {
+            Serial.printf("[SENSOR] %s GPIO%u: DS18B20 available.\n",
+                          component.id, component.pin);
+            runtime.warned = false;
+        }
+        // Send unchanged measurements too: the new successful conversion, not
+        // a heartbeat repeating an old cache value, advances sensor freshness.
+        return true;
+    }
+    if (now - component.lastPollAt < component.intervalMs) return false;
+    component.lastPollAt = now;
+    const bool hadValue = component.hasValue;
+    if (!runtime.found && !findTemperatureSensor(component, runtime)) return hadValue;
+    const DallasTemperature::request_t requested =
+        runtime.sensor.requestTemperaturesByAddress(runtime.address);
+    if (!requested.result) {
+        invalidateTemperature(component, runtime, "temperature conversion could not start");
+        return hadValue;
+    }
+    runtime.conversionStartedAt = requested.timestamp;
+    runtime.converting = true;
+    return false;
+}
+
 int32_t UniversalDevice::scaleAnalogValue(
     const Component& component,
     int32_t rawValue
@@ -970,6 +1152,10 @@ void UniversalDevice::loop(GatewayClient& gateway, bool registered) {
     bool changed = false;
     for (uint8_t index = 0; index < componentCount_; ++index) {
         Component& component = components_[index];
+        if (component.driver == Driver::Ds18b20) {
+            changed = pollTemperature(component, temperatures_[index], now) || changed;
+            continue;
+        }
         if (component.driver != Driver::DigitalInput &&
             component.driver != Driver::AnalogInput) continue;
         if (now - component.lastPollAt < component.intervalMs) continue;
@@ -1135,6 +1321,9 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
                 if (strcmp(component.parameterId, parameter) != 0) continue;
                 if (component.driver == Driver::GpioOutput || component.driver == Driver::DigitalInput) {
                     data["value"] = component.booleanValue;
+                } else if (component.driver == Driver::Ds18b20) {
+                    // This is read-only telemetry. A failed/cached command
+                    // cannot manufacture a new sample from a stored value.
                 } else {
                     data["value"] = component.integerValue;
                 }
@@ -1151,7 +1340,7 @@ void UniversalDevice::handleMessage(JsonDocument& message, GatewayClient& gatewa
     if (!configured_) error = "device has no applied hardware configuration";
     if (strcmp(commandName, "set") == 0) {
         const char* parameter = message["data"]["parameter"] | "";
-        JsonVariant applied = data["value"];
+        JsonVariant applied = data["value"].to<JsonVariant>();
         success = configured_ &&
             setParameter(parameter, message["data"]["value"], applied, error);
         data["parameter"] = parameter;
