@@ -1,10 +1,15 @@
 # Результаты проверки Smartest-Home — 19 ноября 2026
 
-Прогон по [плану итогового тестирования](ACCEPTANCE_TESTING.md).
+Это исторический отчёт. Версии, измерения, пути TEMP и состояние плат ниже
+относятся к этому прогону; актуальный порядок работы находится в
+[README](../../README.md), а результаты обновления LED — в
+[отчёте 20 ноября](FLASH_REPORT_2026-11-20.md).
+
+Прогон по [плану итогового тестирования](../ACCEPTANCE_TESTING.md).
 Среда: Windows 11, Python 3.12.0, Chrome 158.0.8127.36.
 Первичный прогон выполнен на прикладном коде `30f3a59`; затем добавлены
-изменения DS18B20 и исправления телеметрии, описанные ниже. Изменения ещё
-не закоммичены. Время в этом отчёте — МСК.
+изменения DS18B20 и исправления телеметрии, описанные ниже. На момент
+составления отчёта эти изменения ещё не были закоммичены. Время — МСК.
 
 **Программная часть и доступная аппаратная проверка DS18B20 прошли.**
 После уточнения модели датчика C3 SuperMini обновлена до universal 1.1.0,
@@ -205,7 +210,7 @@ DS18B20 настроен на GPIO4 и передаёт настоящую те�
 горячий диапазон и 24–48 часов физической работы остаются непроверенными.
 
 Инструкция подключения и пример конфигурации —
-[DS18B20 в универсальной прошивке](UNIVERSAL_FIRMWARE.md#ds18b20-на-esp32-c3-и-esp32-s3).
+[DS18B20 в универсальной прошивке](../UNIVERSAL_FIRMWARE.md#ds18b20-на-esp32-c3-и-esp32-s3).
 
 ## Покрытие личного плана первичным прогоном
 
@@ -245,8 +250,8 @@ $env:ZIG = Join-Path $env:TEMP 'smartest-home-native-toolchain\zig-x86_64-window
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $env:TEMP 'smartest-home-native-toolchain\zig-cache'
 $env:ARDUINOJSON_INCLUDE_DIR = Join-Path (Get-Location).Path 'esp32\universal\.pio\libdeps\esp32-s3-devkitc-1\ArduinoJson\src'
 .\.venv\Scripts\python.exe -X utf8 -m unittest discover -s gateway/tests -v
-.\.venv\Scripts\python.exe -X utf8 web\tests\browser_smoke.py --screenshots <каталог-снимков>
-.\.venv\Scripts\python.exe -X utf8 gateway\soak_test.py --duration 600 --interval 0.25 --restart-every 100 --report <путь-к-новому-отчёту.json>
+.\.venv\Scripts\python.exe -X utf8 web\tests\browser_smoke.py --screenshots "<каталог-снимков>"
+.\.venv\Scripts\python.exe -X utf8 gateway\soak_test.py --duration 600 --interval 0.25 --restart-every 100 --report "<путь-к-новому-отчёту.json>"
 ```
 
 Путь Zig здесь относится к найденному локальному инструментарию этого прогона;
@@ -302,7 +307,7 @@ TEMP может очищаться системой; для долговреме
 ```
 
 Резервный образ flash и копия рабочей БД сохранены только локально,
-в репозиторий не добавлялись. Текущий процесс Gateway — PID 21704; это
+в репозиторий не добавлялись. Процесс Gateway в момент прогона — PID 21704; это
 наблюдение данного запуска, после нового старта PID изменится.
 
 SHA256 загруженного C3 `firmware.bin`:
