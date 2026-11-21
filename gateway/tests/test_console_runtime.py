@@ -1,6 +1,7 @@
 """Console mistakes and damaged legacy state must not stop the Gateway."""
 
 import io
+import json
 import sys
 import unittest
 from contextlib import redirect_stdout
@@ -38,13 +39,12 @@ class ConsoleRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("'led': True", output.getvalue())
 
     async def test_invalid_console_json_does_not_block_subsequent_commands(self):
-        deep_json = "[" * 2000 + "0" + "]" * 2000
         commands = [
             "use lamp",
-            "set led " + "9" * 5000,
-            "set led " + deep_json,
+            "set led {",
             "set led true",
-            "call blink " + deep_json,
+            "call blink {",
+            "call blink []",
             'call blink {"count": 2}',
             "exit",
         ]
@@ -60,6 +60,40 @@ class ConsoleRuntimeTests(unittest.IsolatedAsyncioTestCase):
         call_action.assert_awaited_once_with("lamp", "blink", arguments={"count": 2})
         self.assertIn("Значение должно быть корректным JSON", output.getvalue())
         self.assertIn("Аргументы должны быть корректным JSON", output.getvalue())
+        self.assertIn("Аргументы действия должны быть JSON-объектом", output.getvalue())
+
+    async def test_json_parser_limits_do_not_block_subsequent_commands(self):
+        decode = json.loads
+        commands = [
+            "use lamp",
+            "set led [0]",
+            "set led true",
+            "call blink [0]",
+            'call blink {"count": 2}',
+            "exit",
+        ]
+        # Parser resource limits vary across Python versions and settings.
+        # Force these failures instead of assuming valid deep JSON is rejected.
+        for error_type in (ValueError, RecursionError):
+            with self.subTest(error=error_type.__name__):
+                def limited_decode(value):
+                    if value == "[0]":
+                        raise error_type("simulated JSON parser limit")
+                    return decode(value)
+
+                output = io.StringIO()
+                with (
+                    patch("builtins.input", side_effect=commands),
+                    patch("runtime.json.loads", side_effect=limited_decode),
+                    patch.object(gateway, "dispatch_device_command", new_callable=AsyncMock) as set_value,
+                    patch.object(gateway, "dispatch_device_action", new_callable=AsyncMock) as call_action,
+                    redirect_stdout(output),
+                ):
+                    await gateway.console_loop()
+                set_value.assert_awaited_once_with("lamp", "led", True)
+                call_action.assert_awaited_once_with("lamp", "blink", arguments={"count": 2})
+                self.assertIn("Значение должно быть корректным JSON", output.getvalue())
+                self.assertIn("Аргументы должны быть корректным JSON", output.getvalue())
 
 
 if __name__ == "__main__":
