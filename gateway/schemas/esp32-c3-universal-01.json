@@ -1,7 +1,7 @@
 {
   "export_format": "smartest-home-device",
   "export_version": 1,
-  "exported_at": "2026-11-21T19:54:24+03:00",
+  "exported_at": "2026-11-21T21:51:04+03:00",
   "device_id": "esp32-c3-universal-01",
   "schema_version": 4,
   "firmware_version": "1.1.0",
@@ -55,5 +55,5 @@
   "configuration_status": "applied",
   "configuration_applied_version": 4,
   "configuration_updated_at": "2026-11-19T22:40:40+03:00",
-  "configuration_applied_at": "2026-11-21T19:54:24+03:00"
+  "configuration_applied_at": "2026-11-21T21:51:04+03:00"
 }

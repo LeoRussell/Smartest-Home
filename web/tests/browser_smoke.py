@@ -87,6 +87,9 @@ class Browser:
     async def reload(self):
         previous = (await self.call("Page.getFrameTree"))["frameTree"]["frame"]["loaderId"]
         await self.call("Page.reload", ignoreCache=True)
+        await self.wait_for_reload(previous)
+
+    async def wait_for_reload(self, previous):
         # Page.reload can return while the previous document is still ready.
         # Wait for its replacement before checking the application functions.
         for _ in range(150):
@@ -96,6 +99,71 @@ class Browser:
                 return
             await asyncio.sleep(0.05)
         raise RuntimeError("The interface did not navigate after reload.")
+
+
+async def check_gateway_address_form(browser):
+    key = "iot-gateway-connection-v1"
+    await browser.evaluate(f"localStorage.removeItem({json.dumps(key)})")
+    await browser.reload()
+    active_url = await browser.evaluate("GatewayConnection.url()")
+    # Connection/status redraws must never replace a draft, including after blur.
+    draft = await browser.evaluate("""(()=>{
+        setActivePage('settings');
+        const input=document.getElementById('gateway-address');
+        input.focus();input.value='ws://10.64.226.105:8765';input.dispatchEvent(new Event('input',{bubbles:true}));
+        GatewayConnection.status(false);GatewayConnection.status(true);
+        input.blur();GatewayConnection.status(false);GatewayConnection.languageChanged();
+        return input.value;
+    })()""")
+    if draft != "ws://10.64.226.105:8765":
+        raise AssertionError(("Connection redraw replaced the typed Gateway address", draft))
+    for host in ("0.0.0.0", "0", "0.0", "0x0", "[::]", "[0:0:0:0:0:0:0:0]"):
+        invalid = "ws://" + host + ":8765"
+        state = await browser.evaluate("""(()=>{
+            const input=document.getElementById('gateway-address');input.value=""" + json.dumps(invalid) + ";" + """
+            input.closest('form').requestSubmit();
+            const message=document.querySelector('.gateway-connection-settings > .management-feedback:not(.gateway-connection-status)');
+            return {input:input.value,active:GatewayConnection.url(),saved:localStorage.getItem('iot-gateway-connection-v1'),error:message.textContent,state:message.dataset.state};
+        })()""")
+        if state["input"] != invalid or state["active"] != active_url or state["saved"] is not None or state["state"] != "error" or not state["error"]:
+            raise AssertionError(("The address form accepted or overwrote a wildcard draft", invalid, state))
+
+    # Use the real form submission and wait for its own automatic reload.
+    previous = (await browser.call("Page.getFrameTree"))["frameTree"]["frame"]["loaderId"]
+    await browser.evaluate("document.getElementById('gateway-address').value='ws://10.64.226.105:8765';setTimeout(()=>document.getElementById('gateway-address').closest('form').requestSubmit(),0)")
+    await browser.wait_for_reload(previous)
+    state = await browser.evaluate("({input:document.getElementById('gateway-address').value,stored:JSON.parse(localStorage.getItem('iot-gateway-connection-v1')).url,socket:__smokeSockets[0].url,backup:databaseBackupDownloadUrl('test.sqlite3'),schema:deviceConfigurationExportUrl('lamp')})")
+    expected = {
+        "input": "ws://10.64.226.105:8765/", "stored": "ws://10.64.226.105:8765/", "socket": "ws://10.64.226.105:8765/",
+        "backup": "http://10.64.226.105:8765/gateway-backups/test.sqlite3", "schema": "http://10.64.226.105:8765/gateway-schemas/lamp.json",
+    }
+    if state != expected:
+        raise AssertionError(("Saving the LAN address through its form did not survive reload", state))
+    # A rejected edit must also preserve a previously saved, working endpoint.
+    state = await browser.evaluate("""(()=>{
+        const input=document.getElementById('gateway-address');input.value='ws://0.0.0.0:8765';input.closest('form').requestSubmit();
+        return {input:input.value,stored:JSON.parse(localStorage.getItem('iot-gateway-connection-v1')).url,active:GatewayConnection.url()};
+    })()""")
+    if state != {"input": "ws://0.0.0.0:8765", "stored": expected["stored"], "active": expected["socket"]}:
+        raise AssertionError(("A rejected wildcard edit destroyed the saved LAN address", state))
+    await browser.reload()
+    if await browser.evaluate("document.getElementById('gateway-address').value") != expected["input"]:
+        raise AssertionError("The saved LAN address was lost on another page reload")
+    await browser.evaluate((Path(__file__).with_name("smoke.js")).read_text(encoding="utf-8"))
+    print("Stalled Gateway connection:", await browser.evaluate("runGatewayConnectingSmoke()"))
+
+    for invalid in ("ws://0.0.0.0:8765/", "ws://0:8765/", "ws://0.0:8765/", "ws://[::]:8765/"):
+        await browser.evaluate(f"localStorage.setItem({json.dumps(key)},JSON.stringify({{url:{json.dumps(invalid)}}}))")
+        await browser.reload()
+        state = await browser.evaluate("({input:document.getElementById('gateway-address').value,active:GatewayConnection.url(),saved:localStorage.getItem('iot-gateway-connection-v1'),state:document.querySelector('.gateway-connection-settings > .management-feedback:not(.gateway-connection-status)').dataset.state})")
+        if state != {"input": "", "active": active_url, "saved": None, "state": "warning"}:
+            raise AssertionError(("An old wildcard setting did not migrate to this page's usable host", invalid, state))
+
+    # Browsers may reject navigating to 0.0.0.0 before loading the interface.
+    # Test that page-host policy with the shipped module and native URL parser.
+    await browser.evaluate((Path(__file__).with_name("smoke.js")).read_text(encoding="utf-8"))
+    print("Gateway endpoint policy:", await browser.evaluate("runGatewayAddressPolicySmoke()"))
+    print("Gateway address form: drafts, wildcard errors/migration, saved LAN reload and consistent downloads passed.")
 
 
 def find_browser(explicit):
@@ -280,6 +348,7 @@ async def run(options):
                             raise AssertionError(("Invalid runtime port was trusted", invalid_port))
                     print("Launcher runtime port: discovered, immutable, explicit override preserved; invalid ports use the static fallback.")
                     QuietHandler.runtime_config = None
+                    await check_gateway_address_form(browser)
                     if not await browser.evaluate("__smokeErrors.length===0"):
                         raise AssertionError(await browser.evaluate("__smokeErrors"))
                     await browser.call("Browser.close")

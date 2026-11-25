@@ -2012,8 +2012,15 @@ function connectGateway() {
         return;
     }
     socket = gatewaySocket;
+    const connectTimeout = setTimeout(() => {
+        if (socket !== gatewaySocket || gatewaySocket.readyState !== WebSocket.CONNECTING) return;
+        setGatewayConnectionStatus("Нет соединения с Gateway", false);
+        window.GatewayConnection.unavailable();
+        gatewaySocket.close();
+    }, 10000);
 
     gatewaySocket.addEventListener("open", () => {
+        clearTimeout(connectTimeout);
         if (socket !== gatewaySocket) return;
         setGatewayConnectionStatus("Gateway подключён", true);
         setActivity("Подключено к Gateway.");
@@ -2048,6 +2055,7 @@ function connectGateway() {
     });
 
     gatewaySocket.addEventListener("close", () => {
+        clearTimeout(connectTimeout);
         if (socket !== gatewaySocket) return;
         setGatewayConnectionStatus("Нет соединения с Gateway", false);
         pendingSchemaDecisions.clear();
@@ -2078,6 +2086,7 @@ function connectGateway() {
     gatewaySocket.addEventListener("error", (error) => {
         if (socket !== gatewaySocket) return;
         setGatewayConnectionStatus("Ошибка соединения с Gateway", false);
+        window.GatewayConnection.unavailable();
         console.error("Ошибка WebSocket:", error);
         setActivity("Ошибка соединения с Gateway.");
     });
@@ -3946,8 +3955,13 @@ function renderDevices() {
         const parameters = device.schema?.parameters || {};
         const schemaComponents = device.schema?.components || {};
         const componentGroups = new Map();
+        const modeStatusParameters = new Set(
+            Object.values(device.schema?.modes || {}).map(mode => mode.status_parameter)
+        );
 
         for (const [parameterId, definition] of Object.entries(parameters)) {
+            // Mode activity is already shown beside its selector.
+            if (definition.access === "read_only" && modeStatusParameters.has(parameterId)) continue;
             const parameter = document.createElement("div");
             parameter.className = "device-parameter";
             parameter.dataset.parameterId = parameterId;

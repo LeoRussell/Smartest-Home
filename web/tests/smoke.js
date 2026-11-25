@@ -132,10 +132,113 @@ async function runGatewaySmoke() {
     socket.receive({ type: "device_list", devices: originalDevices }); AutomationBlockly.load(originalWorkspace);
     const normalize = GatewayConnection.normalize;
     check(normalize("http://127.0.0.1:18765") === "ws://127.0.0.1:18765/", "Gateway URL normalization is inconsistent.");
+    check(normalize("ws://10.64.226.105:8765") === "ws://10.64.226.105:8765/" && normalize("ws://[::1]:8765") === "ws://[::1]:8765/", "Usable LAN and IPv6 loopback destinations were rejected.");
     for (const address of ["file:///etc/passwd", "ws://user:password@localhost:8765", "ws://localhost:0", "ws://localhost:8765/path", "ws://localhost:8765/#fragment", "ws://localhost:8765/#", "ws://localhost:8765/?"]) {
         let rejected = false; try { normalize(address); } catch { rejected = true; }
         check(rejected, `Invalid Gateway address was accepted: ${address}`);
     }
+    for (const host of ["0.0.0.0", "0", "0.0", "0.0.0", "000.000.000.000", "0x0", "[::]", "[0:0:0:0:0:0:0:0]"]) {
+        let reason = ""; try { normalize(`ws://${host}:8765`); } catch (error) { reason = error.message; }
+        check(reason === "wildcard_address", `A normalized wildcard destination was not rejected clearly: ${host} (${reason})`);
+    }
     check(__smokeErrors.length === 0, JSON.stringify(__smokeErrors));
     return { diagnostics: true, charts: true, commandDeduplication: true, blockRollback: true, copy: true, simulation: true, filterPreservation: true, argumentPreservation: true, connectionSettings: true };
+}
+
+/* Exercise HTTPS/default-host policy using the shipped module and native URL parser. */
+async function runGatewayAddressPolicySmoke() {
+    const check = (condition, message) => { if (!condition) throw new Error(message); };
+    const source = await (await fetch("gateway-connection.js", { cache: "no-store" })).text();
+    const create = page => new Function("window", "localStorage", `${source}\nreturn window.GatewayConnection;`)(
+        { location: new URL(page), __GATEWAY_CONFIG__: { gateway_port: 18777 } },
+        { getItem: () => null, removeItem() {} }
+    );
+    const secure = create("https://gateway-policy.example/");
+    check(secure.url() === "wss://gateway-policy.example:18777/", "An HTTPS page did not default to WSS.");
+    let insecureReason = "";
+    try { secure.normalize("ws://10.64.226.105:8765"); } catch (error) { insecureReason = error.message; }
+    check(insecureReason === "secure_address_required", "HTTPS accepted an insecure WS endpoint.");
+    check(secure.normalize("https://10.64.226.105:8765") === "wss://10.64.226.105:8765/", "An HTTPS Gateway address lost its secure protocol.");
+    let wildcardReason = "";
+    try { secure.normalize("wss://[::]:8765"); } catch (error) { wildcardReason = error.message; }
+    check(wildcardReason === "wildcard_address", "A secure wildcard destination was accepted.");
+    check(create("http://0.0.0.0:8080/").url() === "ws://localhost:18777/", "An IPv4 wildcard page produced a wildcard destination.");
+    check(create("https://[::]:8080/").url() === "wss://[::1]:18777/", "An IPv6 wildcard page did not use IPv6 loopback.");
+    check(create("https://[::1]:8080/").url() === "wss://[::1]:18777/", "A usable IPv6 page hostname was changed.");
+    return { httpsRequiresWss: true, secureAddressNormalization: true, wildcardDefaults: true, runtimePortPreserved: true };
+}
+
+/* A silently dropped TCP/WebSocket handshake must become a bounded UI failure. */
+async function runGatewayConnectingSmoke() {
+    const check = (condition, message) => { if (!condition) throw new Error(message); };
+    const NativeSocket = window.WebSocket, nativeTimeout = window.setTimeout, nativeClearTimeout = window.clearTimeout;
+    const target = GatewayConnection.url(), saved = localStorage.getItem("iot-gateway-connection-v1");
+    check(target === "ws://10.64.226.105:8765/", "The stalled-connection regression requires an explicitly saved LAN endpoint.");
+    const timers = new Map(), attempts = [];
+    let clock = 0, sequence = -1;
+    window.setTimeout = (callback, delay = 0, ...arguments_) => {
+        const identity = sequence--;
+        timers.set(identity, { due: clock + Math.max(0, Number(delay) || 0), callback: () => callback(...arguments_) });
+        return identity;
+    };
+    window.clearTimeout = identity => { if (!timers.delete(identity)) nativeClearTimeout(identity); };
+    const advance = milliseconds => {
+        const end = clock + milliseconds;
+        for (let count = 0; count < 1000; count++) {
+            const next = [...timers.entries()].filter(([, timer]) => timer.due <= end).sort((left, right) => left[1].due - right[1].due)[0];
+            if (!next) { clock = end; return; }
+            const [identity, timer] = next; clock = timer.due; timers.delete(identity); timer.callback();
+        }
+        throw new Error("Connection retries entered an unbounded timer loop.");
+    };
+    class ConnectingSocket extends EventTarget {
+        static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+        constructor(url) { super(); this.url = url; this.readyState = 0; this.sent = []; attempts.push(this); }
+        send(value) { this.sent.push(JSON.parse(value)); }
+        close() { this.readyState = 3; this.dispatchEvent(new Event("close")); }
+        open() { this.readyState = 1; this.dispatchEvent(new Event("open")); }
+    }
+    const feedback = () => document.querySelector(".gateway-connection-settings > .management-feedback:not(.gateway-connection-status)");
+    const unchangedTarget = () => {
+        check(GatewayConnection.url() === target && localStorage.getItem("iot-gateway-connection-v1") === saved && attempts.every(attempt => attempt.url === target), "A failed connection replaced the saved LAN host or dialled a fallback.");
+    };
+    try {
+        window.WebSocket = ConnectingSocket;
+        socket.close(); advance(2000);
+        check(attempts.length === 1 && attempts[0].readyState === 0, "The normal reconnect did not start a stalled handshake.");
+        advance(9999);
+        check(attempts[0].readyState === 0, "The handshake timed out before its 10 second deadline.");
+        advance(1);
+        check(attempts[0].readyState === 3 && feedback().dataset.state === "error" && feedback().textContent.includes(target), "A CONNECTING socket stayed pending or failed without showing its destination.");
+        unchangedTarget();
+        const failure = feedback().textContent;
+        GatewayConnection.languageChanged(); GatewayConnection.status(false);
+        check(feedback().textContent === failure, "An offline status redraw erased the connection failure explanation.");
+        advance(2000);
+        check(attempts.length === 2 && attempts[1].readyState === 0 && feedback().textContent === failure, "A retry erased the failure or did not reuse the saved destination.");
+        attempts[1].dispatchEvent(new Event("error")); attempts[1].close(); advance(2000);
+        check(attempts.length === 3 && feedback().textContent.includes(target), "Error/close did not schedule another retry with address-specific feedback.");
+        attempts[2].open();
+        check(!feedback().textContent && feedback().dataset.state !== "error", "A successful connection retained its transient connection error.");
+        advance(10000);
+        check(attempts[2].readyState === 1 && attempts.length === 3, "The handshake deadline closed an already open socket.");
+        unchangedTarget();
+
+        attempts[2].close(); advance(2000);
+        const input = document.getElementById("gateway-address");
+        input.value = "ws://0.0.0.0:8765"; input.closest("form").requestSubmit();
+        const validation = feedback().textContent;
+        check(validation && feedback().dataset.state === "error", "The fixture failed to produce a validation error.");
+        attempts[3].dispatchEvent(new Event("error")); GatewayConnection.failed(); GatewayConnection.languageChanged();
+        check(feedback().textContent === validation, "A recurring network or constructor failure overwrote the address validation error.");
+        attempts[3].open();
+        check(feedback().textContent === validation && input.value === "ws://0.0.0.0:8765", "Connecting erased a validation error or replaced the address draft.");
+        unchangedTarget();
+        check(__smokeErrors.length === 0, JSON.stringify(__smokeErrors));
+        return { boundedConnecting: true, retrySameLanHost: true, targetFeedback: true, openCancelsDeadline: true, transientOnlyCleared: true, validationAcrossNetworkFailures: true, validationAndDraftPreserved: true };
+    } finally {
+        if (socket instanceof ConnectingSocket && socket.readyState !== 3) socket.close();
+        timers.clear(); window.WebSocket = NativeSocket; window.setTimeout = nativeTimeout; window.clearTimeout = nativeClearTimeout;
+        connectGateway(); await new Promise(resolve => nativeTimeout(resolve, 0));
+    }
 }

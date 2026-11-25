@@ -6,7 +6,7 @@
     // phone never connects to its own localhost or the server's wildcard IP.
     const configuredPort = window.__GATEWAY_CONFIG__?.gateway_port;
     const defaultPort = Number.isInteger(configuredPort) && configuredPort >= 1 && configuredPort <= 65535 ? configuredPort : 8765;
-    let options, ui, connected = false, feedback = null;
+    let options, ui, connected = false, feedback = null, discardedWildcardAddress = false;
     const t = (ru, en) => options.localized(ru, en);
     const node = (tag, ru, en, className) => {
         const element = document.createElement(tag);
@@ -14,6 +14,7 @@
         if (className) element.className = className;
         return element;
     };
+    const isWildcardHost = hostname => ["0.0.0.0", "[::]"].includes(hostname);
     function normalize(value) {
         if (typeof value !== "string" || value.length > 2048) throw new Error("invalid_address");
         const url = new URL(value.trim());
@@ -21,15 +22,25 @@
         if (url.protocol === "https:") url.protocol = "wss:";
         if (!["ws:", "wss:"].includes(url.protocol) || !url.hostname || url.port === "0" ||
             url.username || url.password || url.pathname !== "/" || url.href.includes("?") || url.href.includes("#")) throw new Error("invalid_address");
+        // URL parsing also canonicalizes aliases such as 0, 0.0 and 0x0.
+        if (isWildcardHost(url.hostname)) throw new Error("wildcard_address");
         if (window.location.protocol === "https:" && url.protocol !== "wss:") throw new Error("secure_address_required");
         return url.href;
     }
     function defaultUrl(port = defaultPort) {
-        return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.hostname || "localhost"}:${port}/`;
+        const pageHost = window.location.hostname;
+        const host = pageHost === "[::]" ? "[::1]" : pageHost === "0.0.0.0" || !pageHost ? "localhost" : pageHost;
+        return `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${host}:${port}/`;
     }
     function savedUrl() {
         try { return normalize(JSON.parse(localStorage.getItem(KEY))?.url); }
-        catch { return ""; }
+        catch (error) {
+            if (error.message === "wildcard_address") {
+                discardedWildcardAddress = true;
+                try { localStorage.removeItem(KEY); } catch { /* The invalid address is still ignored. */ }
+            }
+            return "";
+        }
     }
     // Another tab may edit shared storage while this page has a live socket.
     // Keep downloads and reconnects on that socket's Gateway until a reload.
@@ -39,13 +50,18 @@
         const base = new URL(url()); base.protocol = base.protocol === "wss:" ? "https:" : "http:";
         return new URL(path, base).href;
     }
-    function showFeedback(ru, en, state) {
-        feedback = { ru, en, state }; ui.feedback.textContent = t(ru, en); ui.feedback.dataset.state = state;
+    function showFeedback(ru, en, state, connectionError = false) {
+        feedback = { ru, en, state, connectionError }; ui.feedback.textContent = t(ru, en); ui.feedback.dataset.state = state;
     }
     function apply(value) {
         let next;
         try { next = value.trim() ? normalize(value) : ""; }
         catch (error) {
+            if (error.message === "wildcard_address") {
+                showFeedback("0.0.0.0 и :: — адреса прослушивания сервера. Укажите IP компьютера с Gateway; на этом же компьютере можно использовать localhost.",
+                    "0.0.0.0 and :: are server listen addresses. Enter the Gateway computer's IP; use localhost when the Gateway runs on this computer.", "error");
+                return;
+            }
             showFeedback(error.message === "secure_address_required"
                 ? "Для страницы HTTPS используйте защищённый адрес wss://."
                 : "Укажите адрес вида ws://192.168.0.102:8765 без пути, пароля и параметров.",
@@ -76,7 +92,7 @@
         ui.input.placeholder = defaultUrl();
         ui.status.textContent = `${t("Адрес", "Address")}: ${url()} · ${connected ? t("На связи", "Online") : t("Нет связи", "Offline")}`;
         ui.status.dataset.state = connected ? "success" : "info";
-        if (feedback) showFeedback(feedback.ru, feedback.en, feedback.state);
+        if (feedback) showFeedback(feedback.ru, feedback.en, feedback.state, feedback.connectionError);
     }
     window.GatewayConnection = {
         url, downloadUrl, normalize, isDefault: () => activeUrl === defaultUrl(),
@@ -103,7 +119,10 @@
             help.id = "gateway-address-help"; input.setAttribute("aria-describedby", help.id);
             form.append(label, actions); form.addEventListener("submit", event => { event.preventDefault(); apply(input.value); });
             section.append(heading, form, help, status, message); document.querySelector("#settings-page .settings-card").append(section);
-            ui = { input, status, feedback: message }; render();
+            ui = { input, status, feedback: message };
+            if (discardedWildcardAddress) showFeedback("Сохранённый адрес прослушивания удалён. Используется автоматический адрес; при необходимости укажите IP компьютера с Gateway.",
+                "The saved server listen address was removed. Using the automatic address; enter the Gateway computer's IP if needed.", "warning");
+            render();
             window.addEventListener("storage", event => {
                 if (event.key !== KEY && event.key !== null || (savedUrl() || defaultUrl()) === url()) return;
                 if (document.activeElement !== input) input.value = savedUrl();
@@ -111,10 +130,23 @@
                     "The address changed in another tab. This tab keeps using its original Gateway until the page is reloaded.", "warning");
             });
         },
-        status(value) { connected = Boolean(value); render(); },
+        status(value) {
+            connected = Boolean(value);
+            if (connected && feedback?.connectionError) {
+                feedback = null;
+                if (ui) { ui.feedback.textContent = ""; delete ui.feedback.dataset.state; }
+            }
+            render();
+        },
+        unavailable() {
+            if (feedback?.state === "error" && !feedback.connectionError) return;
+            if (ui) showFeedback(`Нет ответа от Gateway по адресу ${url()}. Проверьте IP, порт и запуск Gateway на выбранном компьютере. «Автоматически» использует ${defaultUrl()}`,
+                `Gateway did not respond at ${url()}. Check the IP, port and that Gateway is running on the selected computer. Use default connects to ${defaultUrl()}`, "error", true);
+        },
         failed() {
+            if (feedback?.state === "error" && !feedback.connectionError) return;
             if (ui) showFeedback("Браузер не разрешил подключение к этому адресу. Проверьте протокол и порт Gateway.",
-                "The browser did not allow this connection. Check the Gateway protocol and port.", "error");
+                "The browser did not allow this connection. Check the Gateway protocol and port.", "error", true);
         },
         languageChanged: render
     };
