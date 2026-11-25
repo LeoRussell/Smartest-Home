@@ -7,6 +7,7 @@ import sqlite3
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
+from statistics import mean
 
 
 DEFAULT_HISTORY_SETTINGS = {"enabled": True, "retention_days": 30, "interval_seconds": 30}
@@ -253,18 +254,20 @@ class ParameterHistory:
             points = []
             for row in rows:
                 value = row[5] if value_type == "boolean" else row[1]
-                if not math.isfinite(value):
+                if value is None or not math.isfinite(value):
                     # SQLite's AVG can overflow its running sum even when all
-                    # measurements and the mathematical mean are finite.
-                    values = [item[0] for item in connection.execute("""
+                    # measurements and the mathematical mean are finite. Some
+                    # versions return NULL instead of infinity in this case.
+                    values = (item[0] for item in connection.execute("""
                         SELECT value FROM parameter_history
                         WHERE device_id = ? AND parameter_id = ? AND sampled_at >= ? AND sampled_at <= ?
                           AND value_type = ? AND unit = ?
                           AND MIN(?, CAST((sampled_at - ?) / ? AS INTEGER)) = ?
                     """, (device_id, parameter_id, query_start, end, value_type, unit,
-                          maximum - 1, start, bucket, row[6]))]
-                    scale = max(abs(item) for item in values)
-                    value = sum(item / scale / len(values) for item in values) * scale
+                          maximum - 1, start, bucket, row[6])))
+                    # mean sums exact float ratios before dividing: neither a
+                    # large intermediate sum nor cancellation loses the result.
+                    value = mean(values)
                     value = max(row[2], min(row[3], value))
                 points.append({"timestamp": self.iso(row[0]), "value": value,
                                "min": row[2], "max": row[3], "count": row[4]})

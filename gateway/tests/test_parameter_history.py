@@ -5,7 +5,7 @@ import sqlite3
 import sys
 import threading
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -178,6 +178,49 @@ class ParameterHistoryTests(unittest.IsolatedAsyncioTestCase):
         response = self.history.query({"device": "sensor", "parameter": "temperature", "max_points": 10})
         self.assertEqual(response["points"][0]["value"], 1e308)
         json.dumps(response, allow_nan=False)
+
+    def test_null_and_infinite_sqlite_averages_recover_from_finite_measurements(self):
+        # SQLite versions report an overflowing AVG as either NULL or infinity.
+        # Override only AVG, so every platform exercises both with real stored rows.
+        cases = (
+            ([1e308, 1e308], 1e308),
+            ([-1e308, -1e308], -1e308),
+            ([sys.float_info.max, sys.float_info.max], sys.float_info.max),
+            ([1e308, 1e-200, -1e308], 1e-200 / 3),
+            ([0.0, 0.0], 0.0),
+        )
+        for index, (samples, _) in enumerate(cases):
+            parameter = f"extreme_{index}"
+            self.schema["parameters"][parameter] = dict(self.schema["parameters"]["temperature"])
+            for offset, value in enumerate(samples):
+                self.assertEqual(self.history.record("sensor", {parameter: value},
+                                 sampled_at=self.now - 30 * (len(samples) - offset)), 1)
+
+        database_connection = self.gateway.database_connection
+        for aggregate_result in (None, float("inf"), float("-inf")):
+            class OverflowingAverage:
+                def step(self, value):
+                    pass
+
+                def finalize(self):
+                    return aggregate_result
+
+            @contextmanager
+            def overflowing_connection():
+                with database_connection() as connection:
+                    connection.create_aggregate("avg", 1, OverflowingAverage)
+                    yield connection
+
+            with patch.object(self.gateway, "database_connection", overflowing_connection):
+                for index, (samples, expected) in enumerate(cases):
+                    with self.subTest(average=aggregate_result, samples=samples):
+                        response = self.history.query({"device": "sensor", "parameter": f"extreme_{index}", "max_points": 10})
+                        self.assertEqual(len(response["points"]), 1)
+                        point = response["points"][0]
+                        self.assertEqual(point["value"], expected)
+                        self.assertEqual((point["min"], point["max"], point["count"]),
+                                         (min(samples), max(samples), len(samples)))
+                        json.dumps(response, allow_nan=False)
 
     def test_retention_and_hard_row_cap(self):
         self.history.record("sensor", {"temperature": 1}, sampled_at=self.now - 31 * 86400)

@@ -988,9 +988,12 @@ class AutomationMixin:
                     automation_id, run_id, "acknowledgment", step_type=step_type,
                     details=step_details, block_id=statement.get("block_id")
                 )
+                # Delivery owns the ACK/retry deadline. This is only a watchdog
+                # for a lost result future; allow SQLite and result broadcasts
+                # to finish even when a test uses a very short ACK interval.
                 result = await asyncio.wait_for(
                     result_future,
-                    timeout=self.COMMAND_TIMEOUT_SECONDS * (self.COMMAND_RETRY_LIMIT + 2)
+                    timeout=max(5.0, self.COMMAND_TIMEOUT_SECONDS * (self.COMMAND_RETRY_LIMIT + 2))
                 )
                 if isinstance(result, dict) and "value" in result:
                     step_details["result_value"] = result["value"]

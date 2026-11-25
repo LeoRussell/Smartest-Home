@@ -4,14 +4,18 @@ import argparse
 import asyncio
 import base64
 import functools
+from http.client import HTTPException
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Thread
+from time import monotonic
+import urllib.error
+import urllib.parse
 import urllib.request
 
 import websockets
@@ -77,12 +81,26 @@ class Browser:
             raise AssertionError(result["exceptionDetails"])
         return result.get("result", {}).get("value")
 
-    async def ready(self):
-        for _ in range(100):
-            if await self.evaluate("document.readyState==='complete' && typeof renderDevices==='function' && __smokeSockets[0]?.readyState===1"):
-                return
-            await asyncio.sleep(0.05)
-        raise RuntimeError("The interface did not become ready.")
+    async def ready(self, timeout=30.0):
+        deadline = monotonic() + timeout
+        while (remaining := deadline - monotonic()) > 0:
+            try:
+                async with asyncio.timeout(remaining):
+                    if await self.evaluate("document.readyState==='complete' && typeof renderDevices==='function' && window.__smokeSockets?.[0]?.readyState===1"):
+                        return
+            except TimeoutError:
+                break
+            await asyncio.sleep(min(0.1, max(0, deadline - monotonic())))
+        try:
+            async with asyncio.timeout(2):
+                details = await self.evaluate("""({url:location.href,readyState:document.readyState,
+                    renderDevices:typeof renderDevices,errors:window.__smokeErrors||[],
+                    sockets:(window.__smokeSockets||[]).map(socket=>socket.readyState),
+                    body:document.body?.innerText?.slice(0,300),
+                    resources:performance.getEntriesByType('resource').slice(-8).map(item=>({url:item.name,status:item.responseStatus}))})""")
+        except Exception as error:
+            details = {"diagnostics_error": f"{type(error).__name__}: {error}"}
+        raise RuntimeError(f"The interface did not become ready within {timeout:g} seconds. State: {json.dumps(details, ensure_ascii=False)}")
 
     async def reload(self):
         previous = (await self.call("Page.getFrameTree"))["frameTree"]["frame"]["loaderId"]
@@ -167,7 +185,12 @@ async def check_gateway_address_form(browser):
 
 
 def find_browser(explicit):
-    candidates = [explicit, os.environ.get("CHROME_PATH"), shutil.which("google-chrome"), shutil.which("chromium"), shutil.which("chromium-browser")]
+    requested = explicit if explicit is not None else os.environ.get("CHROME_PATH")
+    if requested is not None:
+        if requested and Path(requested).is_file():
+            return str(Path(requested).resolve())
+        raise RuntimeError(f"The configured browser executable does not exist: {requested!r}")
+    candidates = [shutil.which(command) for command in ("google-chrome", "chromium", "chromium-browser", "chrome", "chrome.exe")]
     for folder in (os.environ.get("PROGRAMFILES"), os.environ.get("PROGRAMFILES(X86)"), os.environ.get("LOCALAPPDATA")):
         if folder:
             candidates.extend((str(Path(folder) / "Google/Chrome/Application/chrome.exe"), str(Path(folder) / "Microsoft/Edge/Application/msedge.exe")))
@@ -177,6 +200,60 @@ def find_browser(explicit):
     raise RuntimeError("Chrome/Chromium/Edge not found. Pass --chrome or set CHROME_PATH.")
 
 
+def browser_log_tail(path):
+    try:
+        with path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 8192))
+            return log.read().decode("utf-8", errors="replace").strip() or "(empty)"
+    except OSError as error:
+        return f"(unavailable: {error})"
+
+
+def read_browser_page(profile, request_timeout):
+    lines = (profile / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise ValueError("The browser has not written its DevTools port yet.")
+    port = int(lines[0])
+    if not 1 <= port <= 65535:
+        raise ValueError("The browser's DevTools port is invalid.")
+    # The browser is local; environment HTTP proxies must not intercept this probe.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/json", timeout=request_timeout) as response:
+        pages = json.load(response)
+    if isinstance(pages, list):
+        for page in pages:
+            if not isinstance(page, dict) or page.get("type") != "page" or not isinstance(page.get("webSocketDebuggerUrl"), str):
+                continue
+            endpoint = urllib.parse.urlsplit(page["webSocketDebuggerUrl"])
+            if endpoint.scheme == "ws" and endpoint.hostname in ("127.0.0.1", "localhost", "::1") and endpoint.port == port:
+                return page
+    raise ValueError("The browser has not published an inspectable page yet.")
+
+
+async def wait_for_browser(process, profile, timeout=30.0):
+    deadline = monotonic() + timeout
+    last_error = None
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"The browser exited during startup (exit code {return_code}).")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            detail = f" Last startup error: {type(last_error).__name__}: {last_error}" if last_error else ""
+            raise RuntimeError(f"The browser did not become ready within {timeout:g} seconds.{detail}") from last_error
+        try:
+            # The port file can appear before HTTP is responsive or a page exists.
+            # Probe off the event loop and retry only within the shared deadline.
+            async with asyncio.timeout(remaining):
+                return await asyncio.to_thread(read_browser_page, profile, min(2.0, remaining))
+        except (OSError, urllib.error.URLError, HTTPException, ValueError) as error:
+            last_error = error
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            await asyncio.sleep(min(0.1, remaining))
+
+
 async def run(options):
     executable = find_browser(options.chrome)
     server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(QuietHandler, directory=str(ROOT / "web")))
@@ -184,26 +261,26 @@ async def run(options):
     thread.start()
     process = None
     try:
-        with TemporaryDirectory(prefix="smartest-home-browser-", ignore_cleanup_errors=True) as temporary:
-            profile = Path(temporary)
-            command = [executable, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*", "--remote-debugging-port=0", f"--user-data-dir={profile}", "about:blank"]
+        with TemporaryDirectory(prefix="smartest-home-browser-", ignore_cleanup_errors=True) as temporary, TemporaryFile() as browser_log:
+            profile = Path(temporary).resolve()
+            chrome_log = profile / "chrome_debug.log"
+            browser_environment = {**os.environ, "CHROME_LOG_FILE": str(chrome_log)}
+            command = [executable, "--headless=new", "--disable-gpu", "--enable-automation", "--enable-logging", "--no-first-run", "--no-default-browser-check", "--remote-allow-origins=*", "--remote-debugging-port=0", f"--user-data-dir={profile}", "about:blank"]
             if hasattr(os, "geteuid") and os.geteuid() == 0:
                 command.insert(1, "--no-sandbox")
-            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            print(f"Browser executable: {executable}\nBrowser profile: {profile}", flush=True)
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=browser_log, env=browser_environment, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            print(f"Browser process: {process.pid}", flush=True)
             try:
-                for _ in range(150):
-                    active_port = profile / "DevToolsActivePort"
-                    if active_port.is_file():
-                        port = int(active_port.read_text().splitlines()[0])
-                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as response:
-                            pages = json.load(response)
-                        page = next(item for item in pages if item["type"] == "page")
-                        break
-                    if process.poll() is not None:
-                        raise RuntimeError("The browser exited during startup.")
-                    await asyncio.sleep(0.05)
-                else:
-                    raise RuntimeError("The browser did not start.")
+                try:
+                    page = await wait_for_browser(process, profile)
+                except RuntimeError as error:
+                    browser_log.seek(0, os.SEEK_END)
+                    browser_log.seek(max(0, browser_log.tell() - 8192))
+                    details = browser_log.read().decode("utf-8", errors="replace").strip()
+                    raise RuntimeError(f"{error}\nBrowser executable: {executable}\nBrowser profile: {profile}"
+                                       f"\nBrowser stderr:\n{details or '(empty)'}"
+                                       f"\nChrome debug log:\n{browser_log_tail(chrome_log)}") from error
                 async with websockets.connect(page["webSocketDebuggerUrl"], max_size=16 * 1024 * 1024) as websocket:
                     browser = Browser(websocket)
                     await browser.call("Page.enable")

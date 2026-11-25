@@ -39,7 +39,21 @@ jobs:
         run: g++ --version
       - name: Run server and firmware-cache tests
         run: python -X utf8 -m unittest discover -s gateway/tests -v
+      - name: Set up Chrome for Testing
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+        with:
+          chrome-version: '158.0.8127.88'
+      - name: Configure Chrome sandbox on Linux
+        if: runner.os == 'Linux'
+        run: |
+          test -f /opt/google/chrome/chrome-sandbox
+          sudo chown root:root /opt/google/chrome/chrome-sandbox
+          sudo chmod 4755 /opt/google/chrome/chrome-sandbox
       - name: Check browser workflows and layouts
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          CHROME_DEVEL_SANDBOX: ${{ runner.os == 'Linux' && '/opt/google/chrome/chrome-sandbox' || '' }}
         run: python -X utf8 web/tests/browser_smoke.py
       - name: Exercise reconnect and restart cycles
         run: python -X utf8 gateway/soak_test.py --cycles 3 --interval 0 --report "${{ runner.temp }}/gateway-soak.json"

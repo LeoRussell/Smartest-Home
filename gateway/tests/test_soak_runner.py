@@ -73,9 +73,20 @@ class SoakRunnerTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(soak_test.run_soak(
             cycles=100, interval=10, progress=lambda *_: first_cycle.set(),
         ))
-        await asyncio.wait_for(first_cycle.wait(), 10)
-        task.cancel()
-        report = await asyncio.wait_for(task, 10)
+        progress = asyncio.create_task(first_cycle.wait())
+        try:
+            done, _ = await asyncio.wait((task, progress), timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                report = await task
+                self.fail(f"Soak run ended before cancellation: {report['status']}; {report['errors']}")
+            self.assertIn(progress, done, "The first soak cycle did not finish within 30 seconds")
+            task.cancel()
+            report = await asyncio.wait_for(task, 10)
+        finally:
+            for pending in (task, progress):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(task, progress, return_exceptions=True)
         self.assertEqual(report["status"], "interrupted")
         self.assertEqual(report["cycles_completed"], 1)
         self.assertEqual(report["errors"], [])
