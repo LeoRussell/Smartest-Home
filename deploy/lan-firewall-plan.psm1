@@ -1,5 +1,20 @@
 Set-StrictMode -Version Latest
 
+function Invoke-LanFirewallQuery {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][scriptblock] $Query)
+
+    try { & $Query }
+    catch {
+        # NetSecurity reports an empty filtered query as an error. Only these
+        # two errors mean no matching rules; access and service errors must stop setup.
+        if ($_.FullyQualifiedErrorId -cne 'CmdletizationQuery_NotFound,Get-NetFirewallRule' -and
+            $_.FullyQualifiedErrorId -cne 'CmdletizationQuery_NotFound_InstanceID,Get-NetFirewallRule') {
+            throw
+        }
+    }
+}
+
 function ConvertTo-IPv4Number([System.Net.IPAddress] $Address) {
     $bytes = $Address.GetAddressBytes()
     return [uint64]$bytes[0] * 16777216 + [uint64]$bytes[1] * 65536 + [uint64]$bytes[2] * 256 + [uint64]$bytes[3]
@@ -63,4 +78,4 @@ function Test-LanFirewallUserScope {
     return $false
 }
 
-Export-ModuleMember -Function New-LanFirewallPlan, Test-LanFirewallUserScope
+Export-ModuleMember -Function New-LanFirewallPlan, Test-LanFirewallUserScope, Invoke-LanFirewallQuery

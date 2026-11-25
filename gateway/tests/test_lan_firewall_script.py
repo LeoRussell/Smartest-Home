@@ -76,6 +76,84 @@ class LanFirewallPlanningTests(unittest.TestCase):
         """)
         self.assertEqual(matches, [True, True, True, False, True, True, True, True])
 
+    def test_optional_firewall_query_accepts_only_known_empty_results_and_keeps_rules(self):
+        result = self.execute("""
+            $empty = @(Invoke-LanFirewallQuery -Query {}).Count
+            $missing = @()
+            foreach ($id in @(
+                'CmdletizationQuery_NotFound,Get-NetFirewallRule',
+                'CmdletizationQuery_NotFound_InstanceID,Get-NetFirewallRule'
+            )) {
+                $failure = [System.Management.Automation.ErrorRecord]::new(
+                    [System.Exception]::new('synthetic missing rule'), $id,
+                    [System.Management.Automation.ErrorCategory]::ObjectNotFound, $null)
+                $missing += @(Invoke-LanFirewallQuery -Query { throw $failure }).Count
+            }
+            $rules = @(
+                [PSCustomObject]@{ Name='Python block'; Action='Block'; Program='python.exe' },
+                [PSCustomObject]@{ Name='Any application block'; Action='Block'; Program='Any' }
+            )
+            $found = @(Invoke-LanFirewallQuery -Query { $rules })
+            ConvertTo-Json -Depth 5 -InputObject @{
+                Empty=$empty; Missing=$missing; Rules=$found
+                SameObjects=@(
+                    [object]::ReferenceEquals($rules[0], $found[0]),
+                    [object]::ReferenceEquals($rules[1], $found[1])
+                )
+            }
+        """)
+        self.assertEqual(result["Empty"], 0)
+        self.assertEqual(result["Missing"], [0, 0])
+        self.assertEqual(result["Rules"], [
+            {"Name": "Python block", "Action": "Block", "Program": "python.exe"},
+            {"Name": "Any application block", "Action": "Block", "Program": "Any"},
+        ])
+        self.assertEqual(result["SameObjects"], [True, True])
+
+    def test_optional_firewall_query_preserves_unexpected_errors(self):
+        results = self.execute("""
+            $results = @()
+            foreach ($id in @(
+                'AccessDenied,Get-NetFirewallRule',
+                'CimException,Get-NetFirewallRule',
+                'ServiceUnavailable,Get-NetFirewallRule',
+                'CmdletizationQuery_NotFound_Name,Get-NetFirewallRule',
+                'CmdletizationQuery_NotFound,Get-OtherCommand',
+                'CmdletizationQuery_NotFound,Get-NetFirewallRuleUnexpected'
+            )) {
+                $target = [PSCustomObject]@{ Name='synthetic firewall query' }
+                $exception = [System.UnauthorizedAccessException]::new('synthetic read failure')
+                $failure = [System.Management.Automation.ErrorRecord]::new(
+                    $exception, $id, [System.Management.Automation.ErrorCategory]::ObjectNotFound,
+                    $target)
+                try {
+                    Invoke-LanFirewallQuery -Query { throw $failure } | Out-Null
+                    $results += @{ Id=$id; Rethrown=$false }
+                } catch {
+                    $results += @{
+                        Id=$_.FullyQualifiedErrorId; Rethrown=$true
+                        SameException=[object]::ReferenceEquals($_.Exception, $exception)
+                        SameTarget=[object]::ReferenceEquals($_.TargetObject, $target)
+                        Category=$_.CategoryInfo.Category.ToString()
+                    }
+                }
+            }
+            ConvertTo-Json -Depth 5 -InputObject $results
+        """)
+        expected_ids = [
+            "AccessDenied,Get-NetFirewallRule",
+            "CimException,Get-NetFirewallRule",
+            "ServiceUnavailable,Get-NetFirewallRule",
+            "CmdletizationQuery_NotFound_Name,Get-NetFirewallRule",
+            "CmdletizationQuery_NotFound,Get-OtherCommand",
+            "CmdletizationQuery_NotFound,Get-NetFirewallRuleUnexpected",
+        ]
+        self.assertEqual(results, [
+            {"Id": error_id, "Rethrown": True, "SameException": True,
+             "SameTarget": True, "Category": "ObjectNotFound"}
+            for error_id in expected_ids
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

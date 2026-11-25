@@ -349,6 +349,26 @@ async def run(options):
                     print("Launcher runtime port: discovered, immutable, explicit override preserved; invalid ports use the static fallback.")
                     QuietHandler.runtime_config = None
                     await check_gateway_address_form(browser)
+                    modes_source = (Path(__file__).with_name("workspace-modes-smoke.js")).read_text(encoding="utf-8")
+                    await browser.evaluate(modes_source)
+                    await browser.evaluate("WorkspaceModesSmoke.seed()")
+                    await browser.reload()
+                    await browser.ready()
+                    await browser.evaluate(modes_source)
+                    print("Overview mode migration:", await browser.evaluate("WorkspaceModesSmoke.migration()"))
+                    await browser.reload()
+                    await browser.ready()
+                    await browser.evaluate(modes_source)
+                    print("Overview mode controls:", await browser.evaluate("WorkspaceModesSmoke.interactions()"))
+                    for language in ("ru", "en"):
+                        await browser.evaluate(f"uiSettings.language={json.dumps(language)};applyLanguage()")
+                        for width in (1440, 375, 320):
+                            await browser.call("Emulation.setDeviceMetricsOverride", width=width, height=1000, deviceScaleFactor=1, mobile=False)
+                            print("Overview mode layout:", await browser.evaluate("WorkspaceModesSmoke.layout()"))
+                            if options.screenshots and language == "ru":
+                                await browser.evaluate("document.querySelector('[data-workspace-control=mode-select]').closest('.workspace-tile').scrollIntoView({block:'center'});new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))")
+                                screenshot = await browser.call("Page.captureScreenshot", format="png", captureBeyondViewport=False)
+                                (options.screenshots / f"overview-modes-{width}.png").write_bytes(base64.b64decode(screenshot["data"]))
                     if not await browser.evaluate("__smokeErrors.length===0"):
                         raise AssertionError(await browser.evaluate("__smokeErrors"))
                     await browser.call("Browser.close")

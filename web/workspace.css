@@ -13,6 +13,8 @@
 .workspace-type-scenario svg { background: #eee2fb; }
 .workspace-type-reading { color: #00554b; }
 .workspace-type-reading svg { background: #e1f1ec; }
+.workspace-type-mode { color: #544100; }
+.workspace-type-mode svg { background: #fff0c2; }
 .workspace-drag-handle { flex: 0 0 32px; width: 32px; min-width: 32px; min-height: 30px; padding: 1px; color: #000080; cursor: grab; font-size: 21px; line-height: 1; touch-action: none; user-select: none; }
 .workspace-drag-handle:active { cursor: grabbing; }
 .workspace-tile.is-dragging { opacity: .6; }
@@ -35,6 +37,11 @@
 .workspace-toggle:disabled { background: #c0c0c0; color: #555; }
 .workspace-inline-form { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; }
 .workspace-inline-form :is(input, select) { width: 100%; min-width: 0; }
+.workspace-mode-form { align-items: end; flex-wrap: wrap; }
+.workspace-mode-form .management-field { flex: 1 1 100%; min-width: 0; margin: 0; }
+.workspace-mode-form > button { flex: 0 0 auto; }
+.workspace-mode-switch { color: #111; }
+.workspace-mode-switch.is-on .device-boolean-switch-label { color: #005000; font-weight: 700; }
 .workspace-device-link { color: #000080; }
 .workspace-scenario-edit { color: #000080; }
 .workspace-scenario-test { background: #e2dcf2; color: #4a196b; }

@@ -51,14 +51,75 @@
         return JSON.stringify([selected, definition?.type, definition?.unit, definition?.history]);
     }
 
+    function modeCatalog(device) {
+        const selections = [], toggles = [], actions = new Map(), ambiguous = new Set();
+        if (!device) return { selections, toggles, actions };
+        const consume = (action, item) => {
+            if (actions.has(action) && key(actions.get(action)) !== key(item)) ambiguous.add(action);
+            else actions.set(action, item);
+        };
+        const simpleAction = action => typeof action === "string" && device.schema?.actions?.[action] &&
+            !Object.keys(device.schema.actions[action].arguments || {}).length;
+        for (const [modeId, mode] of Object.entries(device.schema?.modes || {})) {
+            if (simpleAction(mode.operations?.select)) {
+                selections.push({ id: modeId, mode, action: mode.operations.select });
+                consume(mode.operations.select, { kind: "mode-select", device: device.device, id: "select" });
+            }
+            if (simpleAction(mode.operations?.enable) && simpleAction(mode.operations?.disable) &&
+                device.schema?.parameters?.[mode.status_parameter] && Object.hasOwn(mode, "status_value")) {
+                const item = { kind: "mode-toggle", device: device.device, id: modeId };
+                toggles.push(item);
+                consume(mode.operations.enable, item); consume(mode.operations.disable, item);
+            }
+        }
+        // A shared action may describe different controls. Keep its original
+        // tile rather than guessing which mode an existing shortcut meant.
+        for (const action of ambiguous) actions.delete(action);
+        return { selections, toggles, actions };
+    }
+
+    function modeState(device, mode) {
+        if (!mode?.status_parameter || !Object.hasOwn(mode, "status_value") ||
+            !Object.hasOwn(device?.parameters || {}, mode.status_parameter) ||
+            device.parameters[mode.status_parameter] === undefined) return null;
+        const freshness = context.parameterFreshness?.(device, mode.status_parameter);
+        if (freshness && freshness.state !== "fresh") return null;
+        return Object.is(device.parameters[mode.status_parameter], mode.status_value);
+    }
+
+    function modeBusy(device) {
+        return Object.values(device?.schema?.modes || {}).some(mode =>
+            Object.values(mode.operations || {}).some(action => context.actionBusy(device.device, action)));
+    }
+
+    function migrateModeLayout() {
+        if (layout === null) return;
+        const catalogs = new Map(devices().map(device => [device.device, modeCatalog(device)]));
+        const unique = new Map();
+        for (const item of layout) {
+            const replacement = item.kind === "action" ? catalogs.get(item.device)?.actions.get(item.id) : null;
+            const next = replacement || item;
+            if (!unique.has(key(next))) unique.set(key(next), next);
+        }
+        const next = [...unique.values()];
+        if (JSON.stringify(next) !== JSON.stringify(layout)) { layout = next; save(); }
+    }
+
     function choices() {
         const result = [];
         for (const device of devices()) {
             for (const [parameter, definition] of Object.entries(device.schema?.parameters || {})) {
                 result.push({ kind: "parameter", device: device.device, id: parameter, title: `${name(device)} · ${definition.label || parameter}` });
             }
+            const modes = modeCatalog(device);
+            if (modes.selections.length) result.push({ kind: "mode-select", device: device.device, id: "select", title: `${name(device)} · ${t("Режим работы", "Operating mode")}` });
+            for (const item of modes.toggles) result.push({ ...item, title: `${name(device)} · ${device.schema.modes[item.id].label || item.id}` });
             for (const [action, definition] of Object.entries(device.schema?.actions || {})) {
-                result.push({ kind: "action", device: device.device, id: action, title: `${name(device)} · ${definition.label || action}` });
+                if (modes.actions.has(action)) continue;
+                const labels = Object.entries(device.schema?.modes || {})
+                    .filter(([, mode]) => Object.values(mode.operations || {}).includes(action))
+                    .map(([modeId, mode]) => mode.label || modeId);
+                result.push({ kind: "action", device: device.device, id: action, title: [name(device), ...labels, definition.label || action].join(" · ") });
             }
         }
         for (const scenario of context.getAutomations()) {
@@ -75,6 +136,7 @@
 
     function tileType(item) {
         if (item.kind === "scenario") return { kind: "scenario", caption: t("Сценарий", "Scenario") };
+        if (item.kind === "mode-select" || item.kind === "mode-toggle") return { kind: "mode", caption: t("Режим", "Mode") };
         if (item.kind === "action") return { kind: "command", caption: t("Команда", "Command") };
         const definition = devices().find(device => device.device === item.device)?.schema?.parameters?.[item.id];
         return definition?.access === "read_write"
@@ -92,6 +154,7 @@
             device: ["M4 3h16v13H4Z", "M8 21h8M12 16v5M8 7h8M8 11h5"],
             reading: ["M4 18V6h16v12Z", "M8 15V9m4 6v-4m4 4V7"],
             command: ["M3 5h18v14H3Z", "m7 9 3 3-3 3m6 0h4"],
+            mode: ["M3 7h18M3 17h18", "M7 4v6m10 4v6"],
             scenario: ["M3 3h7v6H3Zm11 12h7v6h-7Z", "M6 9v9h8m3-3V6h-7"]
         };
         for (const d of paths[type.kind]) {
@@ -225,6 +288,7 @@
     function renderTiles() {
         const host = document.getElementById("workspace-tiles");
         if (!host) return;
+        migrateModeLayout();
         const items = activeLayout();
         const signature = JSON.stringify([context.language(), items, devices().map(device => [device.device, name(device), device.schema]), context.getAutomations().map(item => [item.automation_id, item.config?.name])]);
         if (signature !== tileKey) {
@@ -236,6 +300,9 @@
                 if (record.input && record.input.dataset.dirty === "true") drafts.set(tileId, {
                     value: record.input.value, signature: record.controlSignature,
                     start: record.input.selectionStart, end: record.input.selectionEnd
+                });
+                if (record.modeSelect && record.modeDirty) drafts.set(tileId, {
+                    value: record.modeSelect.value, signature: record.controlSignature
                 });
                 if (record.card.contains(focused)) {
                     focusedKey = tileId;
@@ -263,6 +330,13 @@
                     if (record.input && draft?.signature === record.controlSignature) {
                         record.input.value = draft.value; record.input.dataset.dirty = "true";
                         if (record.input.type === "text" && draft.start != null) record.input.setSelectionRange(draft.start, draft.end);
+                    }
+                }
+                else if (item.kind === "mode-select" || item.kind === "mode-toggle") {
+                    buildModeTile(record);
+                    const draft = drafts.get(key(item));
+                    if (record.modeSelect && draft?.signature === record.controlSignature) {
+                        record.modeSelect.value = draft.value; record.modeDirty = true;
                     }
                 }
                 else {
@@ -359,6 +433,85 @@
         open.dataset.workspaceControl = "device"; controls.append(open);
     }
 
+    function buildModeTile(record) {
+        const { item, controls } = record;
+        const device = devices().find(candidate => candidate.device === item.device);
+        if (item.kind === "mode-select") {
+            const selections = modeCatalog(device).selections;
+            record.controlSignature = JSON.stringify(selections.map(entry => [entry.id, entry.action]));
+            const form = node("form", null, "workspace-inline-form workspace-mode-form");
+            const select = node("select");
+            const placeholder = node("option", t("Выберите режим", "Choose a mode"));
+            placeholder.value = ""; placeholder.disabled = true; select.append(placeholder);
+            for (const entry of selections) {
+                const option = node("option", entry.mode.label || entry.id); option.value = entry.id; select.append(option);
+            }
+            select.value = ""; select.required = true;
+            select.setAttribute("aria-label", `${t("Режим работы", "Operating mode")} · ${name(device || { device: item.device })}`);
+            select.dataset.workspaceControl = "mode-select";
+            const apply = node("button", t("Применить", "Apply")); apply.type = "submit";
+            apply.dataset.workspaceControl = "mode-apply";
+            record.modeSelect = select; record.apply = apply;
+            select.addEventListener("change", () => { record.modeDirty = true; updateTile(record); });
+            form.addEventListener("submit", event => {
+                event.preventDefault();
+                const current = devices().find(candidate => candidate.device === item.device);
+                const entry = modeCatalog(current).selections.find(candidate => candidate.id === select.value);
+                if (!entry || !context.canControl(current) || modeBusy(current) || !form.reportValidity()) return;
+                context.callAction(item.device, entry.action); record.modeDirty = false; refresh();
+            });
+            form.append(field(t("Режим работы", "Operating mode"), select), apply); controls.append(form);
+        } else {
+            const toggle = button("", () => {
+                const current = devices().find(candidate => candidate.device === item.device);
+                const mode = current?.schema?.modes?.[item.id];
+                const active = modeState(current, mode);
+                if (active === null || !context.canControl(current) || modeBusy(current) ||
+                    !modeCatalog(current).toggles.some(candidate => candidate.id === item.id)) return;
+                context.callAction(item.device, mode.operations[active ? "disable" : "enable"]); refresh();
+            }, "device-boolean-switch workspace-mode-switch");
+            toggle.dataset.workspaceControl = "mode-toggle"; toggle.setAttribute("role", "switch");
+            const track = node("span", null, "device-boolean-switch-track"); track.setAttribute("aria-hidden", "true");
+            track.append(node("span", null, "device-boolean-switch-thumb"));
+            record.modeToggleLabel = node("span", "", "device-boolean-switch-label");
+            toggle.append(track, record.modeToggleLabel); controls.append(toggle); record.modeToggle = toggle;
+        }
+        const open = button(t("К устройству", "Open device"), () => context.openDevice(item.device), "workspace-device-link");
+        open.dataset.workspaceControl = "device"; (record.modeSelect?.closest("form") || controls).append(open);
+    }
+
+    function updateModeTile(record, device, canControl) {
+        const { item } = record;
+        const catalog = modeCatalog(device), busy = modeBusy(device);
+        if (busy && connected()) record.status.textContent = t("Ожидается подтверждение режима…", "Waiting for mode confirmation…");
+        if (item.kind === "mode-select") {
+            const states = catalog.selections.map(entry => ({ ...entry, active: modeState(device, entry.mode) }));
+            const active = states.filter(entry => entry.active === true);
+            record.value.textContent = active.length === 1 ? active[0].mode.label || active[0].id
+                : active.length > 1 ? t("Несколько активных режимов", "Multiple active modes")
+                    : states.length && states.every(entry => entry.active === false) ? t("Нет активного режима", "No active mode")
+                        : t("Состояние неизвестно", "State unknown");
+            if (!record.modeDirty && !busy) record.modeSelect.value = active.length === 1 ? active[0].id : "";
+            record.modeSelect.disabled = !canControl || busy || !states.length;
+            record.apply.disabled = record.modeSelect.disabled || !states.some(entry => entry.id === record.modeSelect.value);
+            if (device && !states.length) record.status.textContent = t("Выбор режима больше недоступен в Schema", "Mode selection is no longer available in Schema");
+        } else {
+            const mode = device?.schema?.modes?.[item.id];
+            const available = catalog.toggles.some(candidate => candidate.id === item.id);
+            const active = available ? modeState(device, mode) : null;
+            record.value.textContent = active === null ? t("Состояние неизвестно", "State unknown") : active ? t("Включено", "On") : t("Выключено", "Off");
+            record.modeToggle.disabled = !canControl || !available || busy || active === null;
+            record.modeToggle.setAttribute("aria-checked", String(active === true));
+            record.modeToggle.classList.toggle("is-on", active === true);
+            record.modeToggleLabel.textContent = active === null ? "—" : active ? t("Вкл", "On") : t("Выкл", "Off");
+            const caption = active === null ? t("Состояние режима неизвестно", "Mode state unknown") : active ? t("Выключить режим", "Disable mode") : t("Включить режим", "Enable mode");
+            const label = `${caption} · ${mode?.label || item.id} · ${name(device || { device: item.device })}`;
+            record.modeToggle.setAttribute("aria-label", label); record.modeToggle.title = label;
+            if (device && !available) record.status.textContent = t("Переключатель режима больше недоступен в Schema", "Mode switch is no longer available in Schema");
+            else if (canControl && !busy && active === null) record.status.textContent = t("Ожидается свежее состояние режима от устройства", "Waiting for a fresh mode state from the device");
+        }
+    }
+
     function updateTile(record) {
         const { item } = record;
         const device = devices().find(candidate => candidate.device === item.device);
@@ -403,6 +556,9 @@
         const canControl = Boolean(device && context.canControl(device));
         record.status.textContent = !device ? t("Устройство недоступно", "Device unavailable") : !connected() ? t("Нет связи с Gateway", "Gateway disconnected") : device.connected ? t("На связи", "Online") : t("Отключено · последнее известное значение", "Offline · last known value");
         record.card.dataset.online = String(Boolean(device?.connected && connected()));
+        if (item.kind === "mode-select" || item.kind === "mode-toggle") {
+            updateModeTile(record, device, canControl); return;
+        }
         if (item.kind === "action") {
             record.run.disabled = !canControl || !device?.schema?.actions?.[item.id] || context.actionBusy(item.device, item.id);
             record.value.hidden = true; return;
@@ -748,7 +904,7 @@
                 if (Array.isArray(stored)) {
                     const unique = new Map();
                     for (const item of stored) {
-                        if (item && ["parameter", "action", "scenario"].includes(item.kind) && typeof item.id === "string" && item.id.length > 0 && item.id.length <= 100 &&
+                        if (item && ["parameter", "action", "scenario", "mode-select", "mode-toggle"].includes(item.kind) && typeof item.id === "string" && item.id.length > 0 && item.id.length <= 100 &&
                             (item.kind === "scenario" || typeof item.device === "string" && item.device.length > 0 && item.device.length <= 128)) {
                             const normalized = { kind: item.kind, ...(item.kind !== "scenario" ? { device: item.device } : {}), id: item.id };
                             unique.set(key(normalized), normalized);

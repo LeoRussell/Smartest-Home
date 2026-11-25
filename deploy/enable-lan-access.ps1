@@ -26,7 +26,7 @@ if (Test-Path -LiteralPath $statePath) {
 
 if ($Remove) {
     if (-not $state) { Write-Output 'No saved project LAN firewall rule to remove.'; return }
-    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    $rule = Invoke-LanFirewallQuery { Get-NetFirewallRule -Name $ruleName -ErrorAction Stop }
     if ($rule) {
         $application = $rule | Get-NetFirewallApplicationFilter
         if ($application.Program -ne $state.PythonPath -or $rule.Action -ne 'Allow' -or $rule.Direction -ne 'Inbound') {
@@ -42,7 +42,7 @@ if ($Remove) {
 }
 
 if ($state) { throw 'LAN rules already have saved state. Use -Remove before changing or reapplying them.' }
-if (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue) { throw 'A project rule exists without its saved state; review it before continuing.' }
+if (Invoke-LanFirewallQuery { Get-NetFirewallRule -Name $ruleName -ErrorAction Stop }) { throw 'A project rule exists without its saved state; review it before continuing.' }
 if ($HttpPort -eq $GatewayPort) { throw 'HTTP and Gateway TCP ports must be different.' }
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Create the project .venv before setting up LAN access.' }
@@ -61,7 +61,9 @@ $plan = New-LanFirewallPlan -IPv4Address $addresses[0].IPAddress -PrefixLength $
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $tokenSids = @($identity.User.Value) + @($identity.Groups | ForEach-Object { $_.Value })
 
-foreach ($rule in @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Block)) {
+foreach ($rule in @(Invoke-LanFirewallQuery {
+    Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Block -ErrorAction Stop
+})) {
     $application = $rule | Get-NetFirewallApplicationFilter
     if ($application.Program -notin @($pythonPath, 'Any')) { continue }
     $security = $rule | Get-NetFirewallSecurityFilter
@@ -98,6 +100,12 @@ try {
     New-NetFirewallRule -Name $ruleName -DisplayName 'Smartest Home: LAN web interface and Gateway' -Direction Inbound -Action Allow -Enabled True -Protocol TCP -Program $pythonPath -LocalPort $plan.Ports -LocalAddress $plan.LocalAddress -RemoteAddress $plan.RemoteSubnet -InterfaceAlias $adapter.InterfaceAlias -Profile Any | Out-Null
     Write-Output "LAN access configured: http://$($plan.LocalAddress):$HttpPort"
 } catch {
-    if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $statePath }
-    throw
+    $creationError = $_
+    try {
+        $createdRule = Invoke-LanFirewallQuery { Get-NetFirewallRule -Name $ruleName -ErrorAction Stop }
+        if (-not $createdRule) { Remove-Item -LiteralPath $statePath }
+    } catch {
+        Write-Warning 'Could not verify the project rule after setup failed; saved LAN firewall state was kept for recovery.'
+    }
+    throw $creationError
 }
